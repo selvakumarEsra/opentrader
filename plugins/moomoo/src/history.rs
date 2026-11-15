@@ -120,6 +120,34 @@ impl<S: Source> History<S> {
         Some(roll_up(&lines, secs).into_iter().filter(|b| gaps.iter().any(|&(x, y)| b[0] as i64 >= x && b[0] as i64 <= y)).collect())
     }
 
+    /// Asks OpenD for whatever of the window `a` the store lacks, and stores it: whether OpenD was asked. Unlike
+    /// `bars`, a refusal is the answer.
+    pub async fn fill(&self, a: &Ask<'_>, now: i64) -> Result<bool, String> {
+        let Some((kl, secs)) = kl_type(a.resolution) else {
+            return Err(format!("{} is not a resolution OpenD serves ({})", a.resolution, bars::INTERVALS.join(", ")));
+        };
+        let ext = Self::extended(a.market, secs);
+        let key = Key::new(a.symbol, a.resolution, ext);
+        let (from, to) = (a.from.max(0.0) as i64, (a.to as i64).min(now));
+        let gaps: Vec<(i64, i64)> = self
+            .store
+            .read(&key, |s| s.missing(from, to))
+            .await
+            .into_iter()
+            .filter(|&(x, y)| may_hold_bars(a.market, ext, secs, x, y))
+            .collect();
+        let Some(&(first, _)) = gaps.first() else { return Ok(false) };
+        self.fetch(a, &key, kl, secs, ext, first, to, now).await?;
+        Ok(true)
+    }
+
+    /// The stored bars of `symbol` at `resolution` in [from, to].
+    pub async fn stored(&self, market: Market, symbol: &str, resolution: &str, from: i64, to: i64) -> Vec<Bar> {
+        let Some((_, secs)) = kl_type(resolution) else { return Vec::new() };
+        let key = Key::new(symbol, resolution, Self::extended(market, secs));
+        self.store.read(&key, |s| s.window(from, to)).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn fetch(&self, a: &Ask<'_>, key: &Key, kl: i32, secs: u32, ext: bool, gap_start: i64, to: i64, now: i64) -> Result<(), String> {
         let begin = gap_start - secs as i64;
@@ -130,6 +158,13 @@ impl<S: Source> History<S> {
             .klines(a.sec, kl, ext, bars::wall_of(a.market, begin), bars::wall_of(a.market, end))
             .await?;
         let fetched = bars::to_bars(a.market, secs, ext, &lines);
+        // Bars still forming at `now` are not final: they are asked again next time. An answer cut at the most bars
+        // one request collects covers only up to its newest bar.
+        let cut = |bars: &[Bar], full: bool| match bars.last() {
+            Some(last) if full => (last[0] as i64).min(to),
+            _ => to.min(now - secs as i64),
+        };
+        let covered_to = cut(&fetched, lines.len() >= bars::MAX_BARS);
         // The adjusted prices changed under the stored ones: start again from this answer, over the whole window.
         let changed = self
             .store
@@ -143,9 +178,10 @@ impl<S: Source> History<S> {
                 .klines(a.sec, kl, ext, bars::wall_of(a.market, a.from as i64), bars::wall_of(a.market, end))
                 .await?;
             let all = bars::to_bars(a.market, secs, ext, &lines);
+            let covered_to = cut(&all, lines.len() >= bars::MAX_BARS);
             self.store.update(key, |s| {
                 s.merge(&all);
-                s.cover(a.from as i64, to.min(now - secs as i64));
+                s.cover(a.from as i64, covered_to);
             }).await;
         } else {
             self.store.update(key, |s| {
@@ -153,8 +189,7 @@ impl<S: Source> History<S> {
                     s.clear();
                 }
                 s.merge(&fetched);
-                // Bars still forming at `now` are not final: they are asked again next time.
-                s.cover(begin, to.min(now - secs as i64));
+                s.cover(begin, covered_to);
             }).await;
         }
         self.store.flush().await;
@@ -299,6 +334,22 @@ mod tests {
         assert_eq!(fives.len(), 2);
         assert_eq!((fives[0][1], fives[0][2], fives[0][4], fives[0][5]), (1.0, 6.0, 5.5, 50.0));
         assert_eq!(h.source.asks.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn an_answer_cut_at_the_most_bars_covers_only_up_to_its_newest() {
+        // As many minutes as one request collects, from Monday 04:00 on; the window reaches well past them.
+        let start = us("2025-05-05 04:00:00");
+        let times: Vec<String> = (0..bars::MAX_BARS as i64).map(|i| bars::wall_of(Market::Us, start + i * 60)).collect();
+        let lines: Vec<(&str, f64)> = times.iter().map(|t| (t.as_str(), 1.0)).collect();
+        let h = history(Fake::new(&lines));
+        let sec = sec();
+        let (to, now) = (start + 200_000 * 60, start + 300_000 * 60);
+        assert!(h.fill(&ask(&sec, "1", start, to), now).await.unwrap());
+        let newest = h.stored(Market::Us, "US:AAPL", "1", start, to).await.last().unwrap()[0] as i64;
+        let key = Key::new("US:AAPL", "1", true);
+        let missing = h.store.read(&key, |s| s.missing(start, to)).await;
+        assert_eq!(missing.first().map(|m| m.0), Some(newest + 1), "the rest is asked again");
     }
 
     #[test]

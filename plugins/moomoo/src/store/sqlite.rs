@@ -30,6 +30,8 @@ impl Sqlite {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
+        // The plugin and a backfill run may write the same file: one waits for the other.
+        conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         Ok(Sqlite(Arc::new(Mutex::new(conn))))
     }

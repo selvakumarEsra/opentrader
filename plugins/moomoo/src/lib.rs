@@ -6,6 +6,7 @@
  * whole: `US:AAPL`, `HK:00700`.
  */
 pub mod bars;
+pub mod cli;
 pub mod history;
 pub mod hours;
 pub mod market;
@@ -21,7 +22,7 @@ use bars::OpenD;
 use history::{Ask, History};
 use market::security_of;
 use std::collections::{BTreeSet, HashMap};
-use store::{clickhouse::ClickHouse, Backend, Key, Store};
+use store::{clickhouse::ClickHouse, Backend, Store};
 use opend::client::{Client, Event};
 use opend::proto;
 use pace::Pace;
@@ -50,9 +51,8 @@ struct Plugin {
     store: Arc<Store>,
     /// The store's settings in use, to move only when they change.
     store_settings: tokio::sync::Mutex<Option<String>>,
-    /// Per streamed symbol, the start of its last closed 1-minute bar on this connection: the minutes between two
-    /// closed bars had no trades, so they are covered too.
-    last_closed: Mutex<HashMap<String, i64>>,
+    /// What the stream's closed minutes cover.
+    minute_cover: Mutex<stream::MinuteCover>,
     catalog: Catalog,
     subs: tokio::sync::Mutex<Subscriptions>,
     /// The tickers of `data.subscribe` and of `broker.watchQuote`: both are subscribed at OpenD.
@@ -113,7 +113,7 @@ pub async fn run_session_with(addr: &str, plugin: &str, token: &str, opend: &str
         client,
         store,
         store_settings: tokio::sync::Mutex::new(None),
-        last_closed: Mutex::new(HashMap::new()),
+        minute_cover: Mutex::new(stream::MinuteCover::default()),
         catalog: Catalog::default(),
         subs: tokio::sync::Mutex::new(Subscriptions::default()),
         data_tickers: Mutex::new(BTreeSet::new()),
@@ -274,7 +274,7 @@ impl Plugin {
             match e {
                 Event::Connected => {
                     // Minutes missed while disconnected are not known: coverage starts again.
-                    self.last_closed.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    locked(&self.minute_cover).reset();
                     let again = self.subs.lock().await.reconnected(tokio::time::Instant::now());
                     let me = self.clone();
                     tokio::spawn(async move { me.subscribe(again).await });
@@ -288,7 +288,7 @@ impl Plugin {
                 Event::Push { proto: proto::QOT_UPDATE_KL, s2c } => {
                     let closed = self.quotes.lock().unwrap_or_else(|e| e.into_inner()).minute_push(&s2c, now);
                     if let Some((symbol, bar)) = closed {
-                        self.store_minute(&symbol, bar).await;
+                        stream::store_minute(&self.store, &self.minute_cover, &symbol, bar).await;
                     }
                 }
                 Event::Push { proto: proto::QOT_UPDATE_BASIC, s2c } => {
@@ -320,10 +320,8 @@ impl Plugin {
             tick.tick().await;
             let due = self.subs.lock().await.due(tokio::time::Instant::now());
             if !due.is_empty() {
-                let mut last = self.last_closed.lock().unwrap_or_else(|e| e.into_inner());
-                due.iter().for_each(|s| {
-                    last.remove(s);
-                });
+                let mut cover = locked(&self.minute_cover);
+                due.iter().for_each(|s| cover.forget(s));
             }
             if !due.is_empty() {
                 if let Err(e) = self.client.request(proto::QOT_SUB, stream::sub_request(&due, false)).await {
@@ -331,22 +329,6 @@ impl Plugin {
                 }
             }
         }
-    }
-
-    /// A closed 1-minute bar of the stream: stored, and the minutes since the last one covered.
-    async fn store_minute(&self, symbol: &str, bar: bars::Bar) {
-        let Some((market, _)) = security_of(symbol) else { return };
-        let t = bar[0] as i64;
-        let since = {
-            let mut last = self.last_closed.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = last.insert(symbol.to_string(), t);
-            prev.filter(|p| *p < t).unwrap_or(t)
-        };
-        let key = Key::new(symbol, "1", market.extended().is_some());
-        self.store.update(&key, |s| {
-            s.merge(&[bar]);
-            s.cover(since, t + 59);
-        }).await;
     }
 
     async fn flush_often(self: Arc<Self>) {

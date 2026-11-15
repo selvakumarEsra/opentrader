@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 /// Bars one answer may carry; more come in later pages.
 const PAGE: u32 = 1_000;
 /// Bars one `data.bars` collects at most, whatever the window.
-const MAX_BARS: usize = 100_000;
+pub const MAX_BARS: usize = 100_000;
 
 pub type Bar = [f64; 6];
 

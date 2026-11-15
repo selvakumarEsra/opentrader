@@ -281,3 +281,15 @@ async fn an_order_is_placed_and_its_fill_is_told() {
     let refused = app.ask(8, "broker.place", json!({"ticker":"HK:00700","side":"buy","type":"market","qty":100})).await;
     assert!(refused["error"]["message"].as_str().unwrap().contains("does not trade"), "{refused}");
 }
+
+#[tokio::test]
+async fn a_backfill_run_stores_opends_bars() {
+    isolate_store();
+    let args: Vec<String> = ["backfill", "US:AAPL", "--resolution", "1", "--from", "09/05/2025", "--opend"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([fake_opend().await])
+        .collect();
+    let options = opentrader_moomoo::cli::parse(&args).unwrap();
+    assert_eq!(opentrader_moomoo::cli::run(options).await, Ok(true));
+}

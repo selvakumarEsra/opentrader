@@ -6,6 +6,7 @@
 use crate::bars::{self, Bar};
 use crate::market::{security_of, symbol_of, Market};
 use crate::opend::proto::{self, BasicQot, KLine, Security};
+use crate::store::{Key, Store};
 use chrono::{TimeZone, Timelike};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -64,15 +65,59 @@ impl Subscriptions {
     }
 }
 
-/// Qot_Sub's request for `symbols`.
+/// Qot_Sub's request for `symbols`: Basic quotes and 1-minute K-lines.
 pub fn sub_request(symbols: &[String], subscribe: bool) -> Value {
+    sub_request_of(symbols, &[proto::SUB_BASIC, proto::SUB_KL_1MIN], subscribe)
+}
+
+/// Qot_Sub's request for `symbols` and the sub types `types`.
+pub fn sub_request_of(symbols: &[String], types: &[i32], subscribe: bool) -> Value {
     let list: Vec<Security> = symbols.iter().filter_map(|s| security_of(s).map(|(_, sec)| sec)).collect();
     json!({
-        "securityList": list, "subTypeList": [proto::SUB_BASIC, proto::SUB_KL_1MIN],
+        "securityList": list, "subTypeList": types,
         "isSubOrUnSub": subscribe, "isRegOrUnRegPush": subscribe, "isFirstPush": true,
         // Pre- and post-market for US symbols; OpenD ignores it for the others.
         "extendedTime": true,
     })
+}
+
+/// What closed streamed minutes cover: per symbol, from the start of the last closed minute on this connection to the
+/// end of the new one, since the minutes between two closed bars had no trades. After a reconnect the minutes
+/// missed are not known, so coverage starts again.
+#[derive(Default)]
+pub struct MinuteCover {
+    last: HashMap<String, i64>,
+}
+
+impl MinuteCover {
+    /// The span the closed minute of `symbol` starting at `t` covers.
+    pub fn span(&mut self, symbol: &str, t: i64) -> (i64, i64) {
+        let prev = self.last.insert(symbol.to_string(), t);
+        (prev.filter(|p| *p < t).unwrap_or(t), t + 59)
+    }
+
+    /// A new connection.
+    pub fn reset(&mut self) {
+        self.last.clear();
+    }
+
+    /// No longer streamed.
+    pub fn forget(&mut self, symbol: &str) {
+        self.last.remove(symbol);
+    }
+}
+
+/// A closed streamed 1-minute bar of `symbol`, stored with the span it covers.
+pub async fn store_minute(store: &Store, cover: &std::sync::Mutex<MinuteCover>, symbol: &str, bar: Bar) {
+    let Some((market, _)) = security_of(symbol) else { return };
+    let (a, b) = cover.lock().unwrap_or_else(|e| e.into_inner()).span(symbol, bar[0] as i64);
+    let key = Key::new(symbol, "1", market.extended().is_some());
+    store
+        .update(&key, |s| {
+            s.merge(&[bar]);
+            s.cover(a, b);
+        })
+        .await;
 }
 
 /// The forming 1-minute bar of each symbol, kept to send with its next price.
@@ -169,6 +214,17 @@ mod tests {
         assert_eq!(quotes.minute_push(&push("2025-05-09 10:00:00", 1.2), now), None);
         let (sym, closed) = quotes.minute_push(&push("2025-05-09 10:01:00", 1.3), now + 60).unwrap();
         assert_eq!((sym.as_str(), closed[0] as i64, closed[4]), ("US:AAPL", now - 30, 1.2));
+    }
+
+    #[test]
+    fn closed_minutes_cover_the_span_since_the_last_one_until_a_reconnect() {
+        let mut cover = MinuteCover::default();
+        assert_eq!(cover.span("US:AAPL", 600), (600, 659));
+        assert_eq!(cover.span("US:AAPL", 780), (600, 839));
+        cover.reset();
+        assert_eq!(cover.span("US:AAPL", 900), (900, 959));
+        cover.forget("US:AAPL");
+        assert_eq!(cover.span("US:AAPL", 1020), (1020, 1079));
     }
 
     #[tokio::test(start_paused = true)]

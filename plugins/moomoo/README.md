@@ -37,6 +37,25 @@ Contract: [`specs/moomoo-plugin.md`](../../specs/moomoo-plugin.md).
   plugin keeps no trade password. `broker.quote` carries the last price only (Basic quotes have no bid and ask).
 - **Search** (`src/search.rs`): each market's stocks, funds and indexes, loaded once per session.
 
+## Fill the store yourself
+
+The plugin program also runs as a command, outside the app, writing to the same store the charts read (the same
+SQLite file, or ClickHouse with `--clickhouse`):
+
+```bash
+# Every 1-minute and daily bar OpenD has for a list, in one run. Again later: only the new bars.
+opentrader-moomoo backfill US:AAPL HK:00700 SH:600519
+opentrader-moomoo backfill --file watchlist.txt --from 01/01/2020 --clickhouse http://localhost:8123
+
+# Live 1-minute bars of a list, stored as they close, until Ctrl+C (1 subscription unit per symbol).
+opentrader-moomoo record --file watchlist.txt
+```
+
+Daily bars come in one request; 1-minute bars in 30-day steps from now back, until a step has none (or `--from`).
+Each symbol counts once toward the history quota, which `backfill` prints before and after; a refused symbol is
+reported and the others go on. `opentrader-moomoo --help` lists the options. A chart the app has already opened
+reads the new bars after the plugin restarts.
+
 ## Limits of the user's account
 
 OpenD's quotas depend on the account: 100 to 2,000 live subscriptions, and history for 100 to 2,000 distinct

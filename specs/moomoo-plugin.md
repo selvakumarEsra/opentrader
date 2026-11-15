@@ -286,3 +286,53 @@ implementations:
 - `build.sh` without the key leaves the unsigned zip and says it was not signed. No catalog entry is written.
 <!-- id: REQ-MOOMOO-011.A2 -->
 - The zip's manifest names `opentrader-moomoo.exe` and `["windows"]` from `build.ps1`, and `opentrader-moomoo` and that system from `build.sh`.
+
+<!-- id: REQ-MOOMOO-012 -->
+## `opentrader-moomoo backfill` MUST fill the bar store with a list's whole history in one run
+
+Run by the user, outside the app:
+`opentrader-moomoo backfill [options] SYMBOL… | --file LIST`. For each symbol
+and each resolution (`--resolution`, default `1,1D`) it asks OpenD for every bar
+the store lacks, and stores them in the same series the app's charts read (with
+the same store options as the plugin's settings: `--clickhouse URL`,
+`--database`, `--user`, `--password`; else the embedded store). Without `--from`
+(dd/mm/yyyy or yyyy-mm-dd) it goes back as far as OpenD has bars: daily bars in
+one request, 1-minute bars in 30-day steps from now back to the first step
+with none. Windows the store already covers are not asked again, so a second run
+only fetches the bars since the first. A symbol OpenD refuses (quota, no rights)
+is reported and skipped, and the others go on. It prints the history quota
+OpenD reports before and after, and ends with a line per symbol and resolution.
+
+implementations:
+  - plugins/moomoo/src/cli.rs:backfill
+  - plugins/moomoo/src/history.rs:History.fill
+
+## Acceptance
+<!-- id: REQ-MOOMOO-012.A1 -->
+- Against a source with 1-minute bars in the last 70 days only, a backfill without `--from` stores them all and asks no step older than the first empty one.
+<!-- id: REQ-MOOMOO-012.A2 -->
+- A second backfill right after the first asks OpenD nothing for days already covered.
+<!-- id: REQ-MOOMOO-012.A3 -->
+- A symbol whose asks fail is reported as failed; the next symbol is still filled, and the run's exit code is not 0.
+<!-- id: REQ-MOOMOO-012.A4 -->
+- When one answer holds the most bars a request may collect, the store covers only up to its newest bar, so the rest is asked again.
+
+<!-- id: REQ-MOOMOO-013 -->
+## `opentrader-moomoo record` MUST keep a list's live 1-minute bars in the store
+
+`opentrader-moomoo record [options] SYMBOL… | --file LIST` connects to OpenD,
+subscribes the symbols' 1-minute K-lines (within the account's subscription
+quota), and stores each closed bar as the plugin does, until stopped (Ctrl+C).
+It writes every 30 s and when it stops. It subscribes again after a reconnect.
+Minutes missed while disconnected are not marked covered, so a later backfill
+or chart fetches them.
+
+implementations:
+  - plugins/moomoo/src/cli.rs:record
+  - plugins/moomoo/src/stream.rs:MinuteCover
+
+## Acceptance
+<!-- id: REQ-MOOMOO-013.A1 -->
+- Two closed minutes in a row cover the span from the first's start to the second's end; after a reconnect, the next closed minute covers only itself.
+<!-- id: REQ-MOOMOO-013.A2 -->
+- Symbols that are not the plugin's (`AAPL`, `XX:NOPE`) are refused before connecting, with the expected form.
