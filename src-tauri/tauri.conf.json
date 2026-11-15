@@ -46,9 +46,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERFOTE5N0MyMDEzMTk3MkQKUldRdGx6RUJ3cGVSM2d3NzdWUHNXRjFzYmFmVHZqSDZqSVlnN205bE9VL0tnaTUvcFd2MEhhbTkK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDUxMDE5OTBGNTE2OTc2RTkKUldUcGRtbFJENWtCVWFKZlUvdXFuS1RjQTUxV1dMc0RDNUJNNFZkN3hjTWorc0RRaEtyaUdKMG4K",
       "endpoints": [
-        "https://github.com/deepentropy/opentrader/releases/latest/download/latest.json"
+        "https://github.com/selvakumarEsra/opentrader/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "quiet"

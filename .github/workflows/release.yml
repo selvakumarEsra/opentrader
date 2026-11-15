@@ -7,6 +7,9 @@ name: Release
 #     builds all three into it, and publishes it once all three succeeded.
 #   - Manual run (Actions tab -> "Run workflow"): builds all three and uploads
 #     the installers as workflow artifacts only. No release is created.
+#   - In selvakumarEsra/opentrader the release also carries the moomoo plugin
+#     (plugin-moomoo.yml: its programs, signed zips, moomoo-SHA256SUMS), the
+#     market-data token is optional, and the website is not deployed.
 #
 # Outputs: Windows .exe (NSIS) + .msi, macOS universal .dmg + .app,
 # Linux .AppImage + .deb + .rpm, named OpenTrader_<platform>_<arch>.<ext>.
@@ -119,8 +122,12 @@ jobs:
         working-directory: opentrader
         run: |
           if [ -z "$OPENTRADER_GATEWAY_TOKEN" ]; then
-            echo "::error::OPENTRADER_GATEWAY_TOKEN secret is not set: the app would have no market data."
-            exit 1
+            if [ "$GITHUB_REPOSITORY" = "deepentropy/opentrader" ]; then
+              echo "::error::OPENTRADER_GATEWAY_TOKEN secret is not set: the app would have no market data."
+              exit 1
+            fi
+            # A fork: the app's own data feed is off; plugins (such as moomoo) serve data.
+            echo "::warning::OPENTRADER_GATEWAY_TOKEN is not set: the app's own market data is off; plugins still serve data."
           fi
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ] || [ -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]; then
             echo "::error::TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD secrets are not set: the update files cannot be signed."
@@ -213,10 +220,24 @@ jobs:
             opentrader/src-tauri/target/release/bundle/**
             opentrader/src-tauri/target/universal-apple-darwin/release/bundle/**
 
-  # All three installers are in: publish, so installed apps get the update.
+  # selvakumarEsra/opentrader: the moomoo plugin's files, added to the draft release.
+  plugins:
+    needs: draft
+    if: needs.draft.outputs.release_id != '' && github.repository == 'selvakumarEsra/opentrader'
+    permissions:
+      contents: write
+      id-token: write            # build provenance attestations
+      attestations: write
+    uses: ./.github/workflows/plugin-moomoo.yml
+    with:
+      release_tag: ${{ inputs.tag || github.ref_name }}
+    secrets: inherit
+
+  # All three installers (and in the fork the plugin) are in: publish, so installed apps get the update.
   publish:
-    needs: [draft, build]
-    if: needs.draft.outputs.release_id != ''
+    needs: [draft, build, plugins]
+    # Skipped plugins (upstream) do not hold the release back; failed ones do.
+    if: always() && needs.draft.outputs.release_id != '' && needs.build.result == 'success' && (needs.plugins.result == 'success' || needs.plugins.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -229,7 +250,7 @@ jobs:
   # The web version (demo.opentrader.markets) follows each release.
   web:
     needs: [draft, publish]
-    if: needs.draft.outputs.release_id != ''
+    if: needs.draft.outputs.release_id != '' && github.repository == 'deepentropy/opentrader'
     permissions:
       contents: read
       packages: write

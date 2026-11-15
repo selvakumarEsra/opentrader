@@ -7,6 +7,8 @@ name: Plugin moomoo
 #   - On a pushed tag plugin-moomoo-v<version> (git tag plugin-moomoo-v0.2.1 && git push origin plugin-moomoo-v0.2.1):
 #     the GitHub Release of the tag in selvakumarEsra/opentrader with the three programs and the three zips. The
 #     version must match plugins/moomoo/opentrader-plugin.json and Cargo.toml.
+#   - Called by the app's Release workflow (release.yml) with its release tag v<app version>: the same files, and
+#     moomoo-SHA256SUMS, uploaded to that (draft) release, which it publishes once everything is in.
 #   - Manual run (Actions tab -> "Run workflow"): the zips as workflow artifacts only.
 #
 # Outputs: opentrader-moomoo-<version>-windows-x86_64.exe, -macos-universal, -linux-x86_64 (the programs), and
@@ -21,9 +23,18 @@ on:
   push:
     tags: ['plugin-moomoo-v*']
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: 'The app release (v<version>) the plugin files are added to'
+        type: string
+        required: true
 
 env:
-  TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+  # The plugin's own tag (plugin-moomoo-v<version>) on a push of it; empty when called or run by hand.
+  TAG: ${{ !inputs.release_tag && github.ref_type == 'tag' && startsWith(github.ref_name, 'plugin-moomoo-v') && github.ref_name || '' }}
+  # The release the files go to: the app's when called, else the plugin's tag.
+  RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && startsWith(github.ref_name, 'plugin-moomoo-v') && github.ref_name) || '' }}
   # Where releases go: our repository, not upstream.
   RELEASE_REPO: selvakumarEsra/opentrader
 
@@ -53,6 +64,8 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Check version
         run: |
@@ -121,7 +134,7 @@ jobs:
           echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set: $ZIP is not signed and has no catalog entry."
 
       - name: Attest
-        if: env.TAG != '' && github.repository == 'selvakumarEsra/opentrader'
+        if: env.RELEASE_TAG != '' && github.repository == 'selvakumarEsra/opentrader'
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: plugins/moomoo/dist/*
@@ -135,7 +148,7 @@ jobs:
   release:
     needs: build
     # Only in our repository: a copy of this workflow upstream (or in another fork) never releases.
-    if: github.ref_type == 'tag' && github.repository == 'selvakumarEsra/opentrader'
+    if: github.repository == 'selvakumarEsra/opentrader' && (inputs.release_tag != '' || (github.ref_type == 'tag' && startsWith(github.ref_name, 'plugin-moomoo-v')))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -143,17 +156,25 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           path: dist
+          pattern: moomoo-*        # only the plugin's, also when called by the app's release
           merge-multiple: true
 
       - name: Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ -z "$TAG" ]; then
+            # Into the app's release, which already exists (a draft) and is published by release.yml.
+            (cd dist && sha256sum * > moomoo-SHA256SUMS && cat moomoo-SHA256SUMS)
+            gh release upload "$RELEASE_TAG" -R "$RELEASE_REPO" --clobber dist/*
+            exit 0
+          fi
           version="${TAG#plugin-moomoo-v}"
           (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
           prerelease=$([[ "$version" == *-* ]] && echo --prerelease || true)
+          # Never "Latest": the app's updater reads releases/latest/download/latest.json of the app's release.
           if ! gh release view "$TAG" -R "$RELEASE_REPO" > /dev/null 2>&1; then
-            gh release create "$TAG" -R "$RELEASE_REPO" --verify-tag $prerelease --title "moomoo plugin $version" --notes \
+            gh release create "$TAG" -R "$RELEASE_REPO" --verify-tag --latest=false $prerelease --title "moomoo plugin $version" --notes \
               "The moomoo plugin $version, one self-contained program per system: \`opentrader-moomoo-$version-<system>\` runs \`backfill\` and \`record\` on its own, and the zip of your system installs it in OpenTrader under Settings > Plugins > Install from file. See plugins/moomoo/README.md."
           fi
           gh release upload "$TAG" -R "$RELEASE_REPO" --clobber dist/*
