@@ -1,7 +1,7 @@
 # moomoo plugin
 
-A data plugin ([Plugin API](../PROTOCOL.md) 2, `datafeed`): symbols, bars and live prices of US, Hong Kong and
-China A-share stocks from the user's moomoo OpenD. Symbols are `US:AAPL`, `HK:00700`, `SH:600519`, `SZ:000001`.
+A data and broker plugin ([Plugin API](../PROTOCOL.md) 2, `datafeed` and `broker`): symbols, bars and live prices of
+US, Hong Kong and China A-share stocks from the user's moomoo OpenD, and trading of the user's paper and live accounts. Symbols are `US:AAPL`, `HK:00700`, `SH:600519`, `SZ:000001`.
 Contract: [`specs/moomoo-plugin.md`](../../specs/moomoo-plugin.md).
 
 ## How it works
@@ -29,6 +29,12 @@ Contract: [`specs/moomoo-plugin.md`](../../specs/moomoo-plugin.md).
   it). With a ClickHouse URL in Settings, a `moomoo_bars` ReplacingMergeTree table and `moomoo_covered`, created
   when missing. When a stored bar's close no longer matches OpenD's (a split or dividend adjusts history), the
   series is dropped and asked again.
+- **Trading** (`src/trade/`): each OpenD account and market it may trade is one app account, `SIM-<id>-US` (paper)
+  or `REAL-<id>-HK`; SH/SZ stocks trade in the HKCC or CN market. Netting positions; market, limit, stop and
+  stop-limit orders (DAY, or GTC when asked), no take profit / stop loss brackets. Orders go through Trd_PlaceOrder
+  and Trd_ModifyOrder; a position closes with a market order the other way. `broker.state` is sent after each order
+  or fill push and checked every 5 s. A live account trades only once the user has unlocked trading in OpenD; the
+  plugin keeps no trade password. `broker.quote` carries the last price only (Basic quotes have no bid and ask).
 - **Search** (`src/search.rs`): each market's stocks, funds and indexes, loaded once per session.
 
 ## Limits of the user's account
@@ -44,4 +50,4 @@ OPENTRADER_TEST_CLICKHOUSE=http://localhost:8123 cargo test clickhouse   # the s
 cargo build --release
 ```
 
-Not yet: the `broker` capability (OpenD's trading API), a Windows package and a catalog entry.
+Not yet: a Windows package and a catalog entry.

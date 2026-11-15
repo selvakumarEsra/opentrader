@@ -12,6 +12,17 @@ pub const QOT_UPDATE_KL: u32 = 3007;
 pub const QOT_HISTORY_KL: u32 = 3103;
 pub const QOT_STATIC_INFO: u32 = 3202;
 
+pub const TRD_GET_ACC_LIST: u32 = 2001;
+pub const TRD_SUB_ACC_PUSH: u32 = 2008;
+pub const TRD_GET_FUNDS: u32 = 2101;
+pub const TRD_GET_POSITION_LIST: u32 = 2102;
+pub const TRD_GET_ORDER_LIST: u32 = 2201;
+pub const TRD_PLACE_ORDER: u32 = 2202;
+pub const TRD_MODIFY_ORDER: u32 = 2205;
+pub const TRD_UPDATE_ORDER: u32 = 2208;
+pub const TRD_GET_ORDER_FILL_LIST: u32 = 2211;
+pub const TRD_UPDATE_ORDER_FILL: u32 = 2218;
+
 pub const PACKET_ENC_NONE: i32 = -1;
 pub const PACKET_ENC_AES_CBC: i32 = 2;
 pub const SUB_BASIC: i32 = 1;
@@ -21,7 +32,7 @@ pub const KL_1MIN: i32 = 1;
 
 /// Messages OpenD sends unasked.
 pub fn is_push(proto: u32) -> bool {
-    matches!(proto, QOT_UPDATE_BASIC | QOT_UPDATE_KL)
+    matches!(proto, QOT_UPDATE_BASIC | QOT_UPDATE_KL | TRD_UPDATE_ORDER | TRD_UPDATE_ORDER_FILL)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

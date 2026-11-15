@@ -3,9 +3,9 @@
   "name": "moomoo",
   "version": "0.1.0",
   "publisher": "OpenTrader",
-  "description": "Symbols, bars and live prices of US, Hong Kong and China A-share stocks from your moomoo OpenD.",
+  "description": "Symbols, bars and live prices of US, Hong Kong and China A-share stocks, and trading of your paper and live moomoo accounts, through your moomoo OpenD.",
   "api": 2,
-  "provides": ["datafeed"],
+  "provides": ["datafeed", "broker"],
   "exchanges": ["US", "HK", "SH", "SZ"],
   "runtime": { "type": "process", "entry": "opentrader-moomoo", "args": [] },
   "settings": [
@@ -23,7 +23,7 @@
     { "key": "clickhousePassword", "label": "ClickHouse password", "type": "text", "default": "",
       "help": "Kept in OpenTrader's settings as you type it." }
   ],
-  "setup": "Start moomoo OpenD and log in with your moomoo account (the first time, complete the API questionnaire it asks for). For OpenD on another computer, turn on its encryption and give the plugin the same RSA key file. The plugin connects within a few seconds and retries while OpenD is closed. Then open a symbol such as US:AAPL or HK:00700.",
+  "setup": "Start moomoo OpenD and log in with your moomoo account (the first time, complete the API questionnaire it asks for). For OpenD on another computer, turn on its encryption and give the plugin the same RSA key file. The plugin connects within a few seconds and retries while OpenD is closed. Then open a symbol such as US:AAPL or HK:00700. To trade, choose moomoo in Trade > Connect broker…: paper accounts trade at once; a live account trades once you have unlocked trading in OpenD with your trade password (the plugin never asks for it).",
   "homepage": "https://github.com/deepentropy/opentrader/tree/main/plugins/moomoo",
   "platforms": ["macos", "linux"]
 }

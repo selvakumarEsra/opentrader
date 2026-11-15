@@ -1,8 +1,9 @@
 /*
- * OpenTrader's moomoo plugin: a data plugin (plugins/PROTOCOL.md, Plugin API 2) between the app and the user's
- * moomoo OpenD. The app starts it with its address and token in the environment; `run_session` says hello, then
- * answers `data.search`, `data.symbolInfo` and `data.bars` from OpenD and streams `data.quote` for the symbols of
- * `data.subscribe`, until the app closes the connection. Symbols are whole: `US:AAPL`, `HK:00700`.
+ * OpenTrader's moomoo plugin: a data and broker plugin (plugins/PROTOCOL.md, Plugin API 2) between the app and the
+ * user's moomoo OpenD. The app starts it with its address and token in the environment; `run_session` says hello,
+ * then answers `data.search`, `data.symbolInfo` and `data.bars` from OpenD, streams `data.quote` for the symbols of
+ * `data.subscribe`, and trades through `broker.*` (`trade/`), until the app closes the connection. Symbols are
+ * whole: `US:AAPL`, `HK:00700`.
  */
 pub mod bars;
 pub mod history;
@@ -14,11 +15,12 @@ pub mod rpc;
 pub mod search;
 pub mod store;
 pub mod stream;
+pub mod trade;
 
 use bars::OpenD;
 use history::{Ask, History};
 use market::security_of;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use store::{clickhouse::ClickHouse, Backend, Key, Store};
 use opend::client::{Client, Event};
 use opend::proto;
@@ -53,6 +55,10 @@ struct Plugin {
     last_closed: Mutex<HashMap<String, i64>>,
     catalog: Catalog,
     subs: tokio::sync::Mutex<Subscriptions>,
+    /// The tickers of `data.subscribe` and of `broker.watchQuote`: both are subscribed at OpenD.
+    data_tickers: Mutex<BTreeSet<String>>,
+    quote_tickers: Mutex<BTreeSet<String>>,
+    broker: trade::Broker,
     quotes: Mutex<Quotes>,
     out: Out,
 }
@@ -103,18 +109,24 @@ pub async fn run_session_with(addr: &str, plugin: &str, token: &str, opend: &str
     let store = Arc::new(Store::new(Backend::embedded()));
     let me = Arc::new(Plugin {
         history: History { source: OpenD { client: client.clone(), pace: Pace::history() }, store: store.clone() },
+        broker: trade::Broker::new(client.clone(), out.clone()),
         client,
         store,
         store_settings: tokio::sync::Mutex::new(None),
         last_closed: Mutex::new(HashMap::new()),
         catalog: Catalog::default(),
         subs: tokio::sync::Mutex::new(Subscriptions::default()),
+        data_tickers: Mutex::new(BTreeSet::new()),
+        quote_tickers: Mutex::new(BTreeSet::new()),
         quotes: Mutex::new(Quotes::default()),
         out: out.clone(),
     });
     tokio::spawn(me.clone().pump(events));
     tokio::spawn(me.clone().release());
     tokio::spawn(me.clone().flush_often());
+    me.broker.send_state().await;
+    let broker = me.clone();
+    tokio::spawn(async move { broker.broker.refresh_often().await });
 
     while let Ok(Some(line)) = lines.next_line().await {
         let msg: Value = match serde_json::from_str(&line) {
@@ -166,6 +178,10 @@ struct ConfigureParams {
     settings: std::collections::HashMap<String, String>,
 }
 
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[derive(Deserialize)]
 struct SubscribeParams {
     tickers: Vec<String>,
@@ -194,7 +210,10 @@ impl Plugin {
                 let bars = self.history.bars(ask, chrono::Utc::now().timestamp()).await?;
                 Ok(json!({ "bars": bars }))
             }
-            _ => Err(RpcError::new(UNKNOWN_METHOD, format!("Unknown method {method}"))),
+            _ => match self.broker.request(method, p).await {
+                Some(answer) => answer,
+                None => Err(RpcError::new(UNKNOWN_METHOD, format!("Unknown method {method}"))),
+            },
         }
     }
 
@@ -226,9 +245,12 @@ impl Plugin {
                 self.client.set_key(p.settings.get("rsaKeyFile").cloned());
                 self.configure_store(&p.settings).await;
             }
-            "data.subscribe" => {
+            "data.subscribe" | "broker.watchQuote" => {
                 let Ok(p) = serde_json::from_value::<SubscribeParams>(p) else { return };
-                let new = self.subs.lock().await.set(p.tickers, tokio::time::Instant::now());
+                let set = if method == "data.subscribe" { &self.data_tickers } else { &self.quote_tickers };
+                *locked(set) = p.tickers.into_iter().collect();
+                let wanted: Vec<String> = locked(&self.data_tickers).union(&locked(&self.quote_tickers)).cloned().collect();
+                let new = self.subs.lock().await.set(wanted, tokio::time::Instant::now());
                 self.subscribe(new).await;
             }
             _ => {}
@@ -256,6 +278,12 @@ impl Plugin {
                     let again = self.subs.lock().await.reconnected(tokio::time::Instant::now());
                     let me = self.clone();
                     tokio::spawn(async move { me.subscribe(again).await });
+                    let me = self.clone();
+                    tokio::spawn(async move { me.broker.connected().await });
+                }
+                Event::Push { proto: p @ (proto::TRD_UPDATE_ORDER | proto::TRD_UPDATE_ORDER_FILL), s2c } => {
+                    let me = self.clone();
+                    tokio::spawn(async move { me.broker.push(p, &s2c).await });
                 }
                 Event::Push { proto: proto::QOT_UPDATE_KL, s2c } => {
                     let closed = self.quotes.lock().unwrap_or_else(|e| e.into_inner()).minute_push(&s2c, now);
@@ -268,8 +296,16 @@ impl Plugin {
                         let subs = self.subs.lock().await;
                         self.quotes.lock().unwrap_or_else(|e| e.into_inner()).basic_push(&s2c, &subs, now)
                     };
+                    let (data, watched) = (locked(&self.data_tickers).clone(), locked(&self.quote_tickers).clone());
                     for q in sent {
-                        self.out.notify("data.quote", q);
+                        let ticker = q["ticker"].as_str().unwrap_or_default();
+                        if watched.contains(ticker) {
+                            // Basic quotes carry no bid and ask: the ticket shows the last price.
+                            self.out.notify("broker.quote", json!({ "ticker": ticker, "bid": null, "ask": null, "last": q["price"] }));
+                        }
+                        if data.contains(ticker) {
+                            self.out.notify("data.quote", q);
+                        }
                     }
                 }
                 Event::Push { .. } => {}

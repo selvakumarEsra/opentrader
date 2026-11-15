@@ -117,6 +117,22 @@ async fn fake_opend_sealed(pem: Option<String>) -> String {
                         sock.write_all(&out).await.unwrap();
                         continue;
                     }
+                    2001 => ok(json!({"accList":[{"trdEnv":0,"accID":"1","trdMarketAuthList":[2,1]}]})),
+                    2101 => ok(json!({"funds":{"power":5000,"totalAssets":10000,"cash":9000,"marketVal":1000,"unrealizedPL":12.5,"realizedPL":0}})),
+                    2102 => ok(json!({"positionList":[{"positionID":"55","positionSide":0,"code":"AAPL","secMarket":2,"qty":10,"costPrice":150,"price":160,"plVal":100}]})),
+                    2202 => {
+                        let c = &req["c2s"];
+                        assert_eq!((c["trdSide"].as_i64(), c["orderType"].as_i64(), c["code"].as_str(), c["secMarket"].as_i64()), (Some(1), Some(11), Some("AAPL"), Some(2)));
+                        assert_eq!((c["qty"].as_f64(), c["price"].as_f64(), c["auxPrice"].as_f64()), (Some(10.0), Some(101.0), Some(100.0)));
+                        assert_eq!((c["header"]["accID"].as_str(), c["packetID"]["connID"].as_str()), (Some("1"), Some("1")));
+                        // The order fills at once: OpenD pushes it.
+                        let order = json!({"header":c["header"],"order":{"trdSide":1,"orderType":11,"orderStatus":11,"orderID":"88","code":"AAPL",
+                            "secMarket":2,"qty":10,"price":101,"auxPrice":100,"fillQty":10,"fillAvgPrice":100.5,"updateTimestamp":1746799230.0}});
+                        out.extend(encode(2202, f.serial, &ok(json!({"header":c["header"],"orderID":"88"}))));
+                        out.extend(encode(2208, 0, &ok(order)));
+                        sock.write_all(&out).await.unwrap();
+                        continue;
+                    }
                     _ => ok(json!({})),
                 };
                 out.extend(encode(f.proto, f.serial, &answer));
@@ -230,4 +246,38 @@ async fn an_unreadable_key_file_keeps_the_plugin_from_connecting_in_plain() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let a = app.ask(5, "data.symbolInfo", json!({"ticker":"US:AAPL"})).await;
     assert!(a.get("error").is_some(), "{a}");
+}
+
+#[tokio::test]
+async fn an_order_is_placed_and_its_fill_is_told() {
+    let mut app = FakeApp::start(fake_opend().await).await;
+    let state = loop {
+        let m = app.next().await;
+        if m["method"] == "broker.state" && m["params"]["connected"] == true {
+            break m["params"].clone();
+        }
+    };
+    let ids: Vec<&str> = state["accounts"].as_array().unwrap().iter().filter_map(|a| a["id"].as_str()).collect();
+    assert_eq!(ids, ["SIM-1-US", "SIM-1-HK"]);
+    assert_eq!((state["account"]["isDemo"].as_bool(), state["account"]["equity"].as_f64()), (Some(true), Some(10_000.0)));
+    assert_eq!(state["positions"][0]["ticker"], "US:AAPL");
+
+    app.send(json!({"jsonrpc":"2.0","id":7,"method":"broker.place","params":{"ticker":"US:AAPL","side":"buy","type":"stopLimit",
+        "qty":10,"limitPrice":101,"stopPrice":100,"takeProfit":null,"stopLoss":null}})).await;
+    // The fill's push may be told before the answer.
+    let (mut answer, mut event) = (None, None);
+    while answer.is_none() || event.is_none() {
+        let m = app.next().await;
+        if m["id"] == 7 {
+            answer = Some(m);
+        } else if m["method"] == "broker.event" {
+            event = Some(m["params"].clone());
+        }
+    }
+    let (a, event) = (answer.unwrap(), event.unwrap());
+    assert_eq!(a["result"]["orderId"], "88", "{a}");
+    assert_eq!((event["kind"].as_str(), event["price"].as_f64()), (Some("executed"), Some(100.5)));
+
+    let refused = app.ask(8, "broker.place", json!({"ticker":"HK:00700","side":"buy","type":"market","qty":100})).await;
+    assert!(refused["error"]["message"].as_str().unwrap().contains("does not trade"), "{refused}");
 }
