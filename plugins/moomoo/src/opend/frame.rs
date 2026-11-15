@@ -1,7 +1,8 @@
 /*
  * OpenD's framing: a 44-byte header, then the body. The header is
  *   'F' 'T' | proto id u32 | format u8 | version u8 | serial u32 | body length u32 | SHA-1 of the body (20) | 8 reserved
- * with the numbers little endian. The plugin always sends JSON bodies (format 1).
+ * with the numbers little endian. The plugin always sends JSON bodies (format 1). On an encrypted connection the
+ * body is sent encrypted, its length that of the encrypted body, and the SHA-1 still that of the plain body.
  */
 use sha1::{Digest, Sha1};
 
@@ -22,6 +23,7 @@ pub enum FrameError {
     BadMagic,
     TooLarge(usize),
     BadChecksum { proto: u32 },
+    Sealed(String),
 }
 
 impl std::fmt::Display for FrameError {
@@ -30,11 +32,18 @@ impl std::fmt::Display for FrameError {
             FrameError::BadMagic => f.write_str("OpenD sent a message without its FT header"),
             FrameError::TooLarge(n) => write!(f, "OpenD sent a message of {n} bytes"),
             FrameError::BadChecksum { proto } => write!(f, "OpenD message {proto} failed its checksum"),
+            FrameError::Sealed(e) => f.write_str(e),
         }
     }
 }
 
 pub fn encode(proto: u32, serial: u32, body: &[u8]) -> Vec<u8> {
+    encode_sealed(proto, serial, body, body)
+}
+
+/// `sealed` (the encrypted `plain`) under a header carrying `plain`'s SHA-1.
+pub fn encode_sealed(proto: u32, serial: u32, plain: &[u8], sealed: &[u8]) -> Vec<u8> {
+    let body = sealed;
     let mut out = Vec::with_capacity(HEADER_LEN + body.len());
     out.extend_from_slice(b"FT");
     out.extend_from_slice(&proto.to_le_bytes());
@@ -42,7 +51,7 @@ pub fn encode(proto: u32, serial: u32, body: &[u8]) -> Vec<u8> {
     out.push(0);
     out.extend_from_slice(&serial.to_le_bytes());
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.extend_from_slice(&Sha1::digest(body));
+    out.extend_from_slice(&Sha1::digest(plain));
     out.extend_from_slice(&[0; 8]);
     out.extend_from_slice(body);
     out
@@ -50,6 +59,11 @@ pub fn encode(proto: u32, serial: u32, body: &[u8]) -> Vec<u8> {
 
 /// The first whole frame of `buf`, removed from it; `None` while it has not all arrived.
 pub fn decode(buf: &mut Vec<u8>) -> Result<Option<Frame>, FrameError> {
+    decode_with(buf, |_, b| Ok(b.to_vec()))
+}
+
+/// As `decode`, the body opened by `open` (proto, sealed body) before its checksum is checked.
+pub fn decode_with(buf: &mut Vec<u8>, open: impl Fn(u32, &[u8]) -> Result<Vec<u8>, String>) -> Result<Option<Frame>, FrameError> {
     if buf.len() < HEADER_LEN {
         return Ok(None);
     }
@@ -64,7 +78,7 @@ pub fn decode(buf: &mut Vec<u8>) -> Result<Option<Frame>, FrameError> {
     if buf.len() < HEADER_LEN + len {
         return Ok(None);
     }
-    let body = buf[HEADER_LEN..HEADER_LEN + len].to_vec();
+    let body = open(proto, &buf[HEADER_LEN..HEADER_LEN + len]).map_err(FrameError::Sealed)?;
     if Sha1::digest(&body)[..] != buf[16..36] {
         return Err(FrameError::BadChecksum { proto });
     }

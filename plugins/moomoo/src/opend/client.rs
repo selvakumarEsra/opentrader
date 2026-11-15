@@ -2,8 +2,10 @@
  * One connection to OpenD, kept up for the whole session: connect, InitConnect, KeepAlive at the interval OpenD
  * asks for, and again 5 s after each loss (or at once when the user changes the address). Answers find their
  * request by serial number; pushes go out as events, after a `Connected` event that tells the stream to subscribe
- * again.
+ * again. Requests wait for InitConnect to be done. With the user's RSA key the connection is encrypted
+ * (`crypt.rs`); when the key cannot be read the plugin does not connect at all.
  */
+use super::crypt::{Aes, Rsa, Seal};
 use super::frame::{self, Frame};
 use super::proto;
 use serde_json::{json, Value};
@@ -30,10 +32,29 @@ pub enum Event {
 }
 
 type Answer = oneshot::Sender<Result<Value, String>>;
+/// A message to send: proto, serial and plain body; the writer encrypts it for its connection.
+type Outgoing = (u32, u32, Vec<u8>);
+type Link = mpsc::UnboundedSender<Outgoing>;
+
+/// Where OpenD is, and the RSA key file when the connection is encrypted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Target {
+    addr: String,
+    key: Option<String>,
+}
+
+/// Who InitConnect says this connection is: trading needs both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Login {
+    pub conn_id: u64,
+    pub user_id: u64,
+}
 
 struct Inner {
-    addr: watch::Sender<String>,
-    link: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    target: watch::Sender<Target>,
+    /// The connection, once InitConnect is done.
+    link: Mutex<Option<Link>>,
+    login: Mutex<Option<Login>>,
     pending: Mutex<HashMap<u32, Answer>>,
     serial: AtomicU32,
     events: mpsc::UnboundedSender<Event>,
@@ -50,8 +71,9 @@ impl Client {
     pub fn new(addr: String) -> (Client, mpsc::UnboundedReceiver<Event>) {
         let (events, rx) = mpsc::unbounded_channel();
         let inner = Inner {
-            addr: watch::Sender::new(addr),
+            target: watch::Sender::new(Target { addr, key: None }),
             link: Mutex::new(None),
+            login: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             serial: AtomicU32::new(0),
             events,
@@ -60,22 +82,37 @@ impl Client {
     }
 
     pub fn addr(&self) -> String {
-        self.0.addr.borrow().clone()
+        self.0.target.borrow().addr.clone()
     }
 
     /// A new address: the connection moves to it at once.
     pub fn set_addr(&self, addr: String) {
-        self.0.addr.send_if_modified(|a| (*a != addr).then(|| *a = addr).is_some());
+        self.0.target.send_if_modified(|t| (t.addr != addr).then(|| t.addr = addr).is_some());
+    }
+
+    /// The RSA key file OpenD is set up with, or none for a plain connection: the connection starts again with it.
+    pub fn set_key(&self, key: Option<String>) {
+        let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+        self.0.target.send_if_modified(|t| (t.key != key).then(|| t.key = key).is_some());
+    }
+
+    /// The connection's login, while connected.
+    pub fn login(&self) -> Option<Login> {
+        *locked(&self.0.login)
     }
 
     /// `c2s` as message `proto`; the answer's `s2c`, or OpenD's reason when it refused.
     pub async fn request(&self, proto: u32, c2s: Value) -> Result<Value, String> {
         let link = locked(&self.0.link).clone().ok_or_else(|| self.unreachable())?;
+        self.exchange(&link, proto, c2s).await
+    }
+
+    async fn exchange(&self, link: &Link, proto: u32, c2s: Value) -> Result<Value, String> {
         let serial = self.0.serial.fetch_add(1, Ordering::Relaxed).wrapping_add(1).max(1);
         let (tx, rx) = oneshot::channel();
         locked(&self.0.pending).insert(serial, tx);
         let body = serde_json::to_vec(&json!({ "c2s": c2s })).map_err(|e| e.to_string())?;
-        if link.send(frame::encode(proto, serial, &body)).is_err() {
+        if link.send((proto, serial, body)).is_err() {
             locked(&self.0.pending).remove(&serial);
             return Err(self.unreachable());
         }
@@ -96,10 +133,11 @@ impl Client {
     /// Keeps the connection up until the process ends.
     pub async fn run(self) {
         let mut down_logged = false;
-        let mut addr_rx = self.0.addr.subscribe();
+        let mut target_rx = self.0.target.subscribe();
         loop {
-            let addr = self.addr();
-            match self.session(&addr, &mut addr_rx).await {
+            let target = target_rx.borrow_and_update().clone();
+            let addr = target.addr.clone();
+            match self.session(&target, &mut target_rx).await {
                 Ok(()) => {
                     println!("[warn] the connection to OpenD at {addr} ended");
                     down_logged = false;
@@ -112,51 +150,76 @@ impl Client {
             }
             tokio::select! {
                 _ = tokio::time::sleep(RETRY) => {}
-                _ = addr_rx.changed() => down_logged = false,
+                _ = target_rx.changed() => down_logged = false,
             }
         }
     }
 
     /// One connection: Ok when it was up and then lost, Err when it never came up.
-    async fn session(&self, addr: &str, addr_rx: &mut watch::Receiver<String>) -> Result<(), String> {
+    async fn session(&self, target: &Target, target_rx: &mut watch::Receiver<Target>) -> Result<(), String> {
+        let addr = target.addr.as_str();
+        // No plain connection when the user asked for an encrypted one.
+        let rsa = target.key.as_deref().map(Rsa::read).transpose()?;
+        let seal = Arc::new(Mutex::new(Seal { rsa, aes: None }));
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| format!("OpenD is not reachable at {addr}"))?
             .map_err(|e| format!("OpenD is not reachable at {addr}: {e}"))?;
         let _ = stream.set_nodelay(true);
         let (read, mut write) = stream.into_split();
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Outgoing>();
+        let writer_seal = seal.clone();
         let writer = tokio::spawn(async move {
-            while let Some(bytes) = rx.recv().await {
+            while let Some((proto, serial, plain)) = rx.recv().await {
+                let sealed = locked(&writer_seal).close(proto, &plain);
+                let bytes = match sealed {
+                    Ok(sealed) => frame::encode_sealed(proto, serial, &plain, &sealed),
+                    Err(e) => {
+                        println!("[error] {e}");
+                        return;
+                    }
+                };
                 if write.write_all(&bytes).await.is_err() {
                     return;
                 }
             }
         });
-        *locked(&self.0.link) = Some(tx);
         let me = self.clone();
-        let mut reader = tokio::spawn(async move { me.read_loop(read).await });
-        addr_rx.mark_unchanged();
+        let reader_seal = seal.clone();
+        let mut reader = tokio::spawn(async move { me.read_loop(read, reader_seal).await });
 
+        let encrypted = locked(&seal).is_on();
+        let algo = if encrypted { proto::PACKET_ENC_AES_CBC } else { proto::PACKET_ENC_NONE };
         let init = self
-            .request(proto::INIT_CONNECT, json!({
+            .exchange(&tx, proto::INIT_CONNECT, json!({
                 "clientVer": CLIENT_VER, "clientID": "opentrader-moomoo", "recvNotify": false,
-                "packetEncAlgo": proto::PACKET_ENC_NONE, "pushProtoFmt": frame::FORMAT_JSON,
+                "packetEncAlgo": algo, "pushProtoFmt": frame::FORMAT_JSON,
                 "programmingLanguage": "Rust",
             }))
-            .await;
+            .await
+            .and_then(|s2c| {
+                if encrypted {
+                    let key = s2c.get("connAESKey").and_then(Value::as_str).unwrap_or_default();
+                    let iv = s2c.get("aesCBCiv").and_then(Value::as_str);
+                    locked(&seal).aes = Some(Aes::new(key.as_bytes(), iv.map(str::as_bytes))?);
+                }
+                Ok(s2c)
+            });
         let result = match init {
             Err(e) => Err(format!("OpenD at {addr} refused the connection: {e}")),
             Ok(s2c) => {
+                let id = |k: &str| s2c.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())).unwrap_or(0);
+                *locked(&self.0.login) = Some(Login { conn_id: id("connID"), user_id: id("loginUserID") });
+                *locked(&self.0.link) = Some(tx);
                 let every = s2c.get("keepAliveInterval").and_then(Value::as_u64).unwrap_or(10).max(1);
-                println!("[info] connected to OpenD at {addr}");
+                println!("[info] connected to OpenD at {addr}{}", if encrypted { ", encrypted" } else { "" });
                 let _ = self.0.events.send(Event::Connected);
                 let mut beat = tokio::time::interval(Duration::from_secs(every));
                 beat.tick().await;
                 loop {
                     tokio::select! {
                         _ = &mut reader => break,
-                        _ = addr_rx.changed() => break,
+                        _ = target_rx.changed() => break,
                         _ = beat.tick() => {
                             let me = self.clone();
                             let now = chrono::Utc::now().timestamp();
@@ -168,6 +231,7 @@ impl Client {
             }
         };
         *locked(&self.0.link) = None;
+        *locked(&self.0.login) = None;
         writer.abort();
         reader.abort();
         // Whoever still waits learns the connection is gone (their sender is dropped).
@@ -175,12 +239,12 @@ impl Client {
         result
     }
 
-    async fn read_loop(self, mut read: OwnedReadHalf) {
+    async fn read_loop(self, mut read: OwnedReadHalf, seal: Arc<Mutex<Seal>>) {
         let mut buf = Vec::with_capacity(64 << 10);
         let mut chunk = vec![0u8; 64 << 10];
         loop {
             loop {
-                match frame::decode(&mut buf) {
+                match frame::decode_with(&mut buf, |proto, body| locked(&seal).open(proto, body)) {
                     Ok(Some(f)) => self.dispatch(f),
                     Ok(None) => break,
                     Err(e) => {

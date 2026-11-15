@@ -9,6 +9,9 @@ Contract: [`specs/moomoo-plugin.md`](../../specs/moomoo-plugin.md).
 - **OpenD connection** (`src/opend/`): plain TCP to OpenD (default `127.0.0.1:11111`, Settings > Plugins). Each
   message is OpenD's 44-byte header and a JSON body (format 1), so no protobuf toolchain is needed. InitConnect,
   then KeepAlive at the interval OpenD asks for; reconnects every 5 s while OpenD is closed.
+  With "RSA private key file" set (the key file also set in OpenD), the connection is encrypted
+  (`src/opend/crypt.rs`): InitConnect in RSA, then AES-CBC with the key OpenD returns. An unreadable key file is
+  logged and the plugin stays disconnected rather than connect in plain.
 - **Bars** (`src/history.rs`, `src/bars.rs`): `data.bars` is answered from the bar store when it holds the window.
   Only the missing parts that can hold trading time (`src/hours.rs`: weekdays, sessions, the US 04:00–20:00
   extended day) are asked of OpenD, through Qot_RequestHistoryKL, forward-adjusted, every page. The 3-, 5-, 15- and
@@ -41,5 +44,4 @@ OPENTRADER_TEST_CLICKHOUSE=http://localhost:8123 cargo test clickhouse   # the s
 cargo build --release
 ```
 
-Not yet: the `broker` capability (OpenD's trading API), encrypted OpenD connections, a Windows package and a
-catalog entry.
+Not yet: the `broker` capability (OpenD's trading API), a Windows package and a catalog entry.

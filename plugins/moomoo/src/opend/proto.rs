@@ -13,6 +13,7 @@ pub const QOT_HISTORY_KL: u32 = 3103;
 pub const QOT_STATIC_INFO: u32 = 3202;
 
 pub const PACKET_ENC_NONE: i32 = -1;
+pub const PACKET_ENC_AES_CBC: i32 = 2;
 pub const SUB_BASIC: i32 = 1;
 pub const SUB_KL_1MIN: i32 = 11;
 pub const REHAB_FORWARD: i32 = 1;

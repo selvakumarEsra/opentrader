@@ -223,6 +223,7 @@ impl Plugin {
                 let host = p.settings.get("host").map(|h| h.trim()).filter(|h| !h.is_empty()).unwrap_or("127.0.0.1");
                 let port = p.settings.get("port").and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(11111);
                 self.client.set_addr(format!("{host}:{port}"));
+                self.client.set_key(p.settings.get("rsaKeyFile").cloned());
                 self.configure_store(&p.settings).await;
             }
             "data.subscribe" => {

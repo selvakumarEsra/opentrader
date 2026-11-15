@@ -3,6 +3,7 @@
  * asked of OpenD and stamped at their start, a subscription turned into quotes, symbol info, and the error when
  * OpenD is not running.
  */
+use opentrader_moomoo::opend::crypt::{Aes, Rsa, Seal};
 use opentrader_moomoo::opend::frame;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -69,20 +70,31 @@ fn ok(s2c: Value) -> Value {
 /// A fake OpenD on its own port: answers InitConnect, history, static info and subscriptions; after a
 /// subscription it pushes one 1-minute K-line and one Basic quote of AAPL.
 async fn fake_opend() -> String {
+    fake_opend_sealed(None).await
+}
+
+/// The fake OpenD; with `pem`, encrypted as a real one holding that RSA key: RSA for InitConnect, then AES-CBC.
+async fn fake_opend_sealed(pem: Option<String>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
+        let mut seal = Seal { rsa: pem.as_deref().map(|p| Rsa::from_pem(p).unwrap()), aes: None };
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
         loop {
-            while let Some(f) = frame::decode(&mut buf).unwrap() {
+            while let Some(f) = frame::decode_with(&mut buf, |proto, body| seal.open(proto, body)).unwrap() {
+                let encode = |proto: u32, serial: u32, v: &Value| {
+                    let plain = serde_json::to_vec(v).unwrap();
+                    frame::encode_sealed(proto, serial, &plain, &seal.close(proto, &plain).unwrap())
+                };
                 let req: Value = serde_json::from_slice(&f.body).unwrap();
                 let mut out = Vec::new();
                 let answer = match f.proto {
                     1001 => {
-                        assert_eq!(req["c2s"]["packetEncAlgo"], -1);
-                        ok(json!({"serverVer":1,"loginUserID":"1","connID":"1","connAESKey":"0123456789abcdef","keepAliveInterval":10}))
+                        assert_eq!(req["c2s"]["packetEncAlgo"], if seal.is_on() { 2 } else { -1 });
+                        ok(json!({"serverVer":1,"loginUserID":"1","connID":"1","connAESKey":"0123456789abcdef",
+                            "aesCBCiv":"fedcba9876543210","keepAliveInterval":10}))
                     }
                     3103 => {
                         assert_eq!((req["c2s"]["klType"].as_i64(), req["c2s"]["security"]["code"].as_str()), (Some(1), Some("AAPL")));
@@ -99,15 +111,18 @@ async fn fake_opend() -> String {
                         let basic = json!({"basicQotList":[{"security":{"market":11,"code":"AAPL"},"isSuspended":false,"listTime":"",
                             "priceSpread":0.01,"updateTime":"","highPrice":202,"openPrice":198,"lowPrice":197,"curPrice":200.5,
                             "lastClosePrice":196,"volume":"1000000","turnover":0,"turnoverRate":0,"amplitude":0,"updateTimestamp":1746799230.0}]});
-                        out.extend(frame::encode(3001, f.serial, &serde_json::to_vec(&ok(json!({}))).unwrap()));
-                        out.extend(frame::encode(3007, 0, &serde_json::to_vec(&ok(kl)).unwrap()));
-                        out.extend(frame::encode(3005, 0, &serde_json::to_vec(&ok(basic)).unwrap()));
+                        out.extend(encode(3001, f.serial, &ok(json!({}))));
+                        out.extend(encode(3007, 0, &ok(kl)));
+                        out.extend(encode(3005, 0, &ok(basic)));
                         sock.write_all(&out).await.unwrap();
                         continue;
                     }
                     _ => ok(json!({})),
                 };
-                out.extend(frame::encode(f.proto, f.serial, &serde_json::to_vec(&answer).unwrap()));
+                out.extend(encode(f.proto, f.serial, &answer));
+                if f.proto == 1001 && seal.is_on() {
+                    seal.aes = Some(Aes::new(b"0123456789abcdef", Some(b"fedcba9876543210")).unwrap());
+                }
                 sock.write_all(&out).await.unwrap();
             }
             match sock.read(&mut chunk).await {
@@ -176,4 +191,43 @@ async fn without_opend_a_request_names_the_address() {
     assert_eq!(a["error"]["code"], -32602);
     let a = app.ask(4, "data.nope", json!({})).await;
     assert_eq!(a["error"]["code"], -32601);
+}
+
+fn write_key(name: &str) -> (String, String) {
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap();
+    let pem = key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap().to_string();
+    let path = std::env::temp_dir().join(format!("opentrader-moomoo-{name}-{}.pem", std::process::id()));
+    std::fs::write(&path, &pem).unwrap();
+    (pem, path.to_string_lossy().into_owned())
+}
+
+fn configure(host_port: &str, key: &str) -> Value {
+    let (host, port) = host_port.split_once(':').unwrap();
+    json!({"jsonrpc":"2.0","method":"plugin.configure","params":{"settings":{"host":host,"port":port,"rsaKeyFile":key}}})
+}
+
+#[tokio::test]
+async fn with_the_rsa_key_the_session_is_encrypted() {
+    let (pem, path) = write_key("good");
+    let opend = fake_opend_sealed(Some(pem)).await;
+    // Started at a closed port, then moved to the encrypted OpenD with its key.
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string();
+    let mut app = FakeApp::start(closed).await;
+    app.send(configure(&opend, &path)).await;
+    let info = ask_until_connected(&mut app, "data.symbolInfo", json!({"ticker":"US:AAPL"})).await;
+    assert_eq!(info["result"]["description"].as_str(), Some("Apple Inc."), "{info}");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn an_unreadable_key_file_keeps_the_plugin_from_connecting_in_plain() {
+    // A plain fake OpenD: a plain connection to it would answer.
+    let opend = fake_opend().await;
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string();
+    let mut app = FakeApp::start(closed).await;
+    app.send(configure(&opend, "/nonexistent/opend-key.pem")).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let a = app.ask(5, "data.symbolInfo", json!({"ticker":"US:AAPL"})).await;
+    assert!(a.get("error").is_some(), "{a}");
 }
