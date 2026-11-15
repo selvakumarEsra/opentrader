@@ -263,7 +263,7 @@ pub async fn record(client: &Client, events: &mut tokio::sync::mpsc::UnboundedRe
             Err(e) => println!("[warn] OpenD refused the subscription: {e}"),
         }
     };
-    subscribe().await;
+    // No subscribe here: the connection `connect` waited for is already queued as `Event::Connected`, which does it.
     let cover = Mutex::new(MinuteCover::default());
     let mut quotes = Quotes::default();
     let mut flush = tokio::time::interval(FLUSH_EVERY);
