@@ -13,7 +13,10 @@ name: Plugin moomoo
 # moomoo-<version>.zip (Windows, the catalog's package), moomoo-<version>-macos.zip (universal: Apple
 # Silicon and Intel), moomoo-<version>-linux.zip (x86_64). With the secrets TAURI_SIGNING_PRIVATE_KEY and
 # TAURI_SIGNING_PRIVATE_KEY_PASSWORD (the app's release key) each zip also gets its .sig and a catalog entry
-# (catalog-entry-<platform>.json); without them the zips are unsigned, which Settings > Plugins warns about.
+# (catalog-entry-<platform>.json); without them the zips are unsigned, which Settings > Plugins warns about. Every
+# release also carries SHA256SUMS, and each file a build provenance attestation
+# (gh attestation verify <file> -R selvakumarEsra/opentrader). A tag with a "-" (plugin-moomoo-v0.3.0-beta.1) is a
+# prerelease.
 on:
   push:
     tags: ['plugin-moomoo-v*']
@@ -37,6 +40,10 @@ jobs:
           - os: ubuntu-22.04        # an older glibc: the program runs on more Linux systems
             platform: linux
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write          # build provenance attestations
+      attestations: write
     defaults:
       run:
         shell: bash
@@ -63,10 +70,7 @@ jobs:
         with:
           targets: ${{ matrix.platform == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: 'plugins/moomoo -> target'
+      # No compiler cache: released programs never build from outputs restored from an Actions cache.
 
       - uses: actions/setup-python@v6
         with:
@@ -116,6 +120,12 @@ jobs:
         run: |
           echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set: $ZIP is not signed and has no catalog entry."
 
+      - name: Attest
+        if: env.TAG != '' && github.repository == 'selvakumarEsra/opentrader'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: plugins/moomoo/dist/*
+
       - uses: actions/upload-artifact@v7
         with:
           name: moomoo-${{ matrix.platform }}
@@ -140,9 +150,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="${TAG#plugin-moomoo-v}"
-          ls -l dist
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          prerelease=$([[ "$version" == *-* ]] && echo --prerelease || true)
           if ! gh release view "$TAG" -R "$RELEASE_REPO" > /dev/null 2>&1; then
-            gh release create "$TAG" -R "$RELEASE_REPO" --verify-tag --title "moomoo plugin $version" --notes \
+            gh release create "$TAG" -R "$RELEASE_REPO" --verify-tag $prerelease --title "moomoo plugin $version" --notes \
               "The moomoo plugin $version, one self-contained program per system: \`opentrader-moomoo-$version-<system>\` runs \`backfill\` and \`record\` on its own, and the zip of your system installs it in OpenTrader under Settings > Plugins > Install from file. See plugins/moomoo/README.md."
           fi
           gh release upload "$TAG" -R "$RELEASE_REPO" --clobber dist/*

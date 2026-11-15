@@ -361,3 +361,5 @@ implementations:
 - The release of a tag holds the three programs and the three zips; each program runs `--help` on its system in the workflow before it is published.
 <!-- id: REQ-MOOMOO-014.A3 -->
 - A catalog entry's `url` is `https://github.com/selvakumarEsra/opentrader/releases/download/plugin-moomoo-v<version>/<zip>`.
+<!-- id: REQ-MOOMOO-014.A4 -->
+- The release holds `SHA256SUMS` of its files, each file has a build provenance attestation of the workflow, the programs are built without a restored compiler cache, and a tag with a `-` is published as a prerelease.
