@@ -1,12 +1,16 @@
 /*
  * `data.search` over each market's list of stocks, funds and indexes, loaded from OpenD once (Qot_GetStaticInfo by
- * market and security type) and kept for the session: exact code first, then code prefix, then name match.
+ * market and security type) and kept for the session: exact code first, then code prefix, then name match. The
+ * US list is also kept on disk (`symbols-US.json`, next to the bar store): loaded on the first run, read at start
+ * after that, and loaded again when a day old.
  */
 use crate::market::{symbol_of, Market};
 use crate::opend::client::Client;
 use crate::opend::proto::{self, StaticBasic};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tokio::sync::Mutex;
 
 pub const MAX_ROWS: usize = 50;
@@ -50,13 +54,60 @@ pub fn rank<'a>(query: &str, list: impl IntoIterator<Item = &'a Listed>) -> Vec<
     hits.into_iter().take(MAX_ROWS).map(|(_, _, l)| l).collect()
 }
 
-/// The lists, loaded on first use.
+/// How long a US list read from disk is used before it is loaded again from OpenD.
+pub const LIST_FRESH_SECS: i64 = 24 * 3600;
+/// The file of the US list, next to the bar store.
+pub const US_LIST_FILE: &str = "symbols-US.json";
+
+/// The lists: the US one read from its file at start and kept fresh (`keep_fresh`), the others loaded on first use.
 #[derive(Default)]
 pub struct Catalog {
     lists: Mutex<HashMap<Market, Vec<Listed>>>,
+    /// The folder of the US list file; none keeps it in memory only.
+    dir: Option<PathBuf>,
+    /// When the US list in use was loaded from OpenD (UNIX seconds).
+    us_fetched: Mutex<Option<i64>>,
+    refreshing: Mutex<()>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ListFile {
+    fetched: i64,
+    list: Vec<FileRow>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FileRow {
+    symbol: String,
+    code: String,
+    name: String,
+    kind: String,
 }
 
 impl Catalog {
+    /// The catalog with the US list of `dir`'s file, when there is a readable one.
+    pub fn with_dir(dir: Option<PathBuf>) -> Catalog {
+        let file = dir.as_ref().and_then(|d| std::fs::read(d.join(US_LIST_FILE)).ok());
+        let read = file.and_then(|b| serde_json::from_slice::<ListFile>(&b).ok());
+        let mut lists = HashMap::new();
+        let mut fetched = None;
+        if let Some(f) = read {
+            let list: Vec<Listed> = f
+                .list
+                .into_iter()
+                .filter_map(|r| {
+                    let kind = TYPES.iter().find(|(_, k)| *k == r.kind).map(|(_, k)| *k)?;
+                    Some(Listed { symbol: r.symbol, code: r.code, name: r.name, kind })
+                })
+                .collect();
+            if !list.is_empty() {
+                lists.insert(Market::Us, list);
+                fetched = Some(f.fetched);
+            }
+        }
+        Catalog { lists: Mutex::new(lists), dir, us_fetched: Mutex::new(fetched), refreshing: Mutex::new(()) }
+    }
+
     async fn load(client: &Client, market: Market) -> Result<Vec<Listed>, String> {
         let mut out = Vec::new();
         for (sec_type, _) in TYPES {
@@ -64,6 +115,38 @@ impl Catalog {
             out.extend(listed(&s2c));
         }
         Ok(out)
+    }
+
+    /// Loads the whole US list from OpenD when there is none or it is older than a day, and writes its file. Ok(true)
+    /// when it was loaded. Searches go on with the list in use meanwhile; a failed load keeps it.
+    pub async fn keep_fresh(&self, client: &Client, now: i64) -> Result<bool, String> {
+        // One load at a time: a reconnect during a load finds the list fresh.
+        let _one = self.refreshing.lock().await;
+        if self.us_fetched.lock().await.is_some_and(|t| now - t < LIST_FRESH_SECS) {
+            return Ok(false);
+        }
+        let list = Self::load(client, Market::Us).await?;
+        if list.is_empty() {
+            return Err("OpenD listed no US securities".into());
+        }
+        if let Some(dir) = &self.dir {
+            let file = ListFile {
+                fetched: now,
+                list: list.iter().map(|l| FileRow { symbol: l.symbol.clone(), code: l.code.clone(), name: l.name.clone(), kind: l.kind.into() }).collect(),
+            };
+            let written = std::fs::create_dir_all(dir).and_then(|_| {
+                let tmp = dir.join(format!("{US_LIST_FILE}.tmp"));
+                std::fs::write(&tmp, serde_json::to_vec(&file).unwrap_or_default())?;
+                std::fs::rename(&tmp, dir.join(US_LIST_FILE))
+            });
+            if let Err(e) = written {
+                println!("[warn] the US list could not be written to {}: {e}", dir.display());
+            }
+        }
+        println!("[info] loaded the US list: {} stocks, funds and indexes", list.len());
+        self.lists.lock().await.insert(Market::Us, list);
+        *self.us_fetched.lock().await = Some(now);
+        Ok(true)
     }
 
     pub async fn search(&self, client: &Client, query: &str) -> Vec<Value> {

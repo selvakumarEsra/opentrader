@@ -58,6 +58,8 @@ struct Plugin {
     /// The tickers of `data.subscribe` and of `broker.watchQuote`: both are subscribed at OpenD.
     data_tickers: Mutex<BTreeSet<String>>,
     quote_tickers: Mutex<BTreeSet<String>>,
+    /// The "Always record" symbols: kept subscribed, so their closed minutes are stored with no chart open.
+    record_tickers: Mutex<BTreeSet<String>>,
     broker: trade::Broker,
     quotes: Mutex<Quotes>,
     out: Out,
@@ -114,10 +116,11 @@ pub async fn run_session_with(addr: &str, plugin: &str, token: &str, opend: &str
         store,
         store_settings: tokio::sync::Mutex::new(None),
         minute_cover: Mutex::new(stream::MinuteCover::default()),
-        catalog: Catalog::default(),
+        catalog: Catalog::with_dir(store::cache_dir()),
         subs: tokio::sync::Mutex::new(Subscriptions::default()),
         data_tickers: Mutex::new(BTreeSet::new()),
         quote_tickers: Mutex::new(BTreeSet::new()),
+        record_tickers: Mutex::new(BTreeSet::new()),
         quotes: Mutex::new(Quotes::default()),
         out: out.clone(),
     });
@@ -176,6 +179,21 @@ struct BarsParams {
 #[derive(Deserialize)]
 struct ConfigureParams {
     settings: std::collections::HashMap<String, String>,
+}
+
+/// The "Always record" setting's symbols (separated by commas, spaces or new lines), and the entries refused.
+pub fn record_list(text: &str) -> (BTreeSet<String>, Vec<String>) {
+    let mut ok = BTreeSet::new();
+    let mut refused = Vec::new();
+    for entry in text.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).filter(|e| !e.is_empty()) {
+        match security_of(entry).and_then(|(_, sec)| market::symbol_of(&sec)) {
+            Some(symbol) => {
+                ok.insert(symbol);
+            }
+            None => refused.push(entry.to_string()),
+        }
+    }
+    (ok, refused)
 }
 
 fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -244,17 +262,40 @@ impl Plugin {
                 self.client.set_addr(format!("{host}:{port}"));
                 self.client.set_key(p.settings.get("rsaKeyFile").cloned());
                 self.configure_store(&p.settings).await;
+                let (record, refused) = record_list(p.settings.get("alwaysRecord").map_or("", |s| s));
+                if !refused.is_empty() {
+                    println!("[warn] Always record: {} left out (symbols are EXCHANGE:CODE, such as US:AAPL)", refused.join(", "));
+                }
+                let changed = {
+                    let mut set = locked(&self.record_tickers);
+                    let changed = *set != record;
+                    *set = record;
+                    changed
+                };
+                if changed {
+                    let list: Vec<String> = locked(&self.record_tickers).iter().cloned().collect();
+                    if !list.is_empty() {
+                        println!("[info] always recording 1-minute bars of {}", list.join(", "));
+                    }
+                    self.resubscribe().await;
+                }
             }
             "data.subscribe" | "broker.watchQuote" => {
                 let Ok(p) = serde_json::from_value::<SubscribeParams>(p) else { return };
                 let set = if method == "data.subscribe" { &self.data_tickers } else { &self.quote_tickers };
                 *locked(set) = p.tickers.into_iter().collect();
-                let wanted: Vec<String> = locked(&self.data_tickers).union(&locked(&self.quote_tickers)).cloned().collect();
-                let new = self.subs.lock().await.set(wanted, tokio::time::Instant::now());
-                self.subscribe(new).await;
+                self.resubscribe().await;
             }
             _ => {}
         }
+    }
+
+    /// Subscribes what the app asks for and the "Always record" symbols; the others are released once OpenD allows.
+    async fn resubscribe(&self) {
+        let mut wanted: BTreeSet<String> = locked(&self.data_tickers).union(&locked(&self.quote_tickers)).cloned().collect();
+        wanted.extend(locked(&self.record_tickers).iter().cloned());
+        let new = self.subs.lock().await.set(wanted, tokio::time::Instant::now());
+        self.subscribe(new).await;
     }
 
     async fn subscribe(&self, symbols: Vec<String>) {
@@ -280,6 +321,13 @@ impl Plugin {
                     tokio::spawn(async move { me.subscribe(again).await });
                     let me = self.clone();
                     tokio::spawn(async move { me.broker.connected().await });
+                    // The whole US list: loaded on the first run, then when a day old (search.rs).
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = me.catalog.keep_fresh(&me.client, chrono::Utc::now().timestamp()).await {
+                            println!("[warn] the US list could not be loaded: {e}");
+                        }
+                    });
                 }
                 Event::Push { proto: p @ (proto::TRD_UPDATE_ORDER | proto::TRD_UPDATE_ORDER_FILL), s2c } => {
                     let me = self.clone();
@@ -365,5 +413,18 @@ impl Plugin {
             self.store.set_backend(backend.unwrap_or_else(Backend::embedded)).await;
         }
         *current = Some(wanted);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn always_record_folds_case_and_duplicates_and_leaves_out_others() {
+        let (ok, refused) = record_list(" us:aapl, US:AAPL\nUS:msft;XX:NOPE  AAPL ");
+        assert_eq!(ok.into_iter().collect::<Vec<_>>(), ["US:AAPL", "US:MSFT"]);
+        assert_eq!(refused, ["XX:NOPE", "AAPL"]);
+        assert!(record_list("").0.is_empty());
     }
 }

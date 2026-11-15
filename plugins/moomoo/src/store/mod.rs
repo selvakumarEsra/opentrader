@@ -163,6 +163,14 @@ impl Key {
     }
 }
 
+/// The plugin's folder on this computer: `OPENTRADER_MOOMOO_CACHE`, else the user's cache folder.
+pub fn cache_dir() -> Option<PathBuf> {
+    match std::env::var_os("OPENTRADER_MOOMOO_CACHE") {
+        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
+        _ => dirs::cache_dir().map(|d| d.join("opentrader-moomoo")),
+    }
+}
+
 /// Where series are kept.
 pub enum Backend {
     /// Nothing written (tests; no cache folder).
@@ -175,11 +183,7 @@ impl Backend {
     /// The embedded store in `dir` (`OPENTRADER_MOOMOO_CACHE`, else the user's cache folder), or memory when no
     /// folder can be had.
     pub fn embedded() -> Backend {
-        let dir = match std::env::var_os("OPENTRADER_MOOMOO_CACHE") {
-            Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
-            _ => dirs::cache_dir().map(|d| d.join("opentrader-moomoo")),
-        };
-        match dir.map(|d| sqlite::Sqlite::open(&d.join("bars.sqlite"))) {
+        match cache_dir().map(|d| sqlite::Sqlite::open(&d.join("bars.sqlite"))) {
             Some(Ok(s)) => Backend::Sqlite(s),
             Some(Err(e)) => {
                 println!("[warn] the bar store could not be opened ({e}); bars are kept for this session only");

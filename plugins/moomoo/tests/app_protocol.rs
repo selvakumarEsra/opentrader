@@ -75,6 +75,11 @@ async fn fake_opend() -> String {
 
 /// The fake OpenD; with `pem`, encrypted as a real one holding that RSA key: RSA for InitConnect, then AES-CBC.
 async fn fake_opend_sealed(pem: Option<String>) -> String {
+    fake_opend_seen(pem, None).await
+}
+
+/// The fake OpenD, telling `seen` each request it gets (its proto and c2s).
+async fn fake_opend_seen(pem: Option<String>, seen: Option<tokio::sync::mpsc::UnboundedSender<(u32, Value)>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
@@ -89,6 +94,9 @@ async fn fake_opend_sealed(pem: Option<String>) -> String {
                     frame::encode_sealed(proto, serial, &plain, &seal.close(proto, &plain).unwrap())
                 };
                 let req: Value = serde_json::from_slice(&f.body).unwrap();
+                if let Some(seen) = &seen {
+                    let _ = seen.send((f.proto, req["c2s"].clone()));
+                }
                 let mut out = Vec::new();
                 let answer = match f.proto {
                     1001 => {
@@ -292,4 +300,61 @@ async fn a_backfill_run_stores_opends_bars() {
         .collect();
     let options = opentrader_moomoo::cli::parse(&args).unwrap();
     assert_eq!(opentrader_moomoo::cli::run(options).await, Ok(true));
+}
+
+#[tokio::test]
+async fn always_record_subscribes_its_symbols_with_no_chart_open() {
+    let (tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let opend = fake_opend_seen(None, Some(tx)).await;
+    let mut app = FakeApp::start(opend.clone()).await;
+    let (host, port) = opend.split_once(':').unwrap();
+    app.send(json!({"jsonrpc":"2.0","method":"plugin.configure","params":{"settings":{"host":host,"port":port,"alwaysRecord":"us:aapl, AAPL\nUS:AAPL"}}})).await;
+    let sub = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match seen.recv().await {
+                Some((3001, c2s)) => return c2s,
+                Some(_) => continue,
+                None => panic!("OpenD closed"),
+            }
+        }
+    })
+    .await
+    .expect("a subscription in time");
+    assert_eq!(sub["securityList"], json!([{"market":11,"code":"AAPL"}]));
+    assert_eq!((sub["isSubOrUnSub"].as_bool(), sub["subTypeList"].as_array().map(|t| t.contains(&json!(11)))), (Some(true), Some(true)));
+}
+
+#[tokio::test]
+async fn the_us_list_is_loaded_once_and_kept_on_disk() {
+    use opentrader_moomoo::search::{Catalog, US_LIST_FILE};
+    let dir = std::env::temp_dir().join(format!("opentrader-moomoo-list-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let (client, _events) = opentrader_moomoo::opend::client::Client::new(fake_opend_seen(None, Some(tx)).await);
+    tokio::spawn(client.clone().run());
+    let now = 1_763_200_000;
+
+    let catalog = Catalog::with_dir(Some(dir.clone()));
+    let mut loaded = Err(String::new());
+    for _ in 0..100 {
+        loaded = catalog.keep_fresh(&client, now).await;
+        if loaded.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(loaded, Ok(true));
+    assert!(dir.join(US_LIST_FILE).is_file());
+    assert_eq!(catalog.find("US:AAPL").await.map(|l| l.name), Some("Apple Inc.".to_string()));
+    // Fresh: not asked again.
+    while seen.try_recv().is_ok() {}
+    assert_eq!(catalog.keep_fresh(&client, now + 3600).await, Ok(false));
+    assert!(seen.try_recv().is_err(), "a fresh list asked OpenD");
+
+    // A later run reads the file at start; a day later it loads it again.
+    let later = Catalog::with_dir(Some(dir.clone()));
+    assert_eq!(later.find("US:AAPL").await.map(|l| l.kind), Some("stock"));
+    assert_eq!(later.keep_fresh(&client, now + 3600).await, Ok(false));
+    assert_eq!(later.keep_fresh(&client, now + 2 * 86_400).await, Ok(true));
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -363,3 +363,44 @@ implementations:
 - A catalog entry's `url` is `https://github.com/selvakumarEsra/opentrader/releases/download/plugin-moomoo-v<version>/<zip>`.
 <!-- id: REQ-MOOMOO-014.A4 -->
 - The release holds `SHA256SUMS` of its files, each file has a build provenance attestation of the workflow, the programs are built without a restored compiler cache, and a tag with a `-` is published as a prerelease.
+
+<!-- id: REQ-MOOMOO-015 -->
+## The plugin MUST record the "Always record" symbols for as long as the app runs
+
+The setting "Always record" lists symbols (`US:AAPL, US:MSFT`, separated by
+commas, spaces or new lines). While the app runs the plugin (it starts the
+plugin when it opens and stops it when it quits), the plugin keeps them
+subscribed at OpenD with the symbols the app asks for, and stores their closed
+1-minute bars as `record` does, whether or not a chart shows them. They are
+subscribed again after a reconnect; a changed list subscribes the new ones and
+releases the ones dropped (unless the app still asks for them).
+
+implementations:
+  - plugins/moomoo/src/lib.rs:Plugin.notification
+  - plugins/moomoo/src/lib.rs:record_list
+
+## Acceptance
+<!-- id: REQ-MOOMOO-015.A1 -->
+- With "Always record" set to `US:AAPL` and no chart open, the plugin subscribes US:AAPL's 1-minute K-lines at OpenD and stores its pushed closed minutes.
+<!-- id: REQ-MOOMOO-015.A2 -->
+- Entries that are not the plugin's symbols (`AAPL`, `XX:NOPE`) are left out with a warning in the plugin's log; duplicates and case are folded (`us:aapl` is `US:AAPL`).
+
+<!-- id: REQ-MOOMOO-016 -->
+## The plugin MUST fetch the whole US list on its first run and keep it on disk
+
+On its first connection to OpenD the plugin loads the whole list of US stocks,
+funds and indexes (names and types, not bars: OpenD's history quota does not
+allow every symbol's history) and writes it next to the bar store
+(`symbols-US.json`). Later runs read that file at start, so symbol search over
+US answers at once and while OpenD is down, and load it again from OpenD when
+it is more than a day old. A failed load keeps the file there.
+
+implementations:
+  - plugins/moomoo/src/search.rs:Catalog
+  - plugins/moomoo/src/lib.rs:Plugin.pump
+
+## Acceptance
+<!-- id: REQ-MOOMOO-016.A1 -->
+- With no list file, the first connection to OpenD loads the US list and writes it; a search then finds `AAPL` without asking OpenD again.
+<!-- id: REQ-MOOMOO-016.A2 -->
+- A list file younger than a day is used at start without asking OpenD; an older one is used until OpenD's answer replaces it.

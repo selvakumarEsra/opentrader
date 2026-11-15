@@ -23,7 +23,9 @@ Contract: [`specs/moomoo-plugin.md`](../../specs/moomoo-plugin.md).
 - **Live prices** (`src/stream.rs`): `data.subscribe` → Basic quotes and 1-minute K-lines (2 subscription units per
   symbol). A dropped symbol is unsubscribed after it has been held a minute, which OpenD requires. Each closed
   1-minute bar is written to the store, so in market hours a watched symbol's bars come from the stream, and
-  outside them from the store, without using the history quota.
+  outside them from the store, without using the history quota. The symbols in "Always record" (Settings >
+  Plugins, `US:AAPL, US:MSFT`) are kept subscribed the same way for as long as the app is open, with or without a
+  chart: the app starts the plugin when it opens and stops it when it quits, so this is `record` inside the app.
 - **Bar store** (`src/store/`): per series (symbol, resolution, session) the bars and the time ranges they cover,
   written every 30 s. By default an SQLite file in the user's cache folder (`OPENTRADER_MOOMOO_CACHE` overrides
   it). With a ClickHouse URL in Settings, a `moomoo_bars` ReplacingMergeTree table and `moomoo_covered`, created
@@ -35,7 +37,10 @@ Contract: [`specs/moomoo-plugin.md`](../../specs/moomoo-plugin.md).
   and Trd_ModifyOrder; a position closes with a market order the other way. `broker.state` is sent after each order
   or fill push and checked every 5 s. A live account trades only once the user has unlocked trading in OpenD; the
   plugin keeps no trade password. `broker.quote` carries the last price only (Basic quotes have no bid and ask).
-- **Search** (`src/search.rs`): each market's stocks, funds and indexes, loaded once per session.
+- **Search** (`src/search.rs`): each market's stocks, funds and indexes, loaded once per session. The whole US
+  list (about 20,000 names and types; no bars, so no history quota) is loaded on the plugin's first connection to
+  OpenD and kept next to the bar store (`symbols-US.json`): later runs search it at once, even with OpenD down,
+  and load it again when it is a day old.
 
 ## Fill the store yourself
 
