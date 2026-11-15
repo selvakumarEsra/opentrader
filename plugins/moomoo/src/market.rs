@@ -60,10 +60,19 @@ impl Market {
         }
     }
 
-    /// Opens and closes of the regular session's parts, seconds after midnight.
-    pub fn bounds(self) -> (&'static [u32], &'static [u32]) {
+    /// The whole traded day, when wider than the session: US pre- and post-market.
+    pub fn extended(self) -> Option<&'static str> {
+        match self {
+            Market::Us => Some("0400-2000"),
+            _ => None,
+        }
+    }
+
+    /// Opens and closes of the session's parts (the extended day's with `extended`), seconds after midnight.
+    pub fn bounds(self, extended: bool) -> (&'static [u32], &'static [u32]) {
         const H: u32 = 3_600;
         match self {
+            Market::Us if extended => (&[4 * H], &[20 * H]),
             Market::Us => (&[9 * H + 1_800], &[16 * H]),
             Market::Hk => (&[9 * H + 1_800, 13 * H], &[12 * H, 16 * H]),
             Market::Sh | Market::Sz => (&[9 * H + 1_800, 13 * H], &[11 * H + 1_800, 15 * H]),

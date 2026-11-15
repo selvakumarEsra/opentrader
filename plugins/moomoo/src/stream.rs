@@ -70,6 +70,8 @@ pub fn sub_request(symbols: &[String], subscribe: bool) -> Value {
     json!({
         "securityList": list, "subTypeList": [proto::SUB_BASIC, proto::SUB_KL_1MIN],
         "isSubOrUnSub": subscribe, "isRegOrUnRegPush": subscribe, "isFirstPush": true,
+        // Pre- and post-market for US symbols; OpenD ignores it for the others.
+        "extendedTime": true,
     })
 }
 
@@ -81,16 +83,17 @@ pub struct Quotes {
 
 impl Quotes {
     /// A 1-minute K-line push. A forming bar stamped after `now` is stamped at its end: its start is a minute earlier.
-    pub fn minute_push(&mut self, s2c: &Value, now: i64) {
-        let Some(symbol) = s2c.get("security").and_then(|v| serde_json::from_value::<Security>(v.clone()).ok()).and_then(|s| symbol_of(&s)) else {
-            return;
-        };
-        let Some((market, _)) = security_of(&symbol) else { return };
+    /// When the push starts a newer bar, the one it replaces has closed: that one is returned, to be stored.
+    pub fn minute_push(&mut self, s2c: &Value, now: i64) -> Option<(String, Bar)> {
+        let symbol = s2c.get("security").and_then(|v| serde_json::from_value::<Security>(v.clone()).ok()).and_then(|s| symbol_of(&s))?;
+        let (market, _) = security_of(&symbol)?;
         let lines: Vec<KLine> = serde_json::from_value(s2c.get("klList").cloned().unwrap_or(json!([]))).unwrap_or_default();
-        let Some(last) = lines.iter().rev().find(|k| !k.is_blank) else { return };
-        let Some(t) = bars::unix_of(market, &last.time) else { return };
+        let last = lines.iter().rev().find(|k| !k.is_blank)?;
+        let t = bars::unix_of(market, &last.time)?;
         let start = if t > now { t - 60 } else { t };
-        self.minute.insert(symbol, [start as f64, last.open_price, last.high_price, last.low_price, last.close_price, last.volume]);
+        let bar = [start as f64, last.open_price, last.high_price, last.low_price, last.close_price, last.volume];
+        let previous = self.minute.insert(symbol.clone(), bar)?;
+        (previous[0] < bar[0]).then_some((symbol, previous))
     }
 
     /// A Basic push: one `data.quote` per wanted symbol in it.
@@ -154,6 +157,18 @@ mod tests {
         subs.set(s(&["US:AAPL"]), t0);
         assert_eq!(subs.reconnected(t0), s(&["US:AAPL"]));
         assert!(subs.set(s(&["US:AAPL"]), t0).is_empty());
+    }
+
+    #[test]
+    fn a_newer_minute_closes_the_one_before() {
+        let mut quotes = Quotes::default();
+        let now = bars::unix_of(Market::Us, "2025-05-09 10:00:30").unwrap();
+        let push = |time: &str, close: f64| json!({"klType":1,"rehabType":1,"security":{"market":11,"code":"AAPL"},
+            "klList":[{"time":time,"isBlank":false,"openPrice":1,"highPrice":2,"lowPrice":0.5,"closePrice":close,"volume":"5"}]});
+        assert_eq!(quotes.minute_push(&push("2025-05-09 10:00:00", 1.0), now), None);
+        assert_eq!(quotes.minute_push(&push("2025-05-09 10:00:00", 1.2), now), None);
+        let (sym, closed) = quotes.minute_push(&push("2025-05-09 10:01:00", 1.3), now + 60).unwrap();
+        assert_eq!((sym.as_str(), closed[0] as i64, closed[4]), ("US:AAPL", now - 30, 1.2));
     }
 
     #[tokio::test(start_paused = true)]

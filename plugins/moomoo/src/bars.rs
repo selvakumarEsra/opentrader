@@ -9,6 +9,7 @@
 use crate::market::Market;
 use crate::opend::client::Client;
 use crate::opend::proto::{self, KLine, Security};
+use crate::history::Source;
 use crate::pace::Pace;
 use chrono::{NaiveDateTime, TimeZone, Timelike};
 use serde_json::{json, Value};
@@ -50,8 +51,8 @@ pub fn wall_of(market: Market, unix: i64) -> String {
 
 /// The bars are stamped at their end: one falls on a session close, or one an interval after an open while none
 /// falls on an open. Bars stamped at their start never sit on a close of the regular session.
-pub fn end_stamped(market: Market, times: &[i64], secs: u32) -> bool {
-    let (opens, closes) = market.bounds();
+pub fn end_stamped(market: Market, extended: bool, times: &[i64], secs: u32) -> bool {
+    let (opens, closes) = market.bounds(extended);
     let tod = |t: i64| market.tz().timestamp_opt(t, 0).single().map(|d| d.num_seconds_from_midnight());
     let tods: Vec<u32> = times.iter().filter_map(|&t| tod(t)).collect();
     let on_close = tods.iter().any(|t| closes.contains(t));
@@ -61,7 +62,7 @@ pub fn end_stamped(market: Market, times: &[i64], secs: u32) -> bool {
 }
 
 /// OpenD's K-lines as the app's bars, oldest first, start-stamped, without blanks.
-pub fn to_bars(market: Market, secs: u32, lines: &[KLine]) -> Vec<Bar> {
+pub fn to_bars(market: Market, secs: u32, extended: bool, lines: &[KLine]) -> Vec<Bar> {
     let mut bars: Vec<Bar> = lines
         .iter()
         .filter(|k| !k.is_blank)
@@ -73,7 +74,7 @@ pub fn to_bars(market: Market, secs: u32, lines: &[KLine]) -> Vec<Bar> {
         .collect();
     if secs < 86_400 {
         let times: Vec<i64> = bars.iter().map(|b| b[0] as i64).collect();
-        if end_stamped(market, &times, secs) {
+        if end_stamped(market, extended, &times, secs) {
             bars.iter_mut().for_each(|b| b[0] -= secs as f64);
         }
     }
@@ -89,44 +90,38 @@ pub fn window(mut bars: Vec<Bar>, from: f64, to: f64, count: usize) -> Vec<Bar> 
     bars.split_off(cut)
 }
 
-/// `data.bars`: forward-adjusted K-lines of `sec` over [`from`, `to`], every page, the newest `count` of them.
-pub async fn fetch(
-    client: &Client,
-    pace: &Pace,
-    market: Market,
-    sec: &Security,
-    resolution: &str,
-    (from, to, count): (f64, f64, usize),
-) -> Result<Vec<Bar>, String> {
-    let Some((kl, secs)) = kl_type(resolution) else {
-        return Ok(Vec::new());
-    };
-    // An end-stamped bar that starts at `to` is written an interval later.
-    let (begin, end) = (wall_of(market, from as i64), wall_of(market, to as i64 + secs as i64));
-    let mut lines: Vec<KLine> = Vec::new();
-    let mut next: Option<Value> = None;
-    loop {
-        // Only a first page counts toward OpenD's limit.
-        if next.is_none() {
-            pace.wait().await;
-        }
-        let mut c2s = json!({
-            "rehabType": proto::REHAB_FORWARD, "klType": kl, "security": sec,
-            "beginTime": begin, "endTime": end, "maxAckKLNum": PAGE,
-        });
-        if let Some(key) = next.take() {
-            c2s["nextReqKey"] = key;
-        }
-        let s2c = client.request(proto::QOT_HISTORY_KL, c2s).await?;
-        let page: Vec<KLine> = serde_json::from_value(s2c.get("klList").cloned().unwrap_or(json!([])))
-            .map_err(|e| format!("OpenD sent unreadable bars: {e}"))?;
-        lines.extend(page);
-        next = s2c.get("nextReqKey").filter(|k| k.as_str().is_some_and(|s| !s.is_empty())).cloned();
-        if next.is_none() || lines.len() >= MAX_BARS {
-            break;
+/// OpenD as the history source: forward-adjusted K-lines, every page, first pages paced to OpenD's limit.
+pub struct OpenD {
+    pub client: Client,
+    pub pace: Pace,
+}
+
+impl Source for OpenD {
+    async fn klines(&self, sec: &Security, kl: i32, extended: bool, begin: String, end: String) -> Result<Vec<KLine>, String> {
+        let mut lines: Vec<KLine> = Vec::new();
+        let mut next: Option<Value> = None;
+        loop {
+            // Only a first page counts toward OpenD's limit.
+            if next.is_none() {
+                self.pace.wait().await;
+            }
+            let mut c2s = json!({
+                "rehabType": proto::REHAB_FORWARD, "klType": kl, "security": sec,
+                "beginTime": begin, "endTime": end, "maxAckKLNum": PAGE, "extendedTime": extended,
+            });
+            if let Some(key) = next.take() {
+                c2s["nextReqKey"] = key;
+            }
+            let s2c = self.client.request(proto::QOT_HISTORY_KL, c2s).await?;
+            let page: Vec<KLine> = serde_json::from_value(s2c.get("klList").cloned().unwrap_or(json!([])))
+                .map_err(|e| format!("OpenD sent unreadable bars: {e}"))?;
+            lines.extend(page);
+            next = s2c.get("nextReqKey").filter(|k| k.as_str().is_some_and(|s| !s.is_empty())).cloned();
+            if next.is_none() || lines.len() >= MAX_BARS {
+                return Ok(lines);
+            }
         }
     }
-    Ok(window(to_bars(market, secs, &lines), from, to, count))
 }
 
 #[cfg(test)]
@@ -152,7 +147,7 @@ mod tests {
     #[test]
     fn end_stamped_minutes_move_back_to_their_start() {
         let lines = [line("2025-05-09 09:31:00", 1.0), line("2025-05-09 09:32:00", 2.0), line("2025-05-09 16:00:00", 3.0)];
-        let bars = to_bars(Market::Us, 60, &lines);
+        let bars = to_bars(Market::Us, 60, false, &lines);
         let open = unix_of(Market::Us, "2025-05-09 09:30:00").unwrap() as f64;
         assert_eq!(bars[0][0], open);
         assert_eq!(bars[2][0], unix_of(Market::Us, "2025-05-09 15:59:00").unwrap() as f64);
@@ -161,23 +156,33 @@ mod tests {
     #[test]
     fn start_stamped_minutes_stay() {
         let lines = [line("2025-05-09 09:30:00", 1.0), line("2025-05-09 09:31:00", 2.0), line("2025-05-09 15:59:00", 3.0)];
-        let bars = to_bars(Market::Us, 60, &lines);
+        let bars = to_bars(Market::Us, 60, false, &lines);
         assert_eq!(bars[0][0], unix_of(Market::Us, "2025-05-09 09:30:00").unwrap() as f64);
         assert_eq!(bars.len(), 3);
     }
 
     #[test]
+    fn extended_us_bars_are_judged_on_the_extended_day() {
+        let at = |t: &str| unix_of(Market::Us, t).unwrap();
+        // Start-stamped pre/post-market bars: one at 16:00 is a post-market start, not a close.
+        let start = [at("2025-05-09 04:00:00"), at("2025-05-09 16:00:00"), at("2025-05-09 19:55:00")];
+        assert!(!end_stamped(Market::Us, true, &start, 300));
+        let end = [at("2025-05-09 04:05:00"), at("2025-05-09 16:00:00"), at("2025-05-09 20:00:00")];
+        assert!(end_stamped(Market::Us, true, &end, 300));
+    }
+
+    #[test]
     fn a_daily_bar_starts_at_midnight_in_new_york() {
-        let bars = to_bars(Market::Us, 86_400, &[line("2025-05-09 00:00:00", 1.0)]);
+        let bars = to_bars(Market::Us, 86_400, false, &[line("2025-05-09 00:00:00", 1.0)]);
         assert_eq!(bars[0][0], 1_746_763_200.0);
     }
 
     #[test]
     fn hong_kong_afternoon_end_stamps_are_seen() {
         let times = [unix_of(Market::Hk, "2025-05-09 13:05:00").unwrap(), unix_of(Market::Hk, "2025-05-09 13:10:00").unwrap()];
-        assert!(end_stamped(Market::Hk, &times, 300));
+        assert!(end_stamped(Market::Hk, false, &times, 300));
         let times = [unix_of(Market::Hk, "2025-05-09 13:00:00").unwrap(), unix_of(Market::Hk, "2025-05-09 13:05:00").unwrap()];
-        assert!(!end_stamped(Market::Hk, &times, 300));
+        assert!(!end_stamped(Market::Hk, false, &times, 300));
     }
 
     #[test]
@@ -185,7 +190,7 @@ mod tests {
         let mut blank = line("2025-05-09 00:00:00", 1.0);
         blank.is_blank = true;
         let lines = [blank, line("2025-05-12 00:00:00", 2.0), line("2025-05-13 00:00:00", 3.0), line("2025-05-14 00:00:00", 4.0)];
-        let bars = window(to_bars(Market::Us, 86_400, &lines), 0.0, f64::MAX, 2);
+        let bars = window(to_bars(Market::Us, 86_400, false, &lines), 0.0, f64::MAX, 2);
         let closes: Vec<f64> = bars.iter().map(|b| b[4]).collect();
         assert_eq!(closes, [3.0, 4.0]);
     }

@@ -3,7 +3,7 @@ id: MOOMOO-DOC
 title: Moomoo OpenD data plugin
 owner: plugins [needs user confirmation]
 priority: medium
-version: 1
+version: 2
 depends_on: DOMAIN-DOC
 ---
 
@@ -20,8 +20,8 @@ is a 44-byte header (`"FT"`, proto id, format, version, serial number, body
 length, SHA-1 of the body, 8 reserved bytes) and a body. The plugin uses the
 JSON body format (format 1), so it needs no protobuf toolchain.
 
-Out of scope for version 1: the `broker` capability, encrypted OpenD connections,
-pre/post-market bars, and a disk cache of bars.
+Version 2 adds trading (`broker`), encrypted OpenD connections, pre/post-market
+bars, a disk cache of bars, and the Windows package that is the catalog entry.
 
 <!-- id: REQ-MOOMOO-001 -->
 ## OpenD messages MUST be framed and checked exactly
@@ -136,3 +136,153 @@ implementations:
 ## Acceptance
 <!-- id: REQ-MOOMOO-006.A1 -->
 - For query `aap`, `US:AAPL` comes before `US:AAPU` and before a stock named "Aapex…". At most 50 rows are returned. Rows carry whole symbols and the type `stock`, `fund` or `index`.
+
+<!-- id: REQ-MOOMOO-007 -->
+## Bars MUST come from the local disk store, kept current by the live stream
+
+OHLCV bars are stored on disk per (symbol, resolution, session), with the time
+ranges they cover, so charts open fast. A small account can fetch history for
+only 100 different stocks per rolling 7 days, so the store also saves quota.
+
+- **During market hours** the live stream fills the store. Each closed 1-minute
+  bar of a subscribed symbol is written as it closes, and a run of pushes
+  without a reconnect covers the minutes in between. A 3/5/15/30-minute chart's
+  newest part is rolled up from those 1-minute bars.
+- **Outside market hours** bars come from the store. A part of the window that
+  holds no trading time (night, weekend) counts as covered.
+- **OpenD's history** is asked only for an uncovered part that holds trading
+  time. The ask starts one bar before that part. If the overlapping bar differs
+  (a split or dividend changed the adjusted prices), the stored series is
+  dropped. What was asked counts as covered up to the bars still forming, even
+  when OpenD returned none (a holiday is asked once).
+- **When OpenD refuses** (quota, no connection), the stored bars of the window
+  are returned.
+- **Where bars are stored:** in ClickHouse when the user gives its URL
+  (table `<database>.moomoo_bars`, a ReplacingMergeTree ordered by symbol,
+  exchange, resolution, session and timestamp, partitioned by month, plus
+  `moomoo_covered` for the ranges), or else in an embedded SQLite file whose
+  bars table is clustered on (series, time). Both read a series in one range
+  scan. Bars streamed in a minute reach the store in one batched write.
+
+implementations:
+  - plugins/moomoo/src/store/mod.rs:Series
+  - plugins/moomoo/src/store/mod.rs:Store
+  - plugins/moomoo/src/store/sqlite.rs:Sqlite
+  - plugins/moomoo/src/store/clickhouse.rs:ClickHouse
+  - plugins/moomoo/src/hours.rs:has_trading
+  - plugins/moomoo/src/history.rs:History
+  - plugins/moomoo/src/history.rs:History.bars
+
+## Acceptance
+<!-- id: REQ-MOOMOO-007.A1 -->
+- A second `data.bars` for a window already covered makes no OpenD request.
+<!-- id: REQ-MOOMOO-007.A2 -->
+- On a Saturday, a window from Friday's fetch until now makes no OpenD request.
+<!-- id: REQ-MOOMOO-007.A3 -->
+- A window that extends past the covered part asks OpenD only from one bar before the covered end. If the overlapping bar's close differs, the series is dropped and the whole window is fetched.
+<!-- id: REQ-MOOMOO-007.A4 -->
+- Closed 1-minute bars from the stream are in the store, and a `data.bars` of 1 or 5 minutes over the streamed minutes makes no OpenD request.
+<!-- id: REQ-MOOMOO-007.A5 -->
+- When OpenD answers with an error, the stored bars inside the window are returned (and an empty store gives the error).
+<!-- id: REQ-MOOMOO-007.A6 -->
+- The store survives a restart, on both backends. The SQLite file lives under the user's cache folder (`OPENTRADER_MOOMOO_CACHE` overrides it).
+<!-- id: REQ-MOOMOO-007.A7 -->
+- With a ClickHouse URL, the plugin creates its tables if they are missing. A re-written bar replaces the earlier one (`FINAL`). A dropped series is deleted.
+
+<!-- id: REQ-MOOMOO-008 -->
+## US symbols MUST include pre- and post-market trading
+
+For US symbols, `data.symbolInfo` gives `extended: "0400-2000"`. Intraday bars
+(60 minutes and shorter) and live 1-minute bars are asked with OpenD's extended
+time, and the app keeps or hides them with its RTH/ETH switch. Daily bars stay
+regular. Telling end stamps from start stamps uses the extended day's bounds
+(04:00 and 20:00).
+
+implementations:
+  - plugins/moomoo/src/market.rs:Market.extended
+  - plugins/moomoo/src/bars.rs:end_stamped
+  - plugins/moomoo/src/hours.rs:has_trading
+
+## Acceptance
+<!-- id: REQ-MOOMOO-008.A1 -->
+- A US 5-minute request carries `extendedTime: true`; a US daily request and any HK request do not.
+<!-- id: REQ-MOOMOO-008.A2 -->
+- Start-stamped US extended bars at 04:00 … 16:00 … 19:55 are returned unchanged. End-stamped ones (04:05 … 20:00) move back 5 minutes.
+
+<!-- id: REQ-MOOMOO-009 -->
+## The OpenD connection MUST be encrypted when the user gives OpenD's RSA key
+
+With the setting "RSA private key file" (the PEM key file also set in OpenD),
+InitConnect is RSA-encrypted (PKCS#1 v1.5, in chunks sized to the key) and asks
+for AES-CBC. Every later body is AES-encrypted with the key OpenD returns: CBC
+with PKCS#7 when OpenD gives an IV, else OpenD's ECB form (zero padding plus a
+16-byte block holding the length of the last block). The header's SHA-1 is
+always that of the plain body. Without the setting, nothing is encrypted.
+
+implementations:
+  - plugins/moomoo/src/opend/crypt.rs:Rsa
+  - plugins/moomoo/src/opend/crypt.rs:Aes
+
+## Acceptance
+<!-- id: REQ-MOOMOO-009.A1 -->
+- RSA: what is encrypted with the key's public half decrypts with its private half, for bodies longer than one chunk.
+<!-- id: REQ-MOOMOO-009.A2 -->
+- AES-CBC and the ECB form decrypt what they encrypt, for bodies of 0, 15, 16 and 33 bytes. The ECB form's output is the padded length plus 16.
+<!-- id: REQ-MOOMOO-009.A3 -->
+- Against a fake OpenD holding the same key, an encrypted session answers `data.bars`.
+<!-- id: REQ-MOOMOO-009.A4 -->
+- An unreadable key file is reported in the plugin's log, and the plugin does not connect without encryption instead.
+
+<!-- id: REQ-MOOMOO-010 -->
+## The plugin MUST trade the user's moomoo accounts as a broker plugin
+
+The manifest adds `broker`. Each account of OpenD's account list and each market
+it may trade is one app account: `SIM-<id>-US` ("Paper US …", `isDemo: true`)
+or `REAL-<id>-HK`. SH and SZ stocks trade through the HKCC (Stock Connect) or CN
+market. Positions are netted. Orders can be market, limit, stop or stop-limit,
+day or GTC, with no brackets. The plugin places orders (Trd_PlaceOrder, with a
+packet id), modifies and cancels them (Trd_ModifyOrder), closes positions with
+a market order the opposite way, and sends the whole `broker.state` again when
+OpenD pushes an order or fill change, and at least every 5 s. A real account
+trades only after the user unlocks trading in OpenD. The plugin keeps no trade
+password. The app's trading switch and its confirmation of live orders apply as
+for every broker.
+
+implementations:
+  - plugins/moomoo/src/trade/mod.rs:Broker
+  - plugins/moomoo/src/trade/map.rs:order_request
+  - plugins/moomoo/src/trade/map.rs:state_of
+
+## Acceptance
+<!-- id: REQ-MOOMOO-010.A1 -->
+- A paper account with US and HK rights gives the accounts `SIM-1-US` and `SIM-1-HK`, both `isDemo: true`.
+<!-- id: REQ-MOOMOO-010.A2 -->
+- `broker.place` of a buy stop-limit of 10 `US:AAPL` at limit 101, stop 100, GTC sends `trdSide 1, orderType 11, code AAPL, secMarket 2, qty 10, price 101, auxPrice 100, timeInForce 1` under the selected account's header, with a fresh packet id. The answer is `{orderId}`.
+<!-- id: REQ-MOOMOO-010.A3 -->
+- An order for `HK:00700` on a US account, or one with a take profit or stop loss, is refused with a message and nothing is sent.
+<!-- id: REQ-MOOMOO-010.A4 -->
+- Order statuses map: submitting → `placing`, submitted or partly filled → `working`, filled → `filled`, cancelled or deleted → `cancelled`, failed or disabled → `rejected`.
+<!-- id: REQ-MOOMOO-010.A5 -->
+- An order push from OpenD is followed by a `broker.event` (`executed` for a fill) and a new `broker.state`.
+<!-- id: REQ-MOOMOO-010.A6 -->
+- `broker.closePosition` of a long 10 with `qty: 4` sends a market sell of 4.
+
+<!-- id: REQ-MOOMOO-011 -->
+## The plugin MUST ship as signed packages
+
+`build.ps1` (Windows) and `build.sh` (macOS, Linux) build the release program.
+They zip it with the manifest, whose entry and platforms are set for that
+system. They sign the zip with the release key (`npx tauri signer sign`) and
+write the catalog entry. The catalog gets the Windows package, as for the other
+broker plugins. A missing key stops the build before any catalog entry is
+written.
+
+implementations:
+  - plugins/moomoo/build.ps1
+  - plugins/moomoo/build.sh
+
+## Acceptance
+<!-- id: REQ-MOOMOO-011.A1 -->
+- `build.sh` without the key leaves the unsigned zip and says it was not signed. No catalog entry is written.
+<!-- id: REQ-MOOMOO-011.A2 -->
+- The zip's manifest names `opentrader-moomoo.exe` and `["windows"]` from `build.ps1`, and `opentrader-moomoo` and that system from `build.sh`.

@@ -12,7 +12,14 @@
     { "key": "host", "label": "Host", "type": "text", "default": "127.0.0.1",
       "help": "The computer OpenD runs on. Keep 127.0.0.1 when it runs on this computer." },
     { "key": "port", "label": "Port", "type": "number", "default": "11111",
-      "help": "The API port set in OpenD (11111 unless you changed it)." }
+      "help": "The API port set in OpenD (11111 unless you changed it)." },
+    { "key": "clickhouseUrl", "label": "ClickHouse URL", "type": "text", "default": "",
+      "help": "Leave empty to keep bars in a file on this computer. Or give a ClickHouse server, such as http://localhost:8123, to keep them there." },
+    { "key": "clickhouseDatabase", "label": "ClickHouse database", "type": "text", "default": "trading_db",
+      "help": "Created if it does not exist." },
+    { "key": "clickhouseUser", "label": "ClickHouse user", "type": "text", "default": "default" },
+    { "key": "clickhousePassword", "label": "ClickHouse password", "type": "text", "default": "",
+      "help": "Kept in OpenTrader's settings as you type it." }
   ],
   "setup": "Start moomoo OpenD and log in with your moomoo account (the first time, complete the API questionnaire it asks for). Leave encryption off for connections from this computer. The plugin connects within a few seconds and retries while OpenD is closed. Then open a symbol such as US:AAPL or HK:00700.",
   "homepage": "https://github.com/deepentropy/opentrader/tree/main/plugins/moomoo",

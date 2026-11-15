@@ -18,6 +18,7 @@ struct FakeApp {
 impl FakeApp {
     /// Starts the plugin against this app and OpenD at `opend`, and answers its hello.
     async fn start(opend: String) -> FakeApp {
+        isolate_store();
         let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = app.local_addr().unwrap().to_string();
         tokio::spawn(async move { opentrader_moomoo::run_session_with(&addr, "moomoo", "tok", &opend).await });
@@ -50,6 +51,17 @@ impl FakeApp {
     }
 }
 
+/// Each test run keeps its bars in a fresh directory, never the user's cache.
+fn isolate_store() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("opentrader-moomoo-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Set once, before any plugin starts.
+        unsafe { std::env::set_var("OPENTRADER_MOOMOO_CACHE", dir) };
+    });
+}
+
 fn ok(s2c: Value) -> Value {
     json!({"retType": 0, "retMsg": "", "s2c": s2c})
 }
@@ -74,10 +86,11 @@ async fn fake_opend() -> String {
                     }
                     3103 => {
                         assert_eq!((req["c2s"]["klType"].as_i64(), req["c2s"]["security"]["code"].as_str()), (Some(1), Some("AAPL")));
-                        // End-stamped minutes, as some OpenD versions write them.
+                        assert_eq!(req["c2s"]["extendedTime"], true);
+                        // End-stamped minutes of the extended US day, as some OpenD versions write them.
                         let k = |t: &str, c: f64| json!({"time":t,"isBlank":false,"openPrice":c,"highPrice":c,"lowPrice":c,"closePrice":c,"volume":"100"});
                         ok(json!({"security":{"market":11,"code":"AAPL"},
-                            "klList":[k("2025-05-09 09:31:00", 1.0), k("2025-05-09 09:32:00", 2.0), k("2025-05-09 16:00:00", 3.0)]}))
+                            "klList":[k("2025-05-09 04:01:00", 1.0), k("2025-05-09 09:32:00", 2.0), k("2025-05-09 20:00:00", 3.0)]}))
                     }
                     3202 => ok(json!({"staticInfoList":[{"basic":{"security":{"market":11,"code":"AAPL"},"id":"1","lotSize":1,"secType":3,"name":"Apple Inc.","listTime":""}}]})),
                     3001 => {
@@ -125,9 +138,9 @@ async fn bars_come_from_opend_stamped_at_their_start() {
     let a = ask_until_connected(&mut app, "data.bars",
         json!({"ticker":"US:AAPL","resolution":"1","from":from,"to":from + 86_400.0,"countBack":2})).await;
     let bars = a["result"]["bars"].as_array().unwrap_or_else(|| panic!("{a}"));
-    // 09:31 and 15:59 New York: the newest two of three end-stamped bars (09:31, 09:32, 16:00), moved back a minute.
+    // 09:31 and 19:59 New York: the newest two of three end-stamped bars (04:01, 09:32, 20:00), moved back a minute.
     let times: Vec<f64> = bars.iter().map(|b| b[0].as_f64().unwrap()).collect();
-    assert_eq!(times, [1_746_797_460.0, 1_746_820_740.0]);
+    assert_eq!(times, [1_746_797_460.0, 1_746_835_140.0]);
     assert_eq!(bars[1][4].as_f64(), Some(3.0));
 }
 

@@ -5,14 +5,21 @@
  * `data.subscribe`, until the app closes the connection. Symbols are whole: `US:AAPL`, `HK:00700`.
  */
 pub mod bars;
+pub mod history;
+pub mod hours;
 pub mod market;
 pub mod opend;
 pub mod pace;
 pub mod rpc;
 pub mod search;
+pub mod store;
 pub mod stream;
 
+use bars::OpenD;
+use history::{Ask, History};
 use market::security_of;
+use std::collections::HashMap;
+use store::{clickhouse::ClickHouse, Backend, Key, Store};
 use opend::client::{Client, Event};
 use opend::proto;
 use pace::Pace;
@@ -31,11 +38,19 @@ pub const API: u32 = 2;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 /// How often dropped symbols are checked for their minute being up.
 const RELEASE_EVERY: Duration = Duration::from_secs(10);
+/// How often streamed bars are written to the store.
+const FLUSH_EVERY: Duration = Duration::from_secs(30);
 pub const DEFAULT_OPEND: &str = "127.0.0.1:11111";
 
 struct Plugin {
     client: Client,
-    pace: Pace,
+    history: History<OpenD>,
+    store: Arc<Store>,
+    /// The store's settings in use, to move only when they change.
+    store_settings: tokio::sync::Mutex<Option<String>>,
+    /// Per streamed symbol, the start of its last closed 1-minute bar on this connection: the minutes between two
+    /// closed bars had no trades, so they are covered too.
+    last_closed: Mutex<HashMap<String, i64>>,
     catalog: Catalog,
     subs: tokio::sync::Mutex<Subscriptions>,
     quotes: Mutex<Quotes>,
@@ -85,9 +100,13 @@ pub async fn run_session_with(addr: &str, plugin: &str, token: &str, opend: &str
 
     let (client, events) = Client::new(opend.to_string());
     tokio::spawn(client.clone().run());
+    let store = Arc::new(Store::new(Backend::embedded()));
     let me = Arc::new(Plugin {
+        history: History { source: OpenD { client: client.clone(), pace: Pace::history() }, store: store.clone() },
         client,
-        pace: Pace::history(),
+        store,
+        store_settings: tokio::sync::Mutex::new(None),
+        last_closed: Mutex::new(HashMap::new()),
         catalog: Catalog::default(),
         subs: tokio::sync::Mutex::new(Subscriptions::default()),
         quotes: Mutex::new(Quotes::default()),
@@ -95,6 +114,7 @@ pub async fn run_session_with(addr: &str, plugin: &str, token: &str, opend: &str
     });
     tokio::spawn(me.clone().pump(events));
     tokio::spawn(me.clone().release());
+    tokio::spawn(me.clone().flush_often());
 
     while let Ok(Some(line)) = lines.next_line().await {
         let msg: Value = match serde_json::from_str(&line) {
@@ -117,6 +137,7 @@ pub async fn run_session_with(addr: &str, plugin: &str, token: &str, opend: &str
             }
         }
     }
+    me.store.flush().await;
     Ok(())
 }
 
@@ -168,7 +189,9 @@ impl Plugin {
             "data.bars" => {
                 let p: BarsParams = params(method, p)?;
                 let (market, sec) = security_of(&p.ticker).ok_or_else(|| not_served(&p.ticker))?;
-                let bars = bars::fetch(&self.client, &self.pace, market, &sec, &p.resolution, (p.from, p.to, p.count_back)).await?;
+                let symbol = market::symbol_of(&sec).unwrap_or_default();
+                let ask = Ask { market, sec: &sec, symbol: &symbol, resolution: &p.resolution, from: p.from, to: p.to, count: p.count_back };
+                let bars = self.history.bars(ask, chrono::Utc::now().timestamp()).await?;
                 Ok(json!({ "bars": bars }))
             }
             _ => Err(RpcError::new(UNKNOWN_METHOD, format!("Unknown method {method}"))),
@@ -188,7 +211,7 @@ impl Plugin {
         let l = found.ok_or_else(|| RpcError::from(format!("OpenD knows no stock, fund or index {symbol}")))?;
         Ok(json!({
             "description": l.name, "type": l.kind, "currency": market.currency(),
-            "timezone": market.tz().name(), "session": market.session(), "extended": null, "holidays": "",
+            "timezone": market.tz().name(), "session": market.session(), "extended": market.extended(), "holidays": "",
             "pricescale": market.pricescale(), "minmov": 1, "intervals": bars::INTERVALS,
         }))
     }
@@ -200,6 +223,7 @@ impl Plugin {
                 let host = p.settings.get("host").map(|h| h.trim()).filter(|h| !h.is_empty()).unwrap_or("127.0.0.1");
                 let port = p.settings.get("port").and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(11111);
                 self.client.set_addr(format!("{host}:{port}"));
+                self.configure_store(&p.settings).await;
             }
             "data.subscribe" => {
                 let Ok(p) = serde_json::from_value::<SubscribeParams>(p) else { return };
@@ -226,12 +250,17 @@ impl Plugin {
             let now = chrono::Utc::now().timestamp();
             match e {
                 Event::Connected => {
+                    // Minutes missed while disconnected are not known: coverage starts again.
+                    self.last_closed.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     let again = self.subs.lock().await.reconnected(tokio::time::Instant::now());
                     let me = self.clone();
                     tokio::spawn(async move { me.subscribe(again).await });
                 }
                 Event::Push { proto: proto::QOT_UPDATE_KL, s2c } => {
-                    self.quotes.lock().unwrap_or_else(|e| e.into_inner()).minute_push(&s2c, now);
+                    let closed = self.quotes.lock().unwrap_or_else(|e| e.into_inner()).minute_push(&s2c, now);
+                    if let Some((symbol, bar)) = closed {
+                        self.store_minute(&symbol, bar).await;
+                    }
                 }
                 Event::Push { proto: proto::QOT_UPDATE_BASIC, s2c } => {
                     let sent = {
@@ -254,10 +283,68 @@ impl Plugin {
             tick.tick().await;
             let due = self.subs.lock().await.due(tokio::time::Instant::now());
             if !due.is_empty() {
+                let mut last = self.last_closed.lock().unwrap_or_else(|e| e.into_inner());
+                due.iter().for_each(|s| {
+                    last.remove(s);
+                });
+            }
+            if !due.is_empty() {
                 if let Err(e) = self.client.request(proto::QOT_SUB, stream::sub_request(&due, false)).await {
                     println!("[warn] could not stop live prices of {}: {e}", due.join(", "));
                 }
             }
         }
+    }
+
+    /// A closed 1-minute bar of the stream: stored, and the minutes since the last one covered.
+    async fn store_minute(&self, symbol: &str, bar: bars::Bar) {
+        let Some((market, _)) = security_of(symbol) else { return };
+        let t = bar[0] as i64;
+        let since = {
+            let mut last = self.last_closed.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = last.insert(symbol.to_string(), t);
+            prev.filter(|p| *p < t).unwrap_or(t)
+        };
+        let key = Key::new(symbol, "1", market.extended().is_some());
+        self.store.update(&key, |s| {
+            s.merge(&[bar]);
+            s.cover(since, t + 59);
+        }).await;
+    }
+
+    async fn flush_often(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(FLUSH_EVERY);
+        loop {
+            tick.tick().await;
+            self.store.flush().await;
+        }
+    }
+
+    /// Settings > Plugins: ClickHouse when its URL is given, else the embedded store.
+    async fn configure_store(&self, settings: &HashMap<String, String>) {
+        let get = |k: &str| settings.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+        let url = get("clickhouseUrl");
+        let wanted = format!("{url}|{}|{}|{}", get("clickhouseDatabase"), get("clickhouseUser"), get("clickhousePassword"));
+        let mut current = self.store_settings.lock().await;
+        if current.as_deref() == Some(wanted.as_str()) {
+            return;
+        }
+        let backend = if url.is_empty() {
+            None
+        } else {
+            let db = Some(get("clickhouseDatabase")).filter(|d| !d.is_empty()).unwrap_or_else(|| "trading_db".into());
+            match ClickHouse::new(&url, &db, &get("clickhouseUser"), settings.get("clickhousePassword").map_or("", |s| s)) {
+                Ok(c) => Some(Backend::ClickHouse(c)),
+                Err(e) => {
+                    println!("[warn] {e}; bars stay in the embedded store");
+                    None
+                }
+            }
+        };
+        // The first configure with no ClickHouse keeps the embedded store opened at start.
+        if backend.is_some() || current.is_some() {
+            self.store.set_backend(backend.unwrap_or_else(Backend::embedded)).await;
+        }
+        *current = Some(wanted);
     }
 }
