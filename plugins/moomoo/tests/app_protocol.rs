@@ -252,7 +252,8 @@ async fn an_unreadable_key_file_keeps_the_plugin_from_connecting_in_plain() {
     let mut app = FakeApp::start(closed).await;
     app.send(configure(&opend, "/nonexistent/opend-key.pem")).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let a = app.ask(5, "data.symbolInfo", json!({"ticker":"US:AAPL"})).await;
+    // Not in the US list file another test's session may have written: only OpenD could answer.
+    let a = app.ask(5, "data.symbolInfo", json!({"ticker":"US:MSFT"})).await;
     assert!(a.get("error").is_some(), "{a}");
 }
 
