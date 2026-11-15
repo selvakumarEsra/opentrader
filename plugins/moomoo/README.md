@@ -50,4 +50,14 @@ OPENTRADER_TEST_CLICKHOUSE=http://localhost:8123 cargo test clickhouse   # the s
 cargo build --release
 ```
 
-Not yet: a Windows package and a catalog entry.
+## Package
+
+```bash
+./build.sh [key]          # macOS / Linux: dist/moomoo-<version>-<platform>.zip; signed, with a catalog entry, when the key is there
+./build.ps1 [-Key <key>]  # Windows: dist/moomoo-<version>.zip, .zip.sig and catalog-entry.json; stops without the key
+```
+
+The key is the app's release key (default `~/.tauri/opentrader-updater.key`), its password in
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` or `<key>.password`. The catalog (`plugins/catalog.json`) lists one package per
+plugin, so it takes the Windows package, as for the other broker plugins; macOS and Linux users install the zip from
+a file.

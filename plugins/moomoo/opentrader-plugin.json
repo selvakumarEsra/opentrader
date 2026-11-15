@@ -1,7 +1,7 @@
 {
   "id": "moomoo",
   "name": "moomoo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "OpenTrader",
   "description": "Symbols, bars and live prices of US, Hong Kong and China A-share stocks, and trading of your paper and live moomoo accounts, through your moomoo OpenD.",
   "api": 2,
