@@ -1,0 +1,20 @@
+{
+  "id": "moomoo",
+  "name": "moomoo",
+  "version": "0.1.0",
+  "publisher": "OpenTrader",
+  "description": "Symbols, bars and live prices of US, Hong Kong and China A-share stocks from your moomoo OpenD.",
+  "api": 2,
+  "provides": ["datafeed"],
+  "exchanges": ["US", "HK", "SH", "SZ"],
+  "runtime": { "type": "process", "entry": "opentrader-moomoo", "args": [] },
+  "settings": [
+    { "key": "host", "label": "Host", "type": "text", "default": "127.0.0.1",
+      "help": "The computer OpenD runs on. Keep 127.0.0.1 when it runs on this computer." },
+    { "key": "port", "label": "Port", "type": "number", "default": "11111",
+      "help": "The API port set in OpenD (11111 unless you changed it)." }
+  ],
+  "setup": "Start moomoo OpenD and log in with your moomoo account (the first time, complete the API questionnaire it asks for). Leave encryption off for connections from this computer. The plugin connects within a few seconds and retries while OpenD is closed. Then open a symbol such as US:AAPL or HK:00700.",
+  "homepage": "https://github.com/deepentropy/opentrader/tree/main/plugins/moomoo",
+  "platforms": ["macos", "linux"]
+}

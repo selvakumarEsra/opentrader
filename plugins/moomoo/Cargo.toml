@@ -1,0 +1,27 @@
+[package]
+name = "opentrader-moomoo"
+version = "0.1.0"
+description = "OpenTrader data plugin for moomoo OpenD (symbols, bars and live prices)"
+edition = "2021"
+publish = false
+
+# A standalone program, never part of the app's build: its own workspace keeps any parent workspace out.
+[workspace]
+
+[[bin]]
+name = "opentrader-moomoo"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.52", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+chrono = "0.4"
+chrono-tz = "0.10"
+
+[profile.release]
+strip = true
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["full", "test-util"] }
