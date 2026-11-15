@@ -233,11 +233,24 @@ jobs:
       release_tag: ${{ inputs.tag || github.ref_name }}
     secrets: inherit
 
+  # selvakumarEsra/opentrader: the zerodha and dhan plugins' files, added to the draft release.
+  plugins-india:
+    needs: draft
+    if: needs.draft.outputs.release_id != '' && github.repository == 'selvakumarEsra/opentrader'
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/plugin-india.yml
+    with:
+      release_tag: ${{ inputs.tag || github.ref_name }}
+    secrets: inherit
+
   # All three installers (and in the fork the plugin) are in: publish, so installed apps get the update.
   publish:
-    needs: [draft, build, plugins]
+    needs: [draft, build, plugins, plugins-india]
     # Skipped plugins (upstream) do not hold the release back; failed ones do.
-    if: always() && needs.draft.outputs.release_id != '' && needs.build.result == 'success' && (needs.plugins.result == 'success' || needs.plugins.result == 'skipped')
+    if: always() && needs.draft.outputs.release_id != '' && needs.build.result == 'success' && (needs.plugins.result == 'success' || needs.plugins.result == 'skipped') && (needs['plugins-india'].result == 'success' || needs['plugins-india'].result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -9,7 +9,7 @@
 pub mod clickhouse;
 pub mod sqlite;
 
-use crate::bars::Bar;
+use crate::Bar;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -163,11 +163,13 @@ impl Key {
     }
 }
 
-/// The plugin's folder on this computer: `OPENTRADER_MOOMOO_CACHE`, else the user's cache folder.
+/// The plugin's folder on this computer: `OPENTRADER_<PLUGIN>_CACHE`, else `opentrader-<plugin>` in the user's
+/// cache folder (`crate::plugin`).
 pub fn cache_dir() -> Option<PathBuf> {
-    match std::env::var_os("OPENTRADER_MOOMOO_CACHE") {
+    let name = crate::plugin();
+    match std::env::var_os(format!("OPENTRADER_{}_CACHE", name.to_ascii_uppercase())) {
         Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
-        _ => dirs::cache_dir().map(|d| d.join("opentrader-moomoo")),
+        _ => dirs::cache_dir().map(|d| d.join(format!("opentrader-{name}"))),
     }
 }
 
@@ -180,7 +182,7 @@ pub enum Backend {
 }
 
 impl Backend {
-    /// The embedded store in `dir` (`OPENTRADER_MOOMOO_CACHE`, else the user's cache folder), or memory when no
+    /// The embedded store in `cache_dir`, or memory when no
     /// folder can be had.
     pub fn embedded() -> Backend {
         match cache_dir().map(|d| sqlite::Sqlite::open(&d.join("bars.sqlite"))) {

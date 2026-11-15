@@ -167,6 +167,7 @@ dependencies = [
  "block-buffer",
  "const-oid",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -294,6 +295,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
  "hashbrown 0.17.1",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
 ]
 
 [[package]]
@@ -488,7 +498,24 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "dirs",
+ "opentrader-plugin-kit",
  "rsa",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
+name = "opentrader-plugin-kit"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "dirs",
+ "hmac",
  "rusqlite",
  "serde",
  "serde_json",

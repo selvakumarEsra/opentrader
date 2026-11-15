@@ -49,7 +49,7 @@ A plugin package is a zip. It holds `opentrader-plugin.json` at its root, plus t
 | `exchanges` | A data plugin that serves several exchanges from one source, for example the market segments of one broker account: `["NSE","BSE","NFO","MCX"]`. Same rules as `exchange`, no repeats. The app then names the plugin's symbols whole in every message (see below). Plugin API 2. |
 | `runtime` | How the plugin runs (see below). |
 | `install` | Files to copy into a folder the user picks (see below). |
-| `settings` | Fields the user fills in under Settings > Plugins. `type` is `text`, `number`, `bool` (`"true"` / `"false"`) or `select`. Values travel as text. |
+| `settings` | Fields the user fills in under Settings > Plugins. `type` is `text`, `secret` (text shown masked: a password, an API secret), `number`, `bool` (`"true"` / `"false"`) or `select`. Values travel as text. |
 | `platforms` | `windows`, `macos` and/or `linux`. Leave it empty for all platforms. |
 
 ### Runtime

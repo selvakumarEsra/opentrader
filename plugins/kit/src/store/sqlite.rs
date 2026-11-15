@@ -3,7 +3,7 @@
  * scan of the primary key; `covered` holds each series' ranges. WAL journal, so a flush does not stall readers.
  */
 use super::{Change, Key, Series};
-use crate::bars::Bar;
+use crate::Bar;
 use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Arc, Mutex};

@@ -2,15 +2,15 @@
  * The ClickHouse store, over ClickHouse's HTTP interface (default http://localhost:8123). Two tables in the user's
  * database, made if missing:
  *
- *   moomoo_bars     ReplacingMergeTree(version), PARTITION BY month, ORDER BY (symbol, exchange, resolution,
+ *   <plugin>_bars     ReplacingMergeTree(version), PARTITION BY month, ORDER BY (symbol, exchange, resolution,
  *                   session, timestamp): a series is one range of the sort key, and a bar written again replaces
  *                   the earlier one (read with FINAL).
- *   moomoo_covered  ReplacingMergeTree(version), ORDER BY series: each series' covered ranges, as JSON.
+ *   <plugin>_covered  ReplacingMergeTree(version), ORDER BY series: each series' covered ranges, as JSON.
  *
  * Values travel as query parameters ({name:Type} with param_name), never spliced into SQL.
  */
 use super::{Change, Key, Series};
-use crate::bars::Bar;
+use crate::Bar;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -91,10 +91,11 @@ impl ClickHouse {
             return Ok(());
         }
         let db = &self.0.database;
+        let t = crate::plugin();
         self.query(&format!("CREATE DATABASE IF NOT EXISTS {db}"), &[], None)?;
         self.query(
             &format!(
-                "CREATE TABLE IF NOT EXISTS {db}.moomoo_bars (
+                "CREATE TABLE IF NOT EXISTS {db}.{t}_bars (
                     symbol String, exchange LowCardinality(String), resolution LowCardinality(String),
                     session LowCardinality(String), timestamp DateTime64(3, 'UTC'),
                     open Float64, high Float64, low Float64, close Float64, volume Float64, version UInt64
@@ -107,7 +108,7 @@ impl ClickHouse {
         )?;
         self.query(
             &format!(
-                "CREATE TABLE IF NOT EXISTS {db}.moomoo_covered (series String, covered String, version UInt64)
+                "CREATE TABLE IF NOT EXISTS {db}.{t}_covered (series String, covered String, version UInt64)
                 ENGINE = ReplacingMergeTree(version) ORDER BY series"
             ),
             &[],
@@ -138,11 +139,12 @@ impl ClickHouse {
         self.blocking(move |c| {
             c.ensure_tables()?;
             let db = &c.0.database;
+            let t = crate::plugin();
             let (exchange, symbol) = key.parts();
             let p = [("s", symbol), ("e", exchange), ("r", key.resolution.as_str()), ("x", key.session())];
             let rows = c.query(
                 &format!(
-                    "SELECT toUnixTimestamp64Milli(timestamp), open, high, low, close, volume FROM {db}.moomoo_bars FINAL
+                    "SELECT toUnixTimestamp64Milli(timestamp), open, high, low, close, volume FROM {db}.{t}_bars FINAL
                      WHERE symbol = {{s:String}} AND exchange = {{e:String}} AND resolution = {{r:String}} AND session = {{x:String}}
                      ORDER BY timestamp FORMAT JSONCompactEachRow"
                 ),
@@ -158,7 +160,7 @@ impl ClickHouse {
                 .collect();
             let id = key.id();
             let covered = c.query(
-                &format!("SELECT covered FROM {db}.moomoo_covered FINAL WHERE series = {{id:String}} FORMAT JSONCompactEachRow"),
+                &format!("SELECT covered FROM {db}.{t}_covered FINAL WHERE series = {{id:String}} FORMAT JSONCompactEachRow"),
                 &[("id", id.as_str())],
                 None,
             )?;
@@ -179,12 +181,13 @@ impl ClickHouse {
         self.blocking(move |c| {
             c.ensure_tables()?;
             let db = &c.0.database;
+            let t = crate::plugin();
             let (exchange, symbol) = key.parts();
             if change.cleared {
                 let p = [("s", symbol), ("e", exchange), ("r", key.resolution.as_str()), ("x", key.session())];
                 c.query(
                     &format!(
-                        "ALTER TABLE {db}.moomoo_bars DELETE WHERE symbol = {{s:String}} AND exchange = {{e:String}}
+                        "ALTER TABLE {db}.{t}_bars DELETE WHERE symbol = {{s:String}} AND exchange = {{e:String}}
                          AND resolution = {{r:String}} AND session = {{x:String}} SETTINGS mutations_sync = 1"
                     ),
                     &p,
@@ -205,10 +208,10 @@ impl ClickHouse {
                         ))
                     })
                     .collect();
-                c.query(&format!("INSERT INTO {db}.moomoo_bars FORMAT JSONEachRow"), &[], Some(rows))?;
+                c.query(&format!("INSERT INTO {db}.{t}_bars FORMAT JSONEachRow"), &[], Some(rows))?;
             }
             let row = json!({"series": key.id(), "covered": Value::from(serde_json::to_string(&change.covered).unwrap_or_default()), "version": c.next_version()});
-            c.query(&format!("INSERT INTO {db}.moomoo_covered FORMAT JSONEachRow"), &[], Some(format!("{row}\n")))?;
+            c.query(&format!("INSERT INTO {db}.{t}_covered FORMAT JSONEachRow"), &[], Some(format!("{row}\n")))?;
             Ok(())
         })
         .await

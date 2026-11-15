@@ -11,10 +11,9 @@ pub mod history;
 pub mod hours;
 pub mod market;
 pub mod opend;
-pub mod pace;
-pub mod rpc;
+// Shared with the other data plugins (plugins/kit).
+pub use opentrader_plugin_kit::{pace, rpc, store};
 pub mod search;
-pub mod store;
 pub mod stream;
 pub mod trade;
 
