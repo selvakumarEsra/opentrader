@@ -1,9 +1,9 @@
 //! A bar family and its bucket width, and the ranged fetch of one span
 //! (minute and second windows longer than one request are fetched in chunks).
 use crate::data::calendar::SessionCalendar;
-use crate::data::provider::capabilities::BarFamily;
+use crate::data::interval::BarUnit;
 use crate::data::provider::Provider;
-use crate::data::symbol::SymbolRef;
+use crate::data::symbol::Symbol;
 use crate::data::types::Candle;
 use chrono::{Duration, NaiveDate};
 
@@ -19,11 +19,11 @@ pub(super) enum Span {
 }
 
 impl Span {
-    pub(super) fn family(self) -> BarFamily {
+    pub(super) fn family(self) -> BarUnit {
         match self {
-            Span::Day => BarFamily::Day,
-            Span::Minute(_) | Span::MinuteChunked(_) => BarFamily::Minute,
-            Span::Second(_) => BarFamily::Second,
+            Span::Day => BarUnit::Day,
+            Span::Minute(_) | Span::MinuteChunked(_) => BarUnit::Minute,
+            Span::Second(_) => BarUnit::Second,
         }
     }
 }
@@ -32,7 +32,7 @@ impl Span {
 pub(super) async fn span_aggs(
     provider: &Provider,
     cal: &SessionCalendar,
-    sym: &SymbolRef,
+    sym: &Symbol,
     span: Span,
     from: NaiveDate,
     to: NaiveDate,
@@ -72,7 +72,7 @@ const SECOND_CHUNK_CONCURRENCY: usize = 16;
 async fn minute_aggs_chunked(
     provider: &Provider,
     cal: &SessionCalendar,
-    sym: &SymbolRef,
+    sym: &Symbol,
     mult: u32,
     from: NaiveDate,
     to: NaiveDate,

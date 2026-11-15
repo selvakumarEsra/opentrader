@@ -11,6 +11,7 @@
  * `trade-tick` events the gateway's live task sends. Bars are not kept on disk: the plugin's source owns its history.
  */
 use super::Plugins;
+use crate::data::interval::Interval;
 use crate::data::session::{Subsession, SymbolSession};
 use crate::data::types::{Candle, ChartAggregate, Snapshot, SymbolSearchResult, TickerInfo, TradeTick};
 use opentrader_core::host::HostRef;
@@ -215,25 +216,18 @@ pub async fn ticker_info(app: &AppHandle, r: &Route) -> Result<TickerInfo, Strin
     })
 }
 
-/// A resolution the plugin serves, and the bucket it is rebuilt to (seconds, 0 = as served).
-fn pick(intervals: &[String], unit: &str, mult: u32) -> Option<(String, u64)> {
-    let served = |n: u32| {
-        let name = match unit {
-            "second" => format!("{n}S"),
-            "minute" => n.to_string(),
-            _ => "1D".to_string(),
-        };
-        intervals.iter().any(|i| i.eq_ignore_ascii_case(&name)).then_some(name)
+/// A resolution the plugin serves for `iv`, and the bucket it is rebuilt to (seconds, 0 = as served).
+fn pick(intervals: &[String], iv: Interval) -> Option<(Interval, u64)> {
+    let served = |d: u32| {
+        let want = Interval::new(iv.unit(), d);
+        intervals.iter().any(|i| i.parse() == Ok(want)).then_some(want)
     };
-    if unit == "day" {
-        return served(1).map(|n| (n, 0));
-    }
-    if let Some(n) = served(mult) {
+    if let Some(n) = served(iv.mult()) {
         return Some((n, 0));
     }
     // The largest served size that divides it, rebuilt on the clock grid.
-    let step = if unit == "second" { 1 } else { 60 };
-    (1..mult).rev().filter(|d| mult % d == 0).find_map(|d| served(d)).map(|n| (n, mult as u64 * step))
+    let mult = iv.mult();
+    (1..mult).rev().filter(|d| mult.is_multiple_of(*d)).find_map(served).map(|n| (n, iv.secs()))
 }
 
 fn parse_bars(v: &Value) -> Result<Vec<Candle>, String> {
@@ -270,33 +264,21 @@ fn rebuild(bars: Vec<Candle>, bucket: u64) -> Vec<Candle> {
     out
 }
 
-/// Bars of `unit` ("second", "minute", "day") × `mult` in [`from`, `to`] (UNIX seconds), at most `count` of them,
-/// the newest ones.
-pub async fn bars(app: &AppHandle, r: &Route, unit: &str, mult: u32, from: f64, to: f64, count: u64) -> Result<Vec<Candle>, String> {
+/// Bars of `iv` in [`from`, `to`] (UNIX seconds), at most `count` of them, the newest ones.
+pub async fn bars(app: &AppHandle, r: &Route, iv: Interval, from: f64, to: f64, count: u64) -> Result<Vec<Candle>, String> {
     let i = info(app, r).await?;
-    let Some((resolution, bucket)) = pick(&i.intervals, unit, mult.max(1)) else {
+    let Some((served, bucket)) = pick(&i.intervals, iv) else {
         return Ok(Vec::new());
     };
-    let ask_count = if bucket > 0 { count.saturating_mul(bucket / base_seconds(&resolution).max(1)) } else { count };
+    let ask_count = if bucket > 0 { count.saturating_mul(bucket / served.secs()) } else { count };
     let params = json!({
-        "ticker": r.ticker, "resolution": resolution,
+        "ticker": r.ticker, "resolution": served.resolution(),
         "from": from.max(0.0).floor(), "to": to.floor(), "countBack": ask_count.clamp(1, MAX_BARS),
     });
     let v = ask(app, r, "data.bars", params, BARS_TIMEOUT).await?;
     let mut bars = parse_bars(&v)?;
     bars.retain(|b| b.time >= from && b.time <= to);
     Ok(if bucket > 0 { rebuild(bars, bucket) } else { bars })
-}
-
-fn base_seconds(resolution: &str) -> u64 {
-    let r = resolution.to_ascii_uppercase();
-    if let Some(s) = r.strip_suffix('S') {
-        s.parse().unwrap_or(1)
-    } else if r.ends_with('D') || r.ends_with('W') || r.ends_with('M') {
-        86_400
-    } else {
-        r.parse::<u64>().unwrap_or(1) * 60
-    }
 }
 
 fn now() -> f64 {
@@ -308,31 +290,21 @@ fn span(days: u32) -> f64 {
     (days as f64 * 7.0 / 5.0 + 3.0) * 86_400.0
 }
 
-/// The last `days` trading days of `unit` bars.
-pub async fn recent(app: &AppHandle, r: &Route, unit: &str, mult: u32, days: u32) -> Result<Vec<Candle>, String> {
+/// The last `days` trading days of `iv` bars.
+pub async fn recent(app: &AppHandle, r: &Route, iv: Interval, days: u32) -> Result<Vec<Candle>, String> {
     let to = now();
-    let per_day = match unit {
-        "second" => 86_400 / mult.max(1) as u64,
-        "minute" => 1_440 / mult.max(1) as u64,
-        _ => 1,
-    };
-    bars(app, r, unit, mult, to - span(days), to, per_day.max(1) * days as u64).await
+    bars(app, r, iv, to - span(days), to, iv.bars_per_day() * days as u64).await
 }
 
-/// Bars strictly before `before_sec`, over `span_days` trading days.
-pub async fn before(app: &AppHandle, r: &Route, unit: &str, mult: u32, before_sec: f64, span_days: u32) -> Result<Vec<Candle>, String> {
+/// Bars of `iv` strictly before `before_sec`, over `span_days` trading days.
+pub async fn before(app: &AppHandle, r: &Route, iv: Interval, before_sec: f64, span_days: u32) -> Result<Vec<Candle>, String> {
     let to = before_sec - 1.0;
-    let per_day = match unit {
-        "second" => 86_400 / mult.max(1) as u64,
-        "minute" => 1_440 / mult.max(1) as u64,
-        _ => 1,
-    };
-    bars(app, r, unit, mult, to - span(span_days), to, per_day.max(1) * span_days as u64).await
+    bars(app, r, iv, to - span(span_days), to, iv.bars_per_day() * span_days as u64).await
 }
 
 /// The quote panel's numbers, from the last two daily bars.
 pub async fn snapshot(app: &AppHandle, r: &Route) -> Result<Snapshot, String> {
-    let daily = recent(app, r, "day", 1, 10).await?;
+    let daily = recent(app, r, Interval::day(), 10).await?;
     let last = daily.last().ok_or_else(|| format!("{}: no bars", r.symbol))?;
     let prev = daily.len().checked_sub(2).map(|i| daily[i].close).unwrap_or(last.open);
     let change = last.close - prev;
@@ -564,17 +536,17 @@ mod tests {
     #[test]
     fn picks_a_served_interval_or_a_divisor() {
         let served = iv(&["1", "5", "15", "60", "1D"]);
-        assert_eq!(pick(&served, "minute", 5), Some(("5".into(), 0)));
-        assert_eq!(pick(&served, "minute", 45), Some(("15".into(), 2700)));
-        assert_eq!(pick(&served, "minute", 7), Some(("1".into(), 420)));
-        assert_eq!(pick(&served, "day", 1), Some(("1D".into(), 0)));
-        assert_eq!(pick(&served, "second", 5), None);
-        assert_eq!(pick(&iv(&["1S"]), "second", 10), Some(("1S".into(), 10)));
+        assert_eq!(pick(&served, Interval::minutes(5)), Some((Interval::minutes(5), 0)));
+        assert_eq!(pick(&served, Interval::minutes(45)), Some((Interval::minutes(15), 2700)));
+        assert_eq!(pick(&served, Interval::minutes(7)), Some((Interval::minutes(1), 420)));
+        assert_eq!(pick(&served, Interval::day()), Some((Interval::day(), 0)));
+        assert_eq!(pick(&served, Interval::seconds(5)), None);
+        assert_eq!(pick(&iv(&["1S"]), Interval::seconds(10)), Some((Interval::seconds(1), 10)));
         // Hours only (#332): the chart asks the served size itself and builds 2 and 4 hours from it; nothing under it.
         let hours = iv(&["60", "1D"]);
-        assert_eq!(pick(&hours, "minute", 60), Some(("60".into(), 0)));
-        assert_eq!(pick(&hours, "minute", 240), Some(("60".into(), 14_400)));
-        assert_eq!(pick(&hours, "minute", 30), None);
+        assert_eq!(pick(&hours, Interval::minutes(60)), Some((Interval::minutes(60), 0)));
+        assert_eq!(pick(&hours, Interval::minutes(240)), Some((Interval::minutes(60), 14_400)));
+        assert_eq!(pick(&hours, Interval::minutes(30)), None);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::data::market_rest::economics;
 use crate::data::provider::capabilities::ProviderCapabilities;
 use crate::data::provider::{entitlements, Provider};
 use crate::data::session::SymbolSession;
-use crate::data::symbol::SymbolRef;
+use crate::data::symbol::Symbol;
 use crate::data::types::{
     DividendEvent, FilingList, FilingQuery, FilingText, Fundamentals, NewsItem, RevenueBreakdown, Snapshot, SplitEvent, SubscribeMsg,
     SymbolSearchResult, TickerInfo, WsHandle,
@@ -60,6 +60,7 @@ pub const SERVED: &[&str] = &[
 /// The arguments of the served commands as the bindings send them (camelCase).
 pub mod args {
     use super::{FilingQuery, ScanRequest};
+    use crate::data::interval::BarUnit;
     use serde::Deserialize;
 
     #[derive(Deserialize)]
@@ -107,7 +108,7 @@ pub mod args {
     #[serde(rename_all = "camelCase")]
     pub struct AggregatesBefore {
         pub symbol: String,
-        pub timespan: String,
+        pub timespan: BarUnit,
         pub mult: u32,
         pub before_sec: f64,
         pub span_days: u32,
@@ -209,9 +210,9 @@ fn is_economic_symbol(symbol: &str) -> bool {
     symbol.split_once(':').is_some_and(|(ex, _)| economics::is_economic(ex))
 }
 
-/// The symbol a chart streams: upper case, none for an economic series.
+/// The symbol a chart streams, normalised as every [`Symbol`]; none for an economic series.
 pub fn live_symbol(symbol: Option<String>) -> Option<String> {
-    symbol.map(|s| s.to_uppercase()).filter(|s| !is_economic_symbol(s))
+    symbol.map(|s| Symbol::parse(&s).to_string()).filter(|s| !is_economic_symbol(s))
 }
 
 /// The symbols a watchlist streams (see [`live_symbol`]).
@@ -234,15 +235,15 @@ pub async fn subscribe(live: &WsHandle, msg: SubscribeMsg) -> Result<()> {
 // ── Reference ──
 
 pub async fn ticker_info(provider: &Provider, symbol: &str) -> Result<TickerInfo> {
-    Ok(provider.ticker_info(&SymbolRef::parse(symbol)).await?)
+    Ok(provider.ticker_info(&Symbol::parse(symbol)).await?)
 }
 
 pub async fn symbol_session(provider: &Provider, symbol: &str) -> Result<SymbolSession> {
-    Ok(provider.symbol_session(&SymbolRef::parse(symbol)).await?)
+    Ok(provider.symbol_session(&Symbol::parse(symbol)).await?)
 }
 
 pub async fn ticker_snapshot(provider: &Provider, symbol: &str) -> Result<Snapshot> {
-    Ok(provider.ticker_snapshot(&SymbolRef::parse(symbol)).await?)
+    Ok(provider.ticker_snapshot(&Symbol::parse(symbol)).await?)
 }
 
 pub async fn search_tickers(provider: &Provider, query: &str, type_filter: Option<&str>) -> Result<Vec<SymbolSearchResult>> {
@@ -260,32 +261,32 @@ pub fn economic_sources() -> Vec<String> {
 // ── Chart events ──
 
 pub async fn dividends(provider: &Provider, symbol: &str) -> Result<Vec<DividendEvent>> {
-    Ok(provider.dividends(&SymbolRef::parse(symbol)).await?)
+    Ok(provider.dividends(&Symbol::parse(symbol)).await?)
 }
 
 pub async fn splits(provider: &Provider, symbol: &str) -> Result<Vec<SplitEvent>> {
-    Ok(provider.splits(&SymbolRef::parse(symbol)).await?)
+    Ok(provider.splits(&Symbol::parse(symbol)).await?)
 }
 
 /// Markers are decorative: a failed lookup is an empty list.
 pub async fn latest_news(provider: &Provider, symbol: &str, limit: u32) -> Vec<NewsItem> {
-    provider.latest_news(&SymbolRef::parse(symbol), limit.clamp(1, 50)).await
+    provider.latest_news(&Symbol::parse(symbol), limit.clamp(1, 50)).await
 }
 
 pub async fn fundamentals(provider: &Provider, symbol: &str) -> Result<Fundamentals> {
-    Ok((*provider.fundamentals(&SymbolRef::parse(symbol)).await?).clone())
+    Ok((*provider.fundamentals(&Symbol::parse(symbol)).await?).clone())
 }
 
 pub async fn filings(provider: &Provider, symbol: &str, query: &FilingQuery) -> Result<FilingList> {
-    Ok(provider.filings(&SymbolRef::parse(symbol), query).await?)
+    Ok(provider.filings(&Symbol::parse(symbol), query).await?)
 }
 
 pub async fn read_filing(provider: &Provider, symbol: &str, accn: &str, section: Option<&str>, offset: Option<u32>) -> Result<FilingText> {
-    Ok(provider.filing_text(&SymbolRef::parse(symbol), accn, section, offset.unwrap_or(0)).await?)
+    Ok(provider.filing_text(&Symbol::parse(symbol), accn, section, offset.unwrap_or(0)).await?)
 }
 
 pub async fn revenue_breakdown(provider: &Provider, symbol: &str) -> Result<RevenueBreakdown> {
-    Ok(provider.revenue_breakdown(&SymbolRef::parse(symbol)).await?)
+    Ok(provider.revenue_breakdown(&Symbol::parse(symbol)).await?)
 }
 
 // ── Provider ──
@@ -323,9 +324,18 @@ mod tests {
     #[test]
     fn economic_series_and_case_are_handled_before_the_live_task() {
         assert_eq!(live_symbol(Some("nasdaq:aapl".into())).as_deref(), Some("NASDAQ:AAPL"));
+        assert_eq!(live_symbol(Some(" nasdaq:aapl ".into())).as_deref(), Some("NASDAQ:AAPL"));
         assert_eq!(live_symbol(Some("ECONOMICS:UNRATE".into())), None);
         assert_eq!(live_symbols(vec!["spy".into(), "ECONOMICS:GDP".into()]), vec!["SPY".to_string()]);
         assert_eq!(chart_owner("main", "0"), "main:0");
+    }
+
+    #[test]
+    fn a_timespan_that_is_not_a_unit_is_refused_when_read() {
+        let a = r#"{"symbol":"SPY","timespan":"weird","mult":1,"beforeSec":0,"spanDays":1,"adjusted":true}"#;
+        assert!(serde_json::from_str::<args::AggregatesBefore>(a).is_err());
+        let a = a.replace("weird", "second");
+        assert!(serde_json::from_str::<args::AggregatesBefore>(&a).is_ok());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 use super::{daily_series, midnight, DIVIDEND_BASIS_DAYS};
 use crate::data::calendar::SessionCalendar;
 use crate::data::provider::Provider;
-use crate::data::symbol::SymbolRef;
+use crate::data::symbol::Symbol;
 use crate::data::types::{Candle, DividendEvent, SplitEvent};
 
 /// Unadjusted `bars` put on the split-adjusted scale: prices times
@@ -67,7 +67,7 @@ pub(super) fn scale_by_dividends(bars: &mut [Candle], steps: &[(f64, f64)], cal:
 pub(super) async fn with_dividends(
     provider: &Provider,
     cal: &SessionCalendar,
-    sym: &SymbolRef,
+    sym: &Symbol,
     mut bars: Vec<Candle>,
     dividends: bool,
 ) -> crate::error::Result<Vec<Candle>> {

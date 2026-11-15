@@ -1,5 +1,5 @@
 //! Owner-keyed desired subscriptions shared by the live transports.
-use crate::data::symbol::SymbolRef;
+use crate::data::symbol::Symbol;
 use crate::data::ticker_case;
 use std::collections::HashSet;
 
@@ -108,7 +108,7 @@ impl SubscriptionState {
 /// Vendor ticker of a full name ("NASDAQ:AAPL" → "AAPL", "NYSE:BAC/PB" →
 /// "BACpB": the vendor's spelling, see `ticker_case`).
 pub fn ticker_of(symbol: &str) -> String {
-    ticker_case::to_source(&SymbolRef::parse(symbol).ticker)
+    ticker_case::to_source(Symbol::parse(symbol).ticker())
 }
 
 

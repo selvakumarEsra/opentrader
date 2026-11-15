@@ -22,7 +22,7 @@ pub use gateway::GatewayProvider;
 
 use capabilities::{DataStatus, HistoryProbe, ProviderCapabilities, StreamCaps};
 use crate::data::session::SymbolSession;
-use crate::data::symbol::SymbolRef;
+use crate::data::symbol::Symbol;
 use crate::data::types::{
     Candle, DividendEvent, FilingList, FilingQuery, FilingText, Fundamentals, NewsItem, RevenueBreakdown, Snapshot, SplitEvent, SymbolSearchResult, TickerInfo,
     WsHandle,
@@ -32,7 +32,7 @@ use chrono::NaiveDate;
 use std::sync::Arc;
 use crate::host::HostRef;
 
-/// Historical OHLCV bars of a symbol (`SymbolRef`: exchange + provider
+/// Historical OHLCV bars of a symbol (`Symbol`: exchange + provider
 /// ticker). Callers pass an inclusive `[from, to]` calendar range
 /// (the command layer derives it from the trading calendar / scroll anchor).
 /// `adjusted` selects split-adjusted vs raw prices. The chart always reads
@@ -43,7 +43,7 @@ use crate::host::HostRef;
 pub trait HistoryProvider: Send + Sync {
     async fn daily_aggs(
         &self,
-        sym: &SymbolRef,
+        sym: &Symbol,
         from: NaiveDate,
         to: NaiveDate,
         adjusted: bool,
@@ -51,38 +51,38 @@ pub trait HistoryProvider: Send + Sync {
     /// Daily bars kept outside `daily_aggs`: the sessions older than its
     /// history window, oldest first, on the same price scale (`adjusted`).
     /// Empty when the provider has none for the symbol.
-    async fn daily_archive(&self, _sym: &SymbolRef, _adjusted: bool) -> Result<Vec<Candle>> {
+    async fn daily_archive(&self, _sym: &Symbol, _adjusted: bool) -> Result<Vec<Candle>> {
         Ok(Vec::new())
     }
     /// Date the symbol's current listing started, when the provider knows
     /// it. A ticker symbol can be used again by another company: archived
     /// bars older than this date belong to the earlier one.
     /// `None` when unknown; an error when the lookup failed.
-    async fn listing_date(&self, _sym: &SymbolRef) -> Result<Option<NaiveDate>> {
+    async fn listing_date(&self, _sym: &Symbol) -> Result<Option<NaiveDate>> {
         Ok(None)
     }
     /// Symbols of the company now behind the symbol, each with the date it
     /// took it (newest first), when the provider keeps that history. Empty
     /// when unknown; an error when the lookup failed.
-    async fn symbol_changes(&self, _sym: &SymbolRef) -> Result<Vec<SymbolChange>> {
+    async fn symbol_changes(&self, _sym: &Symbol) -> Result<Vec<SymbolChange>> {
         Ok(Vec::new())
     }
     /// Every executed split of the company now behind the symbol, in any
     /// order. An error when the list could not be read (bars must then not be
     /// scaled with it); it keeps the lookup's code so a load that could not
     /// reach the server is asked again.
-    async fn executed_splits(&self, _sym: &SymbolRef) -> Result<Vec<SplitEvent>> {
+    async fn executed_splits(&self, _sym: &Symbol) -> Result<Vec<SplitEvent>> {
         Ok(Vec::new())
     }
     /// Every dividend of the symbol, in any order, amounts as declared. An
     /// error when the list could not be read (bars must then not be adjusted
     /// with it), with the lookup's code as for the splits.
-    async fn paid_dividends(&self, _sym: &SymbolRef) -> Result<Vec<DividendEvent>> {
+    async fn paid_dividends(&self, _sym: &Symbol) -> Result<Vec<DividendEvent>> {
         Ok(Vec::new())
     }
     async fn minute_aggs(
         &self,
-        sym: &SymbolRef,
+        sym: &Symbol,
         mult: u32,
         from: NaiveDate,
         to: NaiveDate,
@@ -90,7 +90,7 @@ pub trait HistoryProvider: Send + Sync {
     ) -> Result<Vec<Candle>>;
     async fn second_aggs(
         &self,
-        sym: &SymbolRef,
+        sym: &Symbol,
         mult: u32,
         from: NaiveDate,
         to: NaiveDate,
@@ -100,7 +100,7 @@ pub trait HistoryProvider: Send + Sync {
     /// seconds chart's refresh loop, which must not refetch whole sessions.
     async fn second_tail(
         &self,
-        sym: &SymbolRef,
+        sym: &Symbol,
         mult: u32,
         since_sec: f64,
         adjusted: bool,
@@ -118,12 +118,12 @@ pub struct SymbolChange {
 /// Symbol reference data, snapshots, corporate-action events, and branding icon.
 #[async_trait::async_trait]
 pub trait ReferenceProvider: Send + Sync {
-    async fn ticker_info(&self, sym: &SymbolRef) -> Result<TickerInfo>;
+    async fn ticker_info(&self, sym: &Symbol) -> Result<TickerInfo>;
     /// Trading sessions of a symbol (time zone, regular / extended hours,
     /// holidays). Called before the first bars of a symbol, so it should
     /// answer fast (no I/O when the provider can).
-    async fn symbol_session(&self, sym: &SymbolRef) -> Result<SymbolSession>;
-    async fn ticker_snapshot(&self, sym: &SymbolRef) -> Result<Snapshot>;
+    async fn symbol_session(&self, sym: &Symbol) -> Result<SymbolSession>;
+    async fn ticker_snapshot(&self, sym: &Symbol) -> Result<Snapshot>;
     async fn search(
         &self,
         query: &str,
@@ -131,28 +131,28 @@ pub trait ReferenceProvider: Send + Sync {
     ) -> Result<Vec<SymbolSearchResult>>;
     /// Dividend / split markers. A failed lookup is an error (not an empty
     /// list) so the app can ask again once the server can be reached.
-    async fn dividends(&self, sym: &SymbolRef) -> Result<Vec<DividendEvent>>;
-    async fn splits(&self, sym: &SymbolRef) -> Result<Vec<SplitEvent>>;
+    async fn dividends(&self, sym: &Symbol) -> Result<Vec<DividendEvent>>;
+    async fn splits(&self, sym: &Symbol) -> Result<Vec<SplitEvent>>;
     /// Newest headlines for the "Latest news" lollipop (newest first); empty on
     /// failure, like the event markers.
-    async fn latest_news(&self, sym: &SymbolRef, limit: u32) -> Vec<NewsItem>;
+    async fn latest_news(&self, sym: &Symbol, limit: u32) -> Vec<NewsItem>;
     /// Fetch a branding icon by its encoded proxy path → `(bytes, content_type)`.
     async fn icon(&self, encoded: &str) -> Result<(Vec<u8>, String)>;
     /// Financial statement items and earnings releases of the company behind
     /// the symbol. An error when there are none (or the lookup failed).
-    async fn fundamentals(&self, _sym: &SymbolRef) -> Result<Arc<Fundamentals>> {
+    async fn fundamentals(&self, _sym: &Symbol) -> Result<Arc<Fundamentals>> {
         anyhow::bail!("fundamentals are not available from this data source")
     }
     /// A page of the company's filings, newest first.
-    async fn filings(&self, _sym: &SymbolRef, _q: &FilingQuery) -> Result<FilingList> {
+    async fn filings(&self, _sym: &Symbol, _q: &FilingQuery) -> Result<FilingList> {
         anyhow::bail!("filings are not available from this data source")
     }
     /// The contents of filing `accn` (no `section`), or a page of one section's text.
-    async fn filing_text(&self, _sym: &SymbolRef, _accn: &str, _section: Option<&str>, _offset: u32) -> Result<FilingText> {
+    async fn filing_text(&self, _sym: &Symbol, _accn: &str, _section: Option<&str>, _offset: u32) -> Result<FilingText> {
         anyhow::bail!("filings are not available from this data source")
     }
     /// Revenue by segment, product line, country or region and customer, per filing.
-    async fn revenue_breakdown(&self, _sym: &SymbolRef) -> Result<RevenueBreakdown> {
+    async fn revenue_breakdown(&self, _sym: &Symbol) -> Result<RevenueBreakdown> {
         anyhow::bail!("revenue breakdowns are not available from this data source")
     }
 }

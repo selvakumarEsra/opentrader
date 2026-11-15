@@ -6,7 +6,7 @@ use super::symbol_chain::{earlier_bars, merge_between, prepend_older};
 use crate::data::calendar::SessionCalendar;
 use crate::data::gateway;
 use crate::data::provider::Provider;
-use crate::data::symbol::SymbolRef;
+use crate::data::symbol::Symbol;
 use crate::data::types::Candle;
 use chrono::NaiveDate;
 
@@ -71,7 +71,7 @@ pub(super) fn prepend_archive(mut bars: Vec<Candle>, archive: Vec<Candle>, from_
 pub(super) async fn joined_daily(
     provider: &Provider,
     cal: &SessionCalendar,
-    sym: &SymbolRef,
+    sym: &Symbol,
     wanted_from: NaiveDate,
     from: NaiveDate,
     to: NaiveDate,

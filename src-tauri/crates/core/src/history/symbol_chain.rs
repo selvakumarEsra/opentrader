@@ -6,7 +6,7 @@ use super::span::{span_aggs, Span};
 use super::{clamp_to_floor, day_of};
 use crate::data::calendar::SessionCalendar;
 use crate::data::provider::Provider;
-use crate::data::symbol::SymbolRef;
+use crate::data::symbol::Symbol;
 use crate::data::types::Candle;
 use chrono::{Duration, NaiveDate};
 
@@ -21,7 +21,7 @@ use chrono::{Duration, NaiveDate};
 pub(super) async fn earlier_bars(
     provider: &Provider,
     cal: &SessionCalendar,
-    sym: &SymbolRef,
+    sym: &Symbol,
     segments: &[Segment],
     span: Span,
     from: NaiveDate,
@@ -39,7 +39,7 @@ pub(super) async fn earlier_bars(
         if a > b {
             continue;
         }
-        let earlier = SymbolRef { exchange: sym.exchange.clone(), ticker: segment.ticker.clone() };
+        let earlier = sym.with_ticker(&segment.ticker);
         let recent = match clamp_to_floor(span.family(), a, b).await {
             Some((a, b)) => span_aggs(provider, cal, &earlier, span, a, b, false).await,
             None => Ok(Vec::new()),
@@ -86,7 +86,7 @@ pub(super) async fn earlier_bars(
 pub(super) async fn chained_aggs(
     provider: &Provider,
     cal: &SessionCalendar,
-    sym: &SymbolRef,
+    sym: &Symbol,
     span: Span,
     from: NaiveDate,
     to: NaiveDate,

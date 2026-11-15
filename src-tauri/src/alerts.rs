@@ -27,7 +27,7 @@
  * (`opentrader_core::alerts::engine`); this file feeds it and emits its fires.
  */
 use crate::data::provider::Provider;
-use crate::data::symbol::SymbolRef;
+use crate::data::symbol::Symbol;
 use crate::data::types::Candle;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -226,7 +226,7 @@ pub fn alert_engine_set(
         tauri::async_runtime::spawn(async move {
             let day = |t: f64| chrono::DateTime::from_timestamp(t as i64, 0).unwrap_or_default().date_naive();
             let (from, to) = (day(job.from - 86_400.0), day(now_sec() + 86_400.0));
-            let bars = provider.minute_aggs(&SymbolRef::parse(&job.symbol), 1, from, to, true).await;
+            let bars = provider.minute_aggs(&Symbol::parse(&job.symbol), 1, from, to, true).await;
             if let Err(e) = &bars {
                 eprintln!("[alerts] replay of {} failed: {e:#}", job.symbol);
             }

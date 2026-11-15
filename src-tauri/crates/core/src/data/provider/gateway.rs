@@ -21,7 +21,7 @@ use crate::data::types::{
     WsHandle,
 };
 use crate::data::session::{Subsession, SymbolSession};
-use crate::data::symbol::SymbolRef;
+use crate::data::symbol::Symbol;
 use crate::data::market_rest::economics;
 use crate::data::{daily_archive, gateway, market_rest, market_stream, quote_poll, ticker_case, trading_calendar};
 use anyhow::Result;
@@ -35,87 +35,87 @@ pub struct GatewayProvider;
 impl HistoryProvider for GatewayProvider {
     async fn daily_aggs(
         &self,
-        sym: &SymbolRef,
+        sym: &Symbol,
         from: NaiveDate,
         to: NaiveDate,
         adjusted: bool,
     ) -> Result<Vec<Candle>> {
-        market_rest::fetch_daily_aggs(&ticker_case::to_source(&sym.ticker), from, to, adjusted).await
+        market_rest::fetch_daily_aggs(&ticker_case::to_source(sym.ticker()), from, to, adjusted).await
     }
-    async fn daily_archive(&self, sym: &SymbolRef, adjusted: bool) -> Result<Vec<Candle>> {
-        daily_archive::daily_bars(&ticker_case::to_source(&sym.ticker), adjusted).await
+    async fn daily_archive(&self, sym: &Symbol, adjusted: bool) -> Result<Vec<Candle>> {
+        daily_archive::daily_bars(&ticker_case::to_source(sym.ticker()), adjusted).await
     }
-    async fn listing_date(&self, sym: &SymbolRef) -> Result<Option<NaiveDate>> {
-        Ok(market_rest::listing_date(&ticker_case::to_source(&sym.ticker)).await?)
+    async fn listing_date(&self, sym: &Symbol) -> Result<Option<NaiveDate>> {
+        Ok(market_rest::listing_date(&ticker_case::to_source(sym.ticker())).await?)
     }
-    async fn symbol_changes(&self, sym: &SymbolRef) -> Result<Vec<SymbolChange>> {
-        let changes = market_rest::ticker_changes(&ticker_case::to_source(&sym.ticker)).await?;
+    async fn symbol_changes(&self, sym: &Symbol) -> Result<Vec<SymbolChange>> {
+        let changes = market_rest::ticker_changes(&ticker_case::to_source(sym.ticker())).await?;
         Ok(changes.iter().map(|(date, ticker)| SymbolChange { date: *date, ticker: ticker_case::to_app(ticker) }).collect())
     }
-    async fn executed_splits(&self, sym: &SymbolRef) -> Result<Vec<SplitEvent>> {
-        Ok(market_rest::split_events(&ticker_case::to_source(&sym.ticker)).await?)
+    async fn executed_splits(&self, sym: &Symbol) -> Result<Vec<SplitEvent>> {
+        Ok(market_rest::split_events(&ticker_case::to_source(sym.ticker())).await?)
     }
-    async fn paid_dividends(&self, sym: &SymbolRef) -> Result<Vec<DividendEvent>> {
-        Ok(market_rest::dividend_events(&ticker_case::to_source(&sym.ticker)).await?)
+    async fn paid_dividends(&self, sym: &Symbol) -> Result<Vec<DividendEvent>> {
+        Ok(market_rest::dividend_events(&ticker_case::to_source(sym.ticker())).await?)
     }
     async fn minute_aggs(
         &self,
-        sym: &SymbolRef,
+        sym: &Symbol,
         mult: u32,
         from: NaiveDate,
         to: NaiveDate,
         adjusted: bool,
     ) -> Result<Vec<Candle>> {
-        market_rest::fetch_minute_aggs(&ticker_case::to_source(&sym.ticker), mult, from, to, adjusted).await
+        market_rest::fetch_minute_aggs(&ticker_case::to_source(sym.ticker()), mult, from, to, adjusted).await
     }
     async fn second_aggs(
         &self,
-        sym: &SymbolRef,
+        sym: &Symbol,
         mult: u32,
         from: NaiveDate,
         to: NaiveDate,
         adjusted: bool,
     ) -> Result<Vec<Candle>> {
-        market_rest::fetch_second_aggs(&ticker_case::to_source(&sym.ticker), mult, from, to, adjusted).await
+        market_rest::fetch_second_aggs(&ticker_case::to_source(sym.ticker()), mult, from, to, adjusted).await
     }
     async fn second_tail(
         &self,
-        sym: &SymbolRef,
+        sym: &Symbol,
         mult: u32,
         since_sec: f64,
         adjusted: bool,
     ) -> Result<Vec<Candle>> {
-        market_rest::fetch_second_tail(&ticker_case::to_source(&sym.ticker), mult, since_sec, adjusted).await
+        market_rest::fetch_second_tail(&ticker_case::to_source(sym.ticker()), mult, since_sec, adjusted).await
     }
 }
 
 #[async_trait::async_trait]
 impl ReferenceProvider for GatewayProvider {
-    async fn ticker_info(&self, sym: &SymbolRef) -> Result<TickerInfo> {
-        if economics::is_economic(&sym.exchange) {
+    async fn ticker_info(&self, sym: &Symbol) -> Result<TickerInfo> {
+        if economics::is_economic(sym.exchange()) {
             return economic_info(sym).await;
         }
         // Answered under the app's name, not the source's spelling.
-        let mut info = market_rest::fetch_ticker_info(&ticker_case::to_source(&sym.ticker)).await?;
-        info.ticker = sym.ticker.clone();
+        let mut info = market_rest::fetch_ticker_info(&ticker_case::to_source(sym.ticker())).await?;
+        info.ticker = sym.ticker().to_string();
         Ok(info)
     }
-    async fn symbol_session(&self, sym: &SymbolRef) -> Result<SymbolSession> {
-        if economics::is_economic(&sym.exchange) {
+    async fn symbol_session(&self, sym: &Symbol) -> Result<SymbolSession> {
+        if economics::is_economic(sym.exchange()) {
             return economic_session(sym).await;
         }
         let mut session = us_equity_session();
-        if sym.exchange == "OTC" {
+        if sym.exchange() == "OTC" {
             session.variable_tick_size = OTC_TICKS.into();
         }
         Ok(session)
     }
-    async fn ticker_snapshot(&self, sym: &SymbolRef) -> Result<Snapshot> {
-        if economics::is_economic(&sym.exchange) {
+    async fn ticker_snapshot(&self, sym: &Symbol) -> Result<Snapshot> {
+        if economics::is_economic(sym.exchange()) {
             return economic_snapshot(sym).await;
         }
-        let mut snapshot = market_rest::fetch_ticker_snapshot(&ticker_case::to_source(&sym.ticker)).await?;
-        snapshot.ticker = sym.ticker.clone();
+        let mut snapshot = market_rest::fetch_ticker_snapshot(&ticker_case::to_source(sym.ticker())).await?;
+        snapshot.ticker = sym.ticker().to_string();
         Ok(snapshot)
     }
     async fn search(
@@ -125,50 +125,50 @@ impl ReferenceProvider for GatewayProvider {
     ) -> Result<Vec<SymbolSearchResult>> {
         market_rest::search_tickers(query, type_filter).await
     }
-    async fn dividends(&self, sym: &SymbolRef) -> Result<Vec<DividendEvent>> {
-        if economics::is_economic(&sym.exchange) {
+    async fn dividends(&self, sym: &Symbol) -> Result<Vec<DividendEvent>> {
+        if economics::is_economic(sym.exchange()) {
             return Ok(Vec::new());
         }
-        Ok(market_rest::dividend_events(&ticker_case::to_source(&sym.ticker)).await?)
+        Ok(market_rest::dividend_events(&ticker_case::to_source(sym.ticker())).await?)
     }
-    async fn splits(&self, sym: &SymbolRef) -> Result<Vec<SplitEvent>> {
-        if economics::is_economic(&sym.exchange) {
+    async fn splits(&self, sym: &Symbol) -> Result<Vec<SplitEvent>> {
+        if economics::is_economic(sym.exchange()) {
             return Ok(Vec::new());
         }
-        Ok(market_rest::split_events(&ticker_case::to_source(&sym.ticker)).await?)
+        Ok(market_rest::split_events(&ticker_case::to_source(sym.ticker())).await?)
     }
-    async fn latest_news(&self, sym: &SymbolRef, limit: u32) -> Vec<NewsItem> {
-        if economics::is_economic(&sym.exchange) {
+    async fn latest_news(&self, sym: &Symbol, limit: u32) -> Vec<NewsItem> {
+        if economics::is_economic(sym.exchange()) {
             return Vec::new();
         }
-        market_rest::latest_news(&ticker_case::to_source(&sym.ticker), limit).await
+        market_rest::latest_news(&ticker_case::to_source(sym.ticker()), limit).await
     }
     async fn icon(&self, encoded: &str) -> Result<(Vec<u8>, String)> {
         market_rest::fetch_icon(encoded).await
     }
-    async fn fundamentals(&self, sym: &SymbolRef) -> Result<std::sync::Arc<Fundamentals>> {
-        if economics::is_economic(&sym.exchange) {
+    async fn fundamentals(&self, sym: &Symbol) -> Result<std::sync::Arc<Fundamentals>> {
+        if economics::is_economic(sym.exchange()) {
             anyhow::bail!("an economic series has no fundamentals");
         }
-        Ok(market_rest::fetch_fundamentals(&ticker_case::to_source(&sym.ticker)).await?)
+        Ok(market_rest::fetch_fundamentals(&ticker_case::to_source(sym.ticker())).await?)
     }
-    async fn filings(&self, sym: &SymbolRef, q: &FilingQuery) -> Result<FilingList> {
-        if economics::is_economic(&sym.exchange) {
+    async fn filings(&self, sym: &Symbol, q: &FilingQuery) -> Result<FilingList> {
+        if economics::is_economic(sym.exchange()) {
             anyhow::bail!("an economic series has no filings");
         }
-        Ok(market_rest::fetch_filings(&ticker_case::to_source(&sym.ticker), q).await?)
+        Ok(market_rest::fetch_filings(&ticker_case::to_source(sym.ticker()), q).await?)
     }
-    async fn filing_text(&self, sym: &SymbolRef, accn: &str, section: Option<&str>, offset: u32) -> Result<FilingText> {
-        if economics::is_economic(&sym.exchange) {
+    async fn filing_text(&self, sym: &Symbol, accn: &str, section: Option<&str>, offset: u32) -> Result<FilingText> {
+        if economics::is_economic(sym.exchange()) {
             anyhow::bail!("an economic series has no filings");
         }
-        Ok(market_rest::fetch_filing_text(&ticker_case::to_source(&sym.ticker), accn, section, offset).await?)
+        Ok(market_rest::fetch_filing_text(&ticker_case::to_source(sym.ticker()), accn, section, offset).await?)
     }
-    async fn revenue_breakdown(&self, sym: &SymbolRef) -> Result<RevenueBreakdown> {
-        if economics::is_economic(&sym.exchange) {
+    async fn revenue_breakdown(&self, sym: &Symbol) -> Result<RevenueBreakdown> {
+        if economics::is_economic(sym.exchange()) {
             anyhow::bail!("an economic series has no revenue breakdown");
         }
-        Ok(market_rest::fetch_revenue_breakdown(&ticker_case::to_source(&sym.ticker)).await?)
+        Ok(market_rest::fetch_revenue_breakdown(&ticker_case::to_source(sym.ticker())).await?)
     }
 }
 
@@ -243,13 +243,13 @@ fn economic_unit(units: &str) -> Option<String> {
 
 /// Reference data of an economic series: its title, the agency (shown where
 /// the exchange is) and its unit.
-async fn economic_info(sym: &SymbolRef) -> Result<TickerInfo> {
-    let meta = match economics::meta(&sym.ticker) {
+async fn economic_info(sym: &Symbol) -> Result<TickerInfo> {
+    let meta = match economics::meta(sym.ticker()) {
         Some(m) => m,
-        None => economics::fetch_series(&sym.ticker).await?.meta.clone(),
+        None => economics::fetch_series(sym.ticker()).await?.meta.clone(),
     };
     Ok(TickerInfo {
-        ticker: sym.ticker.clone(),
+        ticker: sym.ticker().to_string(),
         name: Some(meta.name.clone()),
         exchange: Some(meta.source.clone()),
         industry: None,
@@ -274,8 +274,8 @@ fn decimals(v: f64) -> u32 {
 
 /// An economic series trades "every day" (one observation per date, 00:00
 /// UTC); its price grid follows the decimals of its recent values.
-async fn economic_session(sym: &SymbolRef) -> Result<SymbolSession> {
-    let series = economics::fetch_series(&sym.ticker).await?;
+async fn economic_session(sym: &Symbol) -> Result<SymbolSession> {
+    let series = economics::fetch_series(sym.ticker()).await?;
     let dec = series.value.iter().rev().take(60).map(|&v| decimals(v)).max().unwrap_or(2);
     Ok(SymbolSession {
         timezone: "Etc/UTC".into(),
@@ -291,14 +291,14 @@ async fn economic_session(sym: &SymbolRef) -> Result<SymbolSession> {
 }
 
 /// Last value of an economic series and its change from the observation before.
-async fn economic_snapshot(sym: &SymbolRef) -> Result<Snapshot> {
-    let s = economics::fetch_series(&sym.ticker).await?;
+async fn economic_snapshot(sym: &Symbol) -> Result<Snapshot> {
+    let s = economics::fetch_series(sym.ticker()).await?;
     let n = s.value.len();
     let last = *s.value.last().ok_or_else(|| anyhow::anyhow!("no observation"))?;
     let prev = if n > 1 { s.value[n - 2] } else { last };
     let change = last - prev;
     Ok(Snapshot {
-        ticker: sym.ticker.clone(),
+        ticker: sym.ticker().to_string(),
         last,
         change,
         change_percent: if prev != 0.0 { change / prev.abs() * 100.0 } else { 0.0 },
@@ -468,9 +468,9 @@ mod tests {
     #[test]
     fn us_equity_price_grid_matches_reference() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let aapl = rt.block_on(GatewayProvider.symbol_session(&SymbolRef::parse("NASDAQ:AAPL"))).unwrap();
+        let aapl = rt.block_on(GatewayProvider.symbol_session(&Symbol::parse("NASDAQ:AAPL"))).unwrap();
         assert_eq!((aapl.pricescale, aapl.minmov, aapl.variable_tick_size.as_str()), (100, 1, "0.0001 1 0.01"));
-        let otc = rt.block_on(GatewayProvider.symbol_session(&SymbolRef::parse("OTC:TCEHY"))).unwrap();
+        let otc = rt.block_on(GatewayProvider.symbol_session(&Symbol::parse("OTC:TCEHY"))).unwrap();
         assert_eq!(otc.variable_tick_size, "0.000001 0.0001 0.0001 1 0.01");
     }
 

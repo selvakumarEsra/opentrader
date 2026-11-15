@@ -3,6 +3,7 @@
  * assembly (trading-calendar date math, memos, scroll-back windows) lives in
  * `opentrader_core::history`; these hand it the injected provider.
  */
+use crate::data::interval::{BarUnit, Interval};
 use crate::data::provider::Provider;
 use crate::data::types::Candle;
 use crate::plugins::data as plugin;
@@ -31,7 +32,7 @@ pub async fn get_daily_history(
 ) -> Result<History, String> {
     // A data plugin's symbol (plugins/data.rs), here and in the commands below.
     if let Some(r) = plugin::route(&app, &symbol) {
-        return Ok(History { bars: plugin::recent(&app, &r, "day", 1, days).await?, partial: false });
+        return Ok(History { bars: plugin::recent(&app, &r, Interval::day(), days).await?, partial: false });
     }
     Ok(history::get_daily_history(&provider, symbol, days, adjusted).await?)
 }
@@ -52,7 +53,7 @@ pub async fn get_minute_history(
     adjusted: bool,
 ) -> Result<History, String> {
     if let Some(r) = plugin::route(&app, &symbol) {
-        return Ok(History { bars: plugin::recent(&app, &r, "minute", interval_min.max(1), days).await?, partial: false });
+        return Ok(History { bars: plugin::recent(&app, &r, Interval::minutes(interval_min), days).await?, partial: false });
     }
     Ok(history::get_minute_history(&provider, symbol, days, interval_min, adjusted).await?)
 }
@@ -72,7 +73,7 @@ pub async fn get_second_history(
     adjusted: bool,
 ) -> Result<History, String> {
     if let Some(r) = plugin::route(&app, &symbol) {
-        return Ok(History { bars: plugin::recent(&app, &r, "second", mult, days).await?, partial: false });
+        return Ok(History { bars: plugin::recent(&app, &r, Interval::seconds(mult), days).await?, partial: false });
     }
     Ok(history::get_second_history(&provider, symbol, mult, days, adjusted).await?)
 }
@@ -94,7 +95,7 @@ pub async fn get_second_history_tail(
 ) -> Result<Vec<Candle>, String> {
     if let Some(r) = plugin::route(&app, &symbol) {
         let to = chrono::Utc::now().timestamp() as f64;
-        return plugin::bars(&app, &r, "second", mult, since_sec + 1.0, to, 5_000).await;
+        return plugin::bars(&app, &r, Interval::seconds(mult), since_sec + 1.0, to, 5_000).await;
     }
     Ok(history::get_second_history_tail(&provider, symbol, mult, since_sec, adjusted).await?)
 }
@@ -112,7 +113,7 @@ pub async fn get_aggregates_before(
     app: AppHandle,
     provider: State<'_, Provider>,
     symbol: String,
-    timespan: String,
+    timespan: BarUnit,
     mult: u32,
     // Seconds since epoch. `f64` (not i64) because specta forbids exporting
     // 64-bit ints to TypeScript, and it matches `Candle.time`'s type anyway.
@@ -121,7 +122,7 @@ pub async fn get_aggregates_before(
     adjusted: bool,
 ) -> Result<Vec<Candle>, String> {
     if let Some(r) = plugin::route(&app, &symbol) {
-        return plugin::before(&app, &r, &timespan, mult, before_sec, span_days).await;
+        return plugin::before(&app, &r, Interval::new(timespan, mult), before_sec, span_days).await;
     }
     Ok(history::get_aggregates_before(&provider, symbol, timespan, mult, before_sec, span_days, adjusted).await?)
 }
@@ -143,7 +144,7 @@ pub async fn get_daily_history_before(
     adjusted: bool,
 ) -> Result<Vec<Candle>, String> {
     if let Some(r) = plugin::route(&app, &symbol) {
-        return plugin::before(&app, &r, "day", 1, before_sec, span_days).await;
+        return plugin::before(&app, &r, Interval::day(), before_sec, span_days).await;
     }
     Ok(history::get_daily_history_before(&provider, symbol, before_sec, span_days, adjusted).await?)
 }
