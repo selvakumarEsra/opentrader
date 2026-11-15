@@ -66,7 +66,7 @@ m = json.load(open(manifest))
 entry = {k: m[k] for k in ("id", "name", "version", "publisher", "description", "provides", "api")}
 entry["platforms"] = [platform]
 entry["homepage"] = m["homepage"]
-entry["url"] = f"https://github.com/deepentropy/opentrader/releases/download/plugin-moomoo-v{version}/{os.path.basename(zip_path)}"
+entry["url"] = f"https://github.com/selvakumarEsra/opentrader/releases/download/plugin-moomoo-v{version}/{os.path.basename(zip_path)}"
 entry["sha256"] = hashlib.sha256(open(zip_path, "rb").read()).hexdigest()
 entry["signature"] = open(zip_path + ".sig").read().strip()
 print(json.dumps(entry, indent=2, ensure_ascii=False))

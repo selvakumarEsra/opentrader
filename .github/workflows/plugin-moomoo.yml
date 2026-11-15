@@ -1,13 +1,16 @@
 name: Plugin moomoo
 
-# Builds the moomoo plugin (plugins/moomoo) as one program per system, each zipped with its manifest
-# (plugins/moomoo/package.py), and releases them.
-#   - On a pushed tag plugin-moomoo-v<version> (git tag plugin-moomoo-v0.2.0 && git push origin plugin-moomoo-v0.2.0):
-#     a GitHub Release for the tag with the three zips. The version must match plugins/moomoo/opentrader-plugin.json
-#     and Cargo.toml.
+# Builds the moomoo plugin (plugins/moomoo) as one self-contained program per system (the whole plugin: the app's
+# plugin, backfill, record, the embedded store), each also zipped with its manifest (plugins/moomoo/package.py),
+# and releases them to OUR repository, selvakumarEsra/opentrader, never to upstream deepentropy/opentrader: the
+# release job runs only there and names it.
+#   - On a pushed tag plugin-moomoo-v<version> (git tag plugin-moomoo-v0.2.1 && git push origin plugin-moomoo-v0.2.1):
+#     the GitHub Release of the tag in selvakumarEsra/opentrader with the three programs and the three zips. The
+#     version must match plugins/moomoo/opentrader-plugin.json and Cargo.toml.
 #   - Manual run (Actions tab -> "Run workflow"): the zips as workflow artifacts only.
 #
-# Outputs: moomoo-<version>.zip (Windows, the catalog's package), moomoo-<version>-macos.zip (universal: Apple
+# Outputs: opentrader-moomoo-<version>-windows-x86_64.exe, -macos-universal, -linux-x86_64 (the programs), and
+# moomoo-<version>.zip (Windows, the catalog's package), moomoo-<version>-macos.zip (universal: Apple
 # Silicon and Intel), moomoo-<version>-linux.zip (x86_64). With the secrets TAURI_SIGNING_PRIVATE_KEY and
 # TAURI_SIGNING_PRIVATE_KEY_PASSWORD (the app's release key) each zip also gets its .sig and a catalog entry
 # (catalog-entry-<platform>.json); without them the zips are unsigned, which Settings > Plugins warns about.
@@ -18,6 +21,8 @@ on:
 
 env:
   TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+  # Where releases go: our repository, not upstream.
+  RELEASE_REPO: selvakumarEsra/opentrader
 
 jobs:
   build:
@@ -88,6 +93,11 @@ jobs:
               echo "BINARY=target/release/opentrader-moomoo" >> "$GITHUB_ENV" ;;
           esac
 
+      - name: Smoke test
+        run: |
+          "$BINARY" --help
+          "$BINARY" backfill NOT-A-SYMBOL && exit 1 || test $? -eq 2
+
       - name: Package
         run: |
           zip=$(python package.py zip "$BINARY" ${{ matrix.platform }} dist)
@@ -114,7 +124,8 @@ jobs:
 
   release:
     needs: build
-    if: github.ref_type == 'tag'
+    # Only in our repository: a copy of this workflow upstream (or in another fork) never releases.
+    if: github.ref_type == 'tag' && github.repository == 'selvakumarEsra/opentrader'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -129,8 +140,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="${TAG#plugin-moomoo-v}"
-          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "moomoo plugin $version" --notes \
-              "The moomoo plugin $version: one program per system, with its manifest. Install the zip of your system in OpenTrader under Settings > Plugins > Install from file. See plugins/moomoo/README.md."
+          ls -l dist
+          if ! gh release view "$TAG" -R "$RELEASE_REPO" > /dev/null 2>&1; then
+            gh release create "$TAG" -R "$RELEASE_REPO" --verify-tag --title "moomoo plugin $version" --notes \
+              "The moomoo plugin $version, one self-contained program per system: \`opentrader-moomoo-$version-<system>\` runs \`backfill\` and \`record\` on its own, and the zip of your system installs it in OpenTrader under Settings > Plugins > Install from file. See plugins/moomoo/README.md."
           fi
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*
+          gh release upload "$TAG" -R "$RELEASE_REPO" --clobber dist/*

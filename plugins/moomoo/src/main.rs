@@ -9,6 +9,11 @@ fn main() {
     if !args.is_empty() {
         let options = match opentrader_moomoo::cli::parse(&args) {
             Ok(o) => o,
+            // Asked for: the usage, and a success.
+            Err(e) if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help" | "help")) => {
+                println!("{e}");
+                std::process::exit(0);
+            }
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(2);

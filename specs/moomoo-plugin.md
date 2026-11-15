@@ -336,3 +336,28 @@ implementations:
 - Two closed minutes in a row cover the span from the first's start to the second's end; after a reconnect, the next closed minute covers only itself.
 <!-- id: REQ-MOOMOO-013.A2 -->
 - Symbols that are not the plugin's (`AAPL`, `XX:NOPE`) are refused before connecting, with the expected form.
+
+<!-- id: REQ-MOOMOO-014 -->
+## Plugin releases MUST be built by GitHub Actions and published to selvakumarEsra/opentrader only
+
+A pushed tag `plugin-moomoo-v<version>` (matching the manifest and Cargo.toml)
+builds, tests and releases the plugin. Each system gets one self-contained
+program holding the whole plugin (the app's plugin, `backfill` and `record`, the
+embedded store; nothing else to install): `opentrader-moomoo-<version>-windows-x86_64.exe`,
+`…-macos-universal` (Apple Silicon and Intel), `…-linux-x86_64`, and the zip of
+each with its manifest for Settings > Plugins. They are published to the
+release of the tag in `selvakumarEsra/opentrader`, never in the upstream
+`deepentropy/opentrader`: the release job runs only in that repository and
+names it. Catalog entries (when signed) point at that repository's release.
+
+implementations:
+  - .github/workflows/plugin-moomoo.yml
+  - plugins/moomoo/package.py:make_zip
+
+## Acceptance
+<!-- id: REQ-MOOMOO-014.A1 -->
+- The workflow's release job has the condition `github.repository == 'selvakumarEsra/opentrader'` and publishes with `-R selvakumarEsra/opentrader`.
+<!-- id: REQ-MOOMOO-014.A2 -->
+- The release of a tag holds the three programs and the three zips; each program runs `--help` on its system in the workflow before it is published.
+<!-- id: REQ-MOOMOO-014.A3 -->
+- A catalog entry's `url` is `https://github.com/selvakumarEsra/opentrader/releases/download/plugin-moomoo-v<version>/<zip>`.

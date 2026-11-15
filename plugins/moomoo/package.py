@@ -1,19 +1,27 @@
 """The moomoo plugin package, for the plugin release workflow (.github/workflows/plugin-moomoo.yml).
 
-    python package.py zip   BINARY PLATFORM OUT_DIR   # writes OUT_DIR/<zip name>, prints its path
+    python package.py zip   BINARY PLATFORM OUT_DIR   # writes the program and the zip to OUT_DIR, prints the zip's path
     python package.py entry ZIP PLATFORM               # prints the catalog entry of a signed ZIP (ZIP.sig next to it)
 
-The zip holds the program and the manifest set for PLATFORM (windows, macos, linux): its entry and its platform.
-The Windows zip is moomoo-<version>.zip (the catalog's package); the others moomoo-<version>-<platform>.zip.
+BINARY is the whole plugin in one program (the app's plugin, `backfill`, `record`, the embedded store). It is
+written as opentrader-moomoo-<version>-<system> (windows-x86_64.exe, macos-universal, linux-x86_64), and zipped
+with the manifest set for PLATFORM (windows, macos, linux): its entry and its platform. The Windows zip is
+moomoo-<version>.zip (the catalog's package); the others moomoo-<version>-<platform>.zip.
+
+Releases are published to selvakumarEsra/opentrader, never upstream: catalog entries point there.
 """
 import hashlib
 import json
 import os
+import shutil
 import sys
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# The repository plugin releases are published to.
+RELEASE_REPO = "selvakumarEsra/opentrader"
 RELEASES = "https://github.com/{repo}/releases/download/plugin-moomoo-v{version}/{name}"
+SYSTEMS = {"windows": "windows-x86_64.exe", "macos": "macos-universal", "linux": "linux-x86_64"}
 
 
 def manifest():
@@ -31,6 +39,9 @@ def make_zip(binary, platform, out_dir):
     m["runtime"]["entry"] = entry
     m["platforms"] = [platform]
     os.makedirs(out_dir, exist_ok=True)
+    single = os.path.join(out_dir, f"opentrader-moomoo-{m['version']}-{SYSTEMS[platform]}")
+    shutil.copyfile(binary, single)
+    os.chmod(single, 0o755)
     path = os.path.join(out_dir, zip_name(m["version"], platform))
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         info = zipfile.ZipInfo(entry, date_time=(2020, 1, 1, 0, 0, 0))
@@ -51,11 +62,10 @@ def catalog_entry(zip_path, platform):
         sha = hashlib.sha256(f.read()).hexdigest()
     with open(zip_path + ".sig", encoding="utf-8") as f:
         signature = f.read().strip()
-    repo = os.environ.get("GITHUB_REPOSITORY", "deepentropy/opentrader")
     entry = {k: m[k] for k in ("id", "name", "version", "publisher", "description", "provides", "api")}
     entry["platforms"] = [platform]
     entry["homepage"] = m["homepage"]
-    entry["url"] = RELEASES.format(repo=repo, version=m["version"], name=os.path.basename(zip_path))
+    entry["url"] = RELEASES.format(repo=RELEASE_REPO, version=m["version"], name=os.path.basename(zip_path))
     entry["sha256"] = sha
     entry["signature"] = signature
     print(json.dumps(entry, indent=2, ensure_ascii=False))

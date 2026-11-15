@@ -50,7 +50,7 @@ $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
 $entry = [ordered]@{
   id = $manifest.id; name = $manifest.name; version = $version; publisher = $manifest.publisher; description = $manifest.description
   provides = $manifest.provides; api = $manifest.api; platforms = @("windows"); homepage = $manifest.homepage
-  url = "https://github.com/deepentropy/opentrader/releases/download/plugin-moomoo-v$version/moomoo-$version.zip"
+  url = "https://github.com/selvakumarEsra/opentrader/releases/download/plugin-moomoo-v$version/moomoo-$version.zip"
   sha256 = $sha; signature = (Get-Content "$zip.sig" -Raw).Trim()
 }
 [IO.File]::WriteAllText("$dist\catalog-entry.json", ($entry | ConvertTo-Json -Depth 4))
