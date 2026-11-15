@@ -1,0 +1,136 @@
+name: Plugin moomoo
+
+# Builds the moomoo plugin (plugins/moomoo) as one program per system, each zipped with its manifest
+# (plugins/moomoo/package.py), and releases them.
+#   - On a pushed tag plugin-moomoo-v<version> (git tag plugin-moomoo-v0.2.0 && git push origin plugin-moomoo-v0.2.0):
+#     a GitHub Release for the tag with the three zips. The version must match plugins/moomoo/opentrader-plugin.json
+#     and Cargo.toml.
+#   - Manual run (Actions tab -> "Run workflow"): the zips as workflow artifacts only.
+#
+# Outputs: moomoo-<version>.zip (Windows, the catalog's package), moomoo-<version>-macos.zip (universal: Apple
+# Silicon and Intel), moomoo-<version>-linux.zip (x86_64). With the secrets TAURI_SIGNING_PRIVATE_KEY and
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD (the app's release key) each zip also gets its .sig and a catalog entry
+# (catalog-entry-<platform>.json); without them the zips are unsigned, which Settings > Plugins warns about.
+on:
+  push:
+    tags: ['plugin-moomoo-v*']
+  workflow_dispatch:
+
+env:
+  TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: macos-latest
+            platform: macos
+          - os: ubuntu-22.04        # an older glibc: the program runs on more Linux systems
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: plugins/moomoo
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          manifest=$(node -p "require('./opentrader-plugin.json').version")
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::Cargo.toml says $version, opentrader-plugin.json says $manifest"; exit 1
+          fi
+          if [ -n "$TAG" ] && [ "$TAG" != "plugin-moomoo-v$version" ]; then
+            echo "::error::Tag $TAG does not match the plugin version $version (expected plugin-moomoo-v$version)"; exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'plugins/moomoo -> target'
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: |
+          case "${{ matrix.platform }}" in
+            macos)
+              cargo build --release --locked --target aarch64-apple-darwin
+              cargo build --release --locked --target x86_64-apple-darwin
+              mkdir -p target/universal
+              lipo -create -output target/universal/opentrader-moomoo \
+                target/aarch64-apple-darwin/release/opentrader-moomoo target/x86_64-apple-darwin/release/opentrader-moomoo
+              echo "BINARY=target/universal/opentrader-moomoo" >> "$GITHUB_ENV" ;;
+            windows)
+              cargo build --release --locked
+              echo "BINARY=target/release/opentrader-moomoo.exe" >> "$GITHUB_ENV" ;;
+            *)
+              cargo build --release --locked
+              echo "BINARY=target/release/opentrader-moomoo" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Package
+        run: |
+          zip=$(python package.py zip "$BINARY" ${{ matrix.platform }} dist)
+          echo "ZIP=$zip" >> "$GITHUB_ENV"
+          echo "Package: $zip"
+
+      - name: Sign
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        run: |
+          npx --yes @tauri-apps/cli@2.12.3 signer sign "$ZIP"
+          test -f "$ZIP.sig"
+          python package.py entry "$ZIP" ${{ matrix.platform }} > dist/catalog-entry-${{ matrix.platform }}.json
+
+      - name: Not signed
+        if: env.TAURI_SIGNING_PRIVATE_KEY == ''
+        run: |
+          echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set: $ZIP is not signed and has no catalog entry."
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: moomoo-${{ matrix.platform }}
+          path: plugins/moomoo/dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${TAG#plugin-moomoo-v}"
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "moomoo plugin $version" --notes \
+              "The moomoo plugin $version: one program per system, with its manifest. Install the zip of your system in OpenTrader under Settings > Plugins > Install from file. See plugins/moomoo/README.md."
+          fi
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*

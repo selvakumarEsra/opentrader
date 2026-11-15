@@ -76,6 +76,12 @@ cargo build --release
 ./build.ps1 [-Key <key>]  # Windows: dist/moomoo-<version>.zip, .zip.sig and catalog-entry.json; stops without the key
 ```
 
+A release builds all three in GitHub Actions ([`plugin-moomoo.yml`](../../.github/workflows/plugin-moomoo.yml)):
+push a tag `plugin-moomoo-v<version>` and the release of that tag gets `moomoo-<version>.zip` (Windows),
+`moomoo-<version>-macos.zip` (universal) and `moomoo-<version>-linux.zip`, each one program with its manifest
+(`package.py`). They are signed, with catalog entries, when the repository has the secrets
+`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+
 The key is the app's release key (default `~/.tauri/opentrader-updater.key`), its password in
 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` or `<key>.password`. The catalog (`plugins/catalog.json`) lists one package per
 plugin, so it takes the Windows package, as for the other broker plugins; macOS and Linux users install the zip from
