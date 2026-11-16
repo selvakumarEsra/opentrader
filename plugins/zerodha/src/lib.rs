@@ -220,7 +220,17 @@ impl Provider for Zerodha {
     }
 
     async fn instruments(&self) -> Result<Vec<Instrument>, String> {
-        let body = self.get("/instruments").await?;
+        // The instrument dump is public: no login, so search works while the credentials are wrong or missing.
+        let (url, agent) = (format!("{}/instruments", self.urls.api), self.agent.clone());
+        let body = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+            let resp = agent.get(&url).header("X-Kite-Version", "3").call().map_err(|e| format!("Kite instruments: {e}"))?;
+            match resp.status().as_u16() {
+                200 => resp.into_body().with_config().limit(200 * 1024 * 1024).read_to_vec().map_err(|e| format!("Kite instruments: {e}")),
+                status => Err(format!("Kite instruments: HTTP {status}")),
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         let text = instruments::text_of(body)?;
         tokio::task::spawn_blocking(move || instruments::parse(&text)).await.map_err(|e| e.to_string())?
     }

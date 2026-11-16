@@ -36,6 +36,11 @@ Secrets are kept in OpenTrader's settings on this computer and shown masked.
 - **Store**: SQLite in the cache folder `opentrader-dhan` (`OPENTRADER_DHAN_CACHE`), or ClickHouse tables
   `dhan_bars` / `dhan_covered`.
 
+## Fill the store unattended
+
+`opentrader-dhan backfill SYMBOL… [--file FILE] [--from dd/mm/yyyy] [--resolutions 1,1D] [--clickhouse URL …]
+[--env FILE]`: the same command as the Zerodha plugin's (see plugins/zerodha/README.md), with `DHAN_*` credentials.
+
 ## Build and test
 
 ```bash

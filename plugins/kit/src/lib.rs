@@ -11,6 +11,7 @@
  *   feed     a whole data plugin over a broker (`Provider`)
  *   totp     RFC 6238 codes for broker logins
  */
+pub mod backfill;
 pub mod calendar;
 pub mod catalog;
 pub mod feed;

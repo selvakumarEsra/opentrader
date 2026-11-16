@@ -12,6 +12,7 @@
 | `history` | `data.bars` from the store, asking a `Source` only for what is missing |
 | `live` | ticks to 1-minute bars, written to the store |
 | `totp` | RFC 6238 codes from a base32 secret |
+| `backfill` | the `backfill` command of a `Provider`'s program: fill the store unattended |
 | `feed` | a whole data plugin over a `Provider` (search, symbol info, bars, live, "Always record") |
 
 Used by `moomoo` (rpc, pace, store) and by `zerodha` and `dhan` (all of it). `cargo test` runs its tests.

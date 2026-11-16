@@ -233,9 +233,17 @@ async fn logs_in_lists_fetches_history_and_streams() {
     let urls = opentrader_zerodha::auth::Urls { login: base.clone(), api: base, ws };
     let mut app = FakeApp::start(urls).await;
 
-    // Without credentials, a search names what is missing in the log and finds nothing.
-    let a = app.ask(2, "data.search", json!({"query":"reliance"})).await;
-    assert_eq!(a["result"]["symbols"], json!([]));
+    // The instrument list needs no login: search works before the credentials are set.
+    let mut found = Value::Null;
+    for _ in 0..50 {
+        let a = app.ask(2, "data.search", json!({"query":"reliance"})).await;
+        if a["result"]["symbols"].as_array().is_some_and(|r| !r.is_empty()) {
+            found = a["result"]["symbols"][0]["ticker"].clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(found, json!("NSE:RELIANCE"));
 
     app.send(json!({"jsonrpc":"2.0","method":"plugin.configure","params":{"settings":{
         "apiKey": KEY, "apiSecret": SECRET, "userId": "AB1234", "password": "pw", "totpSecret": TOTP }}}))

@@ -40,6 +40,22 @@ anything; the plugin reads the `request_token` off the redirect itself.
 - **Store** (plugins/kit `store`): SQLite in the user's cache folder `opentrader-zerodha`
   (`OPENTRADER_ZERODHA_CACHE` overrides it), or ClickHouse tables `zerodha_bars` / `zerodha_covered`.
 
+## Fill the store unattended
+
+The plugin program also runs as a command, outside the app, writing to the same store the charts read. It logs in
+on its own (the same flow as the app), so it can run from cron or launchd:
+
+```bash
+# Credentials as KITE_*=… lines in a file only you can read (chmod 600), or in the environment.
+opentrader-zerodha backfill NSE:RELIANCE NSE:NIFTY_50 --env ~/.config/opentrader/zerodha.env
+opentrader-zerodha backfill --file watchlist.txt --from 01/01/2020 --resolutions 1,1D --env ~/.config/opentrader/zerodha.env
+opentrader-zerodha backfill --file watchlist.txt --clickhouse http://localhost:8123 --database trading_db --user trading_user --password …
+```
+
+`--from` (dd/mm/yyyy, default 01/01/2000) is how far back to ask; a step with no bars ends it sooner. Resolutions
+default to `1,1D`. Run again later, only the bars the store is missing are asked. Exit status 0 when every series
+was filled, 1 when one failed, 2 for wrong arguments. The instrument list is public and needs no login.
+
 ## Build and test
 
 ```bash

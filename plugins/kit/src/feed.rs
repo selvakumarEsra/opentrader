@@ -242,23 +242,29 @@ impl<P: Provider> Feed<P> {
         if current.as_deref() == Some(wanted.as_str()) {
             return;
         }
-        let backend = if url.is_empty() {
-            None
-        } else {
-            let db = Some(get("clickhouseDatabase")).filter(|d| !d.is_empty()).unwrap_or_else(|| "trading_db".into());
-            let user = Some(get("clickhouseUser")).filter(|u| !u.is_empty()).unwrap_or_else(|| "default".into());
-            match ClickHouse::new(&url, &db, &user, settings.get("clickhousePassword").map_or("", |s| s)) {
-                Ok(c) => Some(Backend::ClickHouse(c)),
-                Err(e) => {
-                    println!("[warn] {e}; bars stay in the embedded store");
-                    None
-                }
-            }
-        };
+        let backend = backend_of(settings);
         if backend.is_some() || current.is_some() {
             self.store.set_backend(backend.unwrap_or_else(Backend::embedded)).await;
         }
         *current = Some(wanted);
+    }
+}
+
+/// The store of the settings: ClickHouse when `clickhouseUrl` is given (and reachable to configure), else None.
+pub fn backend_of(settings: &HashMap<String, String>) -> Option<Backend> {
+    let get = |k: &str| settings.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+    let url = get("clickhouseUrl");
+    if url.is_empty() {
+        return None;
+    }
+    let db = Some(get("clickhouseDatabase")).filter(|d| !d.is_empty()).unwrap_or_else(|| "trading_db".into());
+    let user = Some(get("clickhouseUser")).filter(|u| !u.is_empty()).unwrap_or_else(|| "default".into());
+    match ClickHouse::new(&url, &db, &user, settings.get("clickhousePassword").map_or("", |s| s)) {
+        Ok(c) => Some(Backend::ClickHouse(c)),
+        Err(e) => {
+            println!("[warn] {e}; bars stay in the embedded store");
+            None
+        }
     }
 }
 
