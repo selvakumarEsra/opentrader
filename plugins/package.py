@@ -19,7 +19,12 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RELEASE_REPO = "selvakumarEsra/opentrader"
-RELEASES = "https://github.com/{repo}/releases/download/plugin-{id}-v{version}/{name}"
+RELEASES = "https://github.com/{repo}/releases/download/{tag}/{name}"
+
+
+def release_tag(plugin, version):
+    """The release the zip is uploaded to: the app's (RELEASE_TAG, set by the workflow) or the plugin's own tag."""
+    return os.environ.get("RELEASE_TAG") or f"plugin-{plugin}-v{version}"
 SYSTEMS = {"windows": "windows-x86_64.exe", "macos": "macos-universal", "linux": "linux-x86_64"}
 
 
@@ -65,7 +70,7 @@ def catalog_entry(plugin, zip_path, platform):
     entry = {k: m[k] for k in ("id", "name", "version", "publisher", "description", "provides", "api")}
     entry["platforms"] = [platform]
     entry["homepage"] = m["homepage"]
-    entry["url"] = RELEASES.format(repo=RELEASE_REPO, id=plugin, version=m["version"], name=os.path.basename(zip_path))
+    entry["url"] = RELEASES.format(repo=RELEASE_REPO, tag=release_tag(plugin, m["version"]), name=os.path.basename(zip_path))
     entry["sha256"] = sha
     entry["signature"] = signature
     print(json.dumps(entry, indent=2, ensure_ascii=False))

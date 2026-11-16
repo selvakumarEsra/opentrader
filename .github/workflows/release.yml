@@ -255,6 +255,28 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The plugin catalog the app reads (releases/latest/download/catalog.json): every signed plugin package of this
+      # release, one entry per plugin and platform, merged from the plugin jobs' catalog-entry-*.json.
+      - name: Plugin catalog
+        if: github.repository == 'selvakumarEsra/opentrader'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          mkdir -p entries
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate \
+            -q '.[] | select(.name | startswith("catalog-entry-")) | "\(.id) \(.name)"' |
+          while read -r id name; do
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$id" -H "Accept: application/octet-stream" > "entries/$name"
+          done
+          if ! ls entries/*.json > /dev/null 2>&1; then
+            echo "::warning::No signed plugin package in this release: no plugin catalog."; exit 0
+          fi
+          jq -s '{plugins: (sort_by(.id, .platforms[0]))}' entries/*.json > catalog.json
+          jq -r '.plugins[] | "\(.id) \(.version) \(.platforms[0]) \(.url)"' catalog.json
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber catalog.json
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

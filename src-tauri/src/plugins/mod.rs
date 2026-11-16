@@ -29,7 +29,9 @@ use tokio::sync::oneshot;
 
 const FILE: &str = "plugins.json";
 pub const DEFAULT_PORT: u16 = 47_822;
-const CATALOG_URL: &str = "https://raw.githubusercontent.com/deepentropy/opentrader/main/plugins/catalog.json";
+/// The plugin catalog: the one published with this fork's latest app release (release.yml merges the signed plugin
+/// packages of the release into it). Its packages are signed with the same key as the app's updates.
+const CATALOG_URL: &str = "https://github.com/selvakumarEsra/opentrader/releases/latest/download/catalog.json";
 const LOG_LINES: usize = 300;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -564,14 +566,14 @@ pub fn plugins_set_port(app: AppHandle, port: u16) -> Result<PluginsStatus, Stri
 #[specta::specta]
 pub async fn plugin_catalog() -> Result<Vec<CatalogEntry>, String> {
     let bytes = download(CATALOG_URL).await?;
-    package::parse_catalog(&bytes)
+    Ok(package::for_platform(package::parse_catalog(&bytes)?, std::env::consts::OS))
 }
 
 /// Install (or update) a plugin of the catalog: its package must match the catalog's checksum and signature.
 #[tauri::command]
 #[specta::specta]
 pub async fn plugin_install_catalog(app: AppHandle, id: String) -> Result<PluginsStatus, String> {
-    let entry = package::parse_catalog(&download(CATALOG_URL).await?)?
+    let entry = package::for_platform(package::parse_catalog(&download(CATALOG_URL).await?)?, std::env::consts::OS)
         .into_iter()
         .find(|e| e.id == id)
         .ok_or_else(|| format!("{id} is not in the catalog"))?;

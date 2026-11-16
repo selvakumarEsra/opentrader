@@ -45,6 +45,12 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<Vec<CatalogEntry>, String> {
     serde_json::from_slice::<Catalog>(bytes).map(|c| c.plugins).map_err(|e| format!("Plugin catalog: {e}"))
 }
 
+/// The catalog's packages that run on `platform` (`windows`, `macos`, `linux`): a plugin may have one entry per
+/// system; one listing no platform runs on all.
+pub fn for_platform(entries: Vec<CatalogEntry>, platform: &str) -> Vec<CatalogEntry> {
+    entries.into_iter().filter(|e| e.platforms.is_empty() || e.platforms.iter().any(|p| p == platform)).collect()
+}
+
 /// The manifest of a package (zip bytes), checked.
 pub fn read_manifest(zip_bytes: &[u8]) -> Result<Manifest, String> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).map_err(|e| format!("Not a plugin package: {e}"))?;
@@ -143,5 +149,21 @@ pub mod tests {
         assert!(read_manifest(&no_manifest).unwrap_err().contains("no opentrader-plugin.json"));
         let bad = package(&[(manifest::FILE, br#"{"id":"X"}"#)]);
         assert!(read_manifest(&bad).is_err());
+    }
+
+    #[test]
+    fn the_catalog_keeps_this_systems_packages() {
+        let entry = |id: &str, platforms: &[&str]| {
+            serde_json::json!({ "id": id, "name": id, "version": "1.0.0", "publisher": "P", "description": "", "provides": ["datafeed"],
+                "api": 2, "platforms": platforms, "url": format!("https://example.com/{id}-{}.zip", platforms.join("")), "sha256": "00", "signature": "s" })
+        };
+        let catalog = serde_json::json!({ "plugins": [
+            entry("mt5", &["windows"]), entry("moomoo", &["windows"]), entry("moomoo", &["macos"]), entry("zerodha", &["macos"]), entry("any", &[]),
+        ]});
+        let all = parse_catalog(catalog.to_string().as_bytes()).unwrap();
+        let mac = for_platform(all, "macos");
+        let ids: Vec<&str> = mac.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["moomoo", "zerodha", "any"]);
+        assert_eq!(mac[0].url, "https://example.com/moomoo-macos.zip");
     }
 }
