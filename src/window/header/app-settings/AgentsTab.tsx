@@ -6,6 +6,7 @@ import { CheckField } from "../../../components/form";
 import type { AgentServerStatus } from "../../../bindings";
 import { agentServer, type AgentServerResult } from "./io";
 import { ConfirmButton, Section } from "./parts";
+import { AssistantModels } from "./AssistantModels";
 
 export function AgentsTab() {
   const [st, setSt] = createSignal<AgentServerStatus | null>(null);
@@ -116,6 +117,7 @@ http_headers = { "Authorization" = "Bearer ${s.token}" }` },
                 )}
               </For>
             </Section>
+            <AssistantModels />
           </>
         )}
       </Show>

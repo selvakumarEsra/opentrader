@@ -64,6 +64,9 @@ pub struct AgentRequest {
     pub window: String,
     pub id: u32,
     pub body: String,
+    /// From a question to the AI assistant's SDK model (assistant_cli.rs): its destructive tools wait for the user's
+    /// Allow in the panel.
+    pub assistant: bool,
 }
 
 pub struct AgentServer {
@@ -74,6 +77,43 @@ pub struct AgentServer {
     seq: AtomicU32,
     /// Windows listening for `AgentRequest` (a window still loading would miss it).
     ready: Mutex<HashSet<String>>,
+    /// The AI assistant's questions under way (assistant_cli.rs): each one's token, and the window that asked. The
+    /// endpoint listens while one runs, even with Coding agents off.
+    runs: Mutex<HashMap<String, String>>,
+}
+
+/// How long the assistant's tool call may wait for the window: a destructive one waits for the user's Allow.
+const ASSISTANT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Opens the endpoint for a question to the assistant's SDK model, asked from `window`: its URL and the question's
+/// own token (end_run closes it).
+pub fn begin_run(app: &AppHandle, window: &str) -> Result<(String, String), String> {
+    let token = new_token()?;
+    let state = app.state::<AgentServer>();
+    state.runs.locked().insert(token.clone(), window.to_string());
+    if state.stop.locked().is_none() {
+        start(app);
+    }
+    if state.stop.locked().is_none() {
+        end_run(app, &token);
+        let why = state.error.locked().clone().unwrap_or_else(|| "it did not start".into());
+        return Err(format!("The app's tools could not be opened to the model: {why}"));
+    }
+    Ok((format!("http://127.0.0.1:{}/mcp", state.config.locked().port), token))
+}
+
+/// The question ended: its token no longer opens the endpoint, which stops unless Coding agents is on or another
+/// question runs.
+pub fn end_run(app: &AppHandle, token: &str) {
+    let state = app.state::<AgentServer>();
+    let idle = {
+        let mut runs = state.runs.locked();
+        runs.remove(token);
+        runs.is_empty()
+    };
+    if idle && !state.config.locked().enabled {
+        stop(app);
+    }
 }
 
 fn read_config(app: &AppHandle) -> Config {
@@ -122,6 +162,7 @@ pub fn init(app: &AppHandle) {
         pending: Mutex::new(HashMap::new()),
         seq: AtomicU32::new(0),
         ready: Mutex::new(HashSet::new()),
+        runs: Mutex::new(HashMap::new()),
     });
     if enabled {
         start(app);
@@ -207,27 +248,32 @@ async fn on_post(AxState(app): AxState<AppHandle>, headers: HeaderMap, body: Str
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
     }
     let state = app.state::<AgentServer>();
-    let expected = format!("Bearer {}", state.config.locked().token);
     let given = headers.get(header::AUTHORIZATION).map(|v| v.as_bytes()).unwrap_or_default();
-    if !same(given, expected.as_bytes()) {
-        return (StatusCode::UNAUTHORIZED, "Missing or wrong token (Settings > Coding agents)").into_response();
+    // The assistant's question (its window), else a coding agent with the Settings token while Coding agents is on.
+    let run_window = state.runs.locked().iter().find(|(t, _)| same(given, format!("Bearer {t}").as_bytes())).map(|(_, w)| w.clone());
+    let assistant = run_window.is_some();
+    if !assistant {
+        let config = state.config.locked().clone();
+        if !config.enabled || !same(given, format!("Bearer {}", config.token).as_bytes()) {
+            return (StatusCode::UNAUTHORIZED, "Missing or wrong token (Settings > Coding agents)").into_response();
+        }
     }
     let parsed: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(_) => return rpc_error(&serde_json::Value::Null, -32700, "Parse error"),
     };
     let id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let Some(window) = target_window(&app) else {
+    let Some(window) = run_window.filter(|w| app.webview_windows().contains_key(w)).or_else(|| target_window(&app)) else {
         return rpc_error(&id, -32000, "OpenTrader is starting (no window ready yet): try again in a few seconds");
     };
     let n = state.seq.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel();
     state.pending.locked().insert(n, tx);
-    if let Err(e) = (AgentRequest { window, id: n, body }).emit(&app) {
+    if let Err(e) = (AgentRequest { window, id: n, body, assistant }).emit(&app) {
         state.pending.locked().remove(&n);
         return rpc_error(&id, -32000, &format!("OpenTrader window unreachable: {e}"));
     }
-    match tokio::time::timeout(REPLY_TIMEOUT, rx).await {
+    match tokio::time::timeout(if assistant { ASSISTANT_REPLY_TIMEOUT } else { REPLY_TIMEOUT }, rx).await {
         // A notification (or a response from the client): nothing to answer.
         Ok(Ok(reply)) if reply.is_empty() => StatusCode::ACCEPTED.into_response(),
         Ok(Ok(reply)) => ([(header::CONTENT_TYPE, "application/json")], reply).into_response(),

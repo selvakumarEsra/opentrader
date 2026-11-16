@@ -2,6 +2,7 @@ mod agent;
 mod alerts;
 mod app_menu;
 mod assistant;
+mod assistant_cli;
 mod local_model;
 mod app_update;
 mod commands;
@@ -109,6 +110,10 @@ fn specta_builder() -> Builder<tauri::Wry> {
             agent::agent_ready,
             assistant::assistant_chat,
             assistant::assistant_cancel,
+            assistant_cli::assistant_cli_status,
+            assistant_cli::assistant_cli_configure,
+            assistant_cli::assistant_cli_chat,
+            assistant_cli::assistant_cli_cancel,
             local_model::local_model_info,
             local_model::local_model_install,
             local_model::local_model_cancel,
@@ -275,6 +280,8 @@ pub fn run() {
                 app_update::on_exit(app);
                 // The AI assistant's model server would outlive the app.
                 local_model::shutdown();
+                // The AI assistant's SDK programs.
+                assistant_cli::shutdown();
                 // The plugin programs the app started.
                 plugins::shutdown(app);
             }

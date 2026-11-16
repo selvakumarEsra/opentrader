@@ -63,11 +63,21 @@ function asToolResult(value: unknown): ToolResult {
   return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) }] };
 }
 
-async function callTool(server: AgentServerDef, params: Record<string, unknown>): Promise<ToolResult> {
+/** How a message is answered: `confirm` asks the user before a destructive tool runs (the AI assistant's SDK models,
+ *  specs/assistant-cli-models.md); without it the tool runs (a coding agent asks its own user). */
+export type HandleOptions = { confirm?: (name: string, args: Record<string, unknown>) => Promise<boolean> };
+
+/** What a model is told when the user said no. */
+export const NOT_ALLOWED = "The user did not allow it.";
+
+async function callTool(server: AgentServerDef, params: Record<string, unknown>, opts: HandleOptions): Promise<ToolResult> {
   const name = params.name;
   const tool = server.tools.find((t) => t.name === name);
   if (!tool) throw new RpcError(-32602, `Unknown tool: ${String(name)}`);
   const args = (params.arguments ?? {}) as Record<string, unknown>;
+  if (tool.annotations?.destructiveHint && opts.confirm && !(await opts.confirm(tool.name, args))) {
+    return { content: [{ type: "text", text: NOT_ALLOWED }], isError: true };
+  }
   try {
     return asToolResult(await tool.run(args));
   } catch (e) {
@@ -77,7 +87,7 @@ async function callTool(server: AgentServerDef, params: Record<string, unknown>)
   }
 }
 
-async function dispatch(server: AgentServerDef, method: string, params: Record<string, unknown>): Promise<unknown> {
+async function dispatch(server: AgentServerDef, method: string, params: Record<string, unknown>, opts: HandleOptions): Promise<unknown> {
   switch (method) {
     case "initialize": {
       const asked = String(params.protocolVersion ?? "");
@@ -95,7 +105,7 @@ async function dispatch(server: AgentServerDef, method: string, params: Record<s
         tools: server.tools.map(({ name, title, description, inputSchema, annotations }) => ({ name, title, description, inputSchema, annotations })),
       };
     case "tools/call":
-      return callTool(server, params);
+      return callTool(server, params, opts);
     case "resources/list":
       return {
         resources: (await server.resources()).map(({ uri, name, description, mimeType }) => ({ uri, name, description, mimeType })),
@@ -123,7 +133,7 @@ async function dispatch(server: AgentServerDef, method: string, params: Record<s
 }
 
 /** The answer to one JSON-RPC message ("" = a notification or a response: nothing to answer). */
-export async function handleMessage(server: AgentServerDef, raw: string): Promise<string> {
+export async function handleMessage(server: AgentServerDef, raw: string, opts: HandleOptions = {}): Promise<string> {
   let msg: RpcMessage;
   try {
     msg = JSON.parse(raw) as RpcMessage;
@@ -136,7 +146,7 @@ export async function handleMessage(server: AgentServerDef, raw: string): Promis
   if (!isRequest) return "";
   const id = msg.id as Id;
   try {
-    return result(id, await dispatch(server, msg.method!, msg.params ?? {}));
+    return result(id, await dispatch(server, msg.method!, msg.params ?? {}, opts));
   } catch (e) {
     if (e instanceof RpcError) return failure(id, e.code, e.message);
     return failure(id, -32603, e instanceof Error ? e.message : String(e));

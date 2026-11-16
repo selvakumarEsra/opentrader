@@ -126,6 +126,44 @@
 .asst-menu-item:disabled {
   color: var(--color-content-primary-neutral-light);
 }
+/* The model menu (specs/assistant-cli-models.md): at the head's end */
+.asst-model {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 30px;
+  margin-inline-start: auto;
+  padding-inline: 8px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-content-primary-neutral-normal, inherit);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.asst-model:hover,
+.asst-model.is-open {
+  background-color: var(--color-container-fill-primary-neutral-extra-light);
+}
+.asst-model-menu {
+  inset-inline-start: auto;
+  inset-inline-end: 0;
+  min-width: 300px;
+}
+.asst-model-menu .asst-menu-item[aria-checked="true"] {
+  font-weight: 600;
+}
+.asst-menu-note {
+  margin: 4px 12px 8px;
+  font-size: 12px;
+}
+.asst-run-status,
+.asst-by {
+  margin: 4px 0;
+  font-size: 12px;
+}
 .asst-menu-sep {
   height: 1px;
   margin: 4px 0;
