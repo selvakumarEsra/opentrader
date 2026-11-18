@@ -98,11 +98,11 @@ pub fn route(app: &AppHandle, symbol: &str) -> Option<Route> {
 }
 
 fn route_in(exchanges: &HashMap<String, String>, whole: &HashSet<String>, symbol: &str) -> Option<Route> {
-    let (exchange, ticker) = symbol.trim().split_once(':')?;
-    let exchange = exchange.to_ascii_uppercase();
-    let plugin = exchanges.get(&exchange).cloned()?;
-    let symbol = format!("{exchange}:{ticker}");
-    let ticker = if whole.contains(&plugin) { symbol.clone() } else { ticker.to_string() };
+    // The app's one normalisation of a symbol (a bare ticker has no exchange, so no plugin).
+    let parsed = opentrader_core::data::symbol::Symbol::parse(symbol);
+    let plugin = exchanges.get(parsed.exchange()).cloned()?;
+    let symbol = parsed.to_string();
+    let ticker = if whole.contains(&plugin) { symbol.clone() } else { parsed.ticker().to_string() };
     Some(Route { plugin, symbol, ticker })
 }
 

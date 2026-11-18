@@ -20,6 +20,7 @@
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const SERVER = "opentrader";
 /** The longest tool result passed on to the panel (the model gets the whole result). */
@@ -116,12 +117,41 @@ async function runClaude(input, signal) {
 }
 
 // ── Codex (Codex SDK) ────────────────────────────────────────────────────
+/**
+ * Codex's own home for the assistant: the user's ~/.codex would bring their MCP servers, plugins and skills (a
+ * Node REPL, for one, that runs any command). It holds only their login (a link to ~/.codex/auth.json, so a
+ * refreshed login is kept).
+ */
+export function codexHome(base = os.tmpdir(), userHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")) {
+  const dir = path.join(base, "opentrader-assistant-codex");
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const auth = path.join(dir, "auth.json");
+  const source = path.join(userHome, "auth.json");
+  fs.rmSync(auth, { force: true });
+  if (fs.existsSync(source)) fs.symlinkSync(source, auth);
+  return dir;
+}
+
+/** The Codex items the assistant may run: the app's tools and web search; anything else stops the answer. */
+export function codexItemAllowed(item) {
+  if (!item?.type) return true;
+  if (item.type === "mcp_tool_call") return item.server === SERVER;
+  return !["command_execution", "file_change"].includes(item.type);
+}
+
 async function runCodex(input, signal) {
   const { Codex } = await import("@openai/codex-sdk");
+  const env = Object.fromEntries(Object.entries(process.env).filter(([, v]) => v !== undefined));
   const codex = new Codex({
     ...(process.env.CODEX_API_KEY ? { apiKey: process.env.CODEX_API_KEY } : {}),
+    env: { ...env, CODEX_HOME: codexHome() },
     config: {
       developer_instructions: input.system,
+      // No shell, file editing or image reading: only the app's tools (and web search) (REQ-ASSIST-CLI-003).
+      features: {
+        shell_tool: false, unified_exec: false, view_image: false, image_generation: false, apps: false, plugins: false,
+        hooks: false, browser_use: false, computer_use: false, multi_agent: false, skill_search: false, tool_suggest: false,
+      },
       mcp_servers: {
         // No approval prompt (nobody could answer it): the app itself asks the user before a destructive tool.
         [SERVER]: { url: input.mcp.url, bearer_token_env_var: "OPENTRADER_MCP_TOKEN", default_tools_approval_mode: "approve" },
@@ -130,7 +160,7 @@ async function runCodex(input, signal) {
   });
   const thread = codex.startThread({
     ...(input.model ? { model: input.model } : {}),
-    // Its shell can only read, in an empty folder; no command needs approval (nobody could give it).
+    // No shell (features above); the sandbox stays read-only, in an empty folder, should one be added back.
     sandboxMode: "read-only",
     approvalPolicy: "never",
     workingDirectory: workDir(),
@@ -142,15 +172,14 @@ async function runCodex(input, signal) {
   let wrote = false;
   for await (const e of events) {
     const item = e.item;
+    if (e.type.startsWith("item.") && !codexItemAllowed(item)) {
+      throw new Error(`Codex: it tried to use ${item.type === "mcp_tool_call" ? `${item.server}/${item.tool}` : item.type}, which the assistant does not allow`);
+    }
     if (e.type === "item.started" && item?.type === "mcp_tool_call") {
       emit({ t: "tool", id: item.id, name: item.tool, args: JSON.stringify(item.arguments ?? {}) });
-    } else if (e.type === "item.started" && item?.type === "command_execution") {
-      emit({ t: "tool", id: item.id, name: "shell", args: JSON.stringify({ command: item.command }) });
     } else if (e.type === "item.completed" && item?.type === "mcp_tool_call") {
       const ok = item.status === "completed" && !item.error;
       emit({ t: "tool_done", id: item.id, ok, result: cut(ok ? textOf(item.result?.content) : item.error?.message ?? "failed") });
-    } else if (e.type === "item.completed" && item?.type === "command_execution") {
-      emit({ t: "tool_done", id: item.id, ok: item.exit_code === 0, result: cut(item.aggregated_output ?? "") });
     } else if (e.type === "item.completed" && item?.type === "agent_message" && item.text) {
       emit({ t: "text", text: wrote ? `\n\n${item.text}` : item.text });
       wrote = true;
@@ -270,4 +299,4 @@ async function main() {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) void main();
+if (process.argv[1] && fs.realpathSync(path.resolve(process.argv[1])) === fileURLToPath(import.meta.url)) void main();

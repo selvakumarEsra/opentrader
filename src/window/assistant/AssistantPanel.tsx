@@ -11,6 +11,7 @@ import { translate, translateWith } from "../../i18n/translator";
  * SDKs with the user's credentials (specs/assistant-cli-models.md). The chat runs the app's agent tools
  * (src/data/assistant/session.ts).
  */
+import { date } from "../../community-shared/dates";
 import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { Icon } from "../../components/Icon";
 import { AnswerText, symbolsOf } from "./AnswerText";
@@ -42,7 +43,7 @@ export function AssistantPanel(props: { ticker: string }) {
     void refreshModels();
   });
   // The built-in model needs its download; an SDK model does not.
-  const ready = () => activeModel() !== BUILTIN || !!localInfo()?.installed;
+  const ready = canAsk;
   const overlay = () => assistantPanel.mode() === "overlay";
   const [view, setView] = createSignal<"chat" | "chats">("chat");
 
@@ -121,6 +122,7 @@ export function AssistantPanel(props: { ticker: string }) {
 }
 
 /** Questions can be sent: the built-in model is installed, or an SDK model is chosen (and ready). */
+/** Whether a question can be asked: an SDK model, or the built-in one installed. */
 const canAsk = () => activeModel() !== BUILTIN || !!localInfo()?.installed;
 
 function ChatView(props: { ticker: string; onOpenChats: () => void }) {
@@ -514,10 +516,7 @@ function ChatList(props: { onDone: () => void }) {
   const [query, setQuery] = createSignal("");
   const [editing, setEditing] = createSignal<string | null>(null);
   const shown = () => chats().filter((c) => c.title.toLowerCase().includes(query().trim().toLowerCase()));
-  const date = (ms: number) => {
-    const d = new Date(ms);
-    return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
-  };
+  const day = (ms: number) => date(ms / 1000);
   return (
     <div class="asst-column asst-chats">
       <div class="asst-section-head">
@@ -534,7 +533,7 @@ function ChatList(props: { onDone: () => void }) {
                 fallback={
                   <button type="button" class="asst-chat-open" onClick={() => { openChat(c.id); props.onDone(); }}>
                     <span class="asst-chat-row-title">{c.title}</span>
-                    <span class="asst-muted">{date(c.updatedAt)}</span>
+                    <span class="asst-muted">{day(c.updatedAt)}</span>
                   </button>
                 }
               >

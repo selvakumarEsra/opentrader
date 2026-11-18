@@ -78,9 +78,12 @@ During a question the model is given the app's MCP tools (src/agent/) for that r
 Coding agents is turned on, and only from this computer. Each tool it calls shows in the answer as a step, as the
 built-in model's do. A tool marked destructive (deleting an alert, a note, a layout, a watchlist, a series…) waits
 for the user's Allow in the panel; Deny answers the model that the user did not allow it. Beside the app's tools a
-model may search and read the web; it gets no shell and no access to files.
+model may search and read the web; it gets no shell and no access to files. Nothing of the user's own set-up for
+that model's program comes with it (their MCP servers, plugins, skills or hooks): only their login.
 
 implementations:
+  - src-tauri/assistant-bridge/bridge.mjs:codexHome
+  - src-tauri/assistant-bridge/bridge.mjs:codexItemAllowed
   - src/agent/mcp.ts:handleMessage
   - src/agent/assistant-confirm.ts
   - src-tauri/src/agent.rs:begin_run
@@ -90,6 +93,7 @@ implementations:
 verifies:
   - src/agent/__tests__/mcp.test.ts
   - src/data/assistant/__tests__/session-sdk.test.ts
+  - src-tauri/assistant-bridge/bridge.test.mjs
 
 ## Acceptance
 <!-- id: REQ-ASSIST-CLI-003.A1 -->
@@ -100,6 +104,10 @@ verifies:
 - A `delete_alert` call from the model waits for Allow; on Deny the alert stays and the model is told "The user did not allow it."
 <!-- id: REQ-ASSIST-CLI-003.A4 -->
 - The tools offered to the model include none that places, modifies or cancels an order.
+<!-- id: REQ-ASSIST-CLI-003.A5 -->
+- Asked to run `ls ~`, Codex cannot: it has no shell, no code runner and none of the MCP servers of the user's `~/.codex/config.toml`; a call to any tool but the app's stops the answer with an error.
+<!-- id: REQ-ASSIST-CLI-003.A6 -->
+- Two windows asking at once each get their own answer, and Stop in one leaves the other's running.
 
 <!-- id: REQ-ASSIST-CLI-004 -->
 ## Answers on stocks and options MUST rest on the app's data and say what they rest on

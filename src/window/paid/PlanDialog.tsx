@@ -4,6 +4,7 @@
  * sign in, subscribe, manage the subscription, or take real-time back from
  * another device. Built on the shared confirm dialog.
  */
+import { date } from "../../community-shared/dates";
 import { For, createResource } from "solid-js";
 import { showConfirm, showNotice } from "../../components/Dialogs";
 import { PROVIDER_LABELS, me, signIn } from "../../data/community/session";
@@ -14,11 +15,7 @@ import { translateAs, translateWith } from "../../i18n/translator";
 const PRICE = "$10/month";
 const WHAT = "Real-time prices on charts, in the watchlist and in the screener, instead of 15-minute delayed data.";
 
-/** dd/mm/yyyy of a UNIX time. */
-function day(sec: number): string {
-  const d = new Date(sec * 1000);
-  return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
-}
+const day = date;
 
 function failed(e: unknown): void {
   showNotice({ title: "Real-time data", text: e instanceof Error ? e.message : String(e) });

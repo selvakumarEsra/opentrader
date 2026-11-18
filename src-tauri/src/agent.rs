@@ -80,6 +80,8 @@ pub struct AgentServer {
     /// The AI assistant's questions under way (assistant_cli.rs): each one's token, and the window that asked. The
     /// endpoint listens while one runs, even with Coding agents off.
     runs: Mutex<HashMap<String, String>>,
+    /// The port listened on, while listening.
+    listening: Mutex<Option<u16>>,
 }
 
 /// How long the assistant's tool call may wait for the window: a destructive one waits for the user's Allow.
@@ -91,28 +93,41 @@ pub fn begin_run(app: &AppHandle, window: &str) -> Result<(String, String), Stri
     let token = new_token()?;
     let state = app.state::<AgentServer>();
     state.runs.locked().insert(token.clone(), window.to_string());
-    if state.stop.locked().is_none() {
-        start(app);
-    }
-    if state.stop.locked().is_none() {
+    settle(app);
+    let Some(port) = *state.listening.locked() else {
         end_run(app, &token);
         let why = state.error.locked().clone().unwrap_or_else(|| "it did not start".into());
         return Err(format!("The app's tools could not be opened to the model: {why}"));
-    }
-    Ok((format!("http://127.0.0.1:{}/mcp", state.config.locked().port), token))
+    };
+    Ok((format!("http://127.0.0.1:{port}/mcp"), token))
 }
 
 /// The question ended: its token no longer opens the endpoint, which stops unless Coding agents is on or another
 /// question runs.
 pub fn end_run(app: &AppHandle, token: &str) {
     let state = app.state::<AgentServer>();
-    let idle = {
-        let mut runs = state.runs.locked();
-        runs.remove(token);
-        runs.is_empty()
+    state.runs.locked().remove(token);
+    settle(app);
+}
+
+/// Listens or not as things now are: on while Coding agents is on or a question runs, on the port of Settings. A
+/// running question keeps its port (and its waiting tool calls) until it ends; a new port is taken after it.
+fn settle(app: &AppHandle) {
+    let state = app.state::<AgentServer>();
+    let (enabled, port) = {
+        let c = state.config.locked();
+        (c.enabled, c.port)
     };
-    if idle && !state.config.locked().enabled {
-        stop(app);
+    let running = !state.runs.locked().is_empty();
+    let listening = *state.listening.locked();
+    match listening {
+        _ if !enabled && !running => {
+            stop(app);
+            *state.error.locked() = None;
+        }
+        Some(p) if p == port => {}
+        Some(_) if running => {}
+        _ => start(app),
     }
 }
 
@@ -163,6 +178,7 @@ pub fn init(app: &AppHandle) {
         seq: AtomicU32::new(0),
         ready: Mutex::new(HashSet::new()),
         runs: Mutex::new(HashMap::new()),
+        listening: Mutex::new(None),
     });
     if enabled {
         start(app);
@@ -174,8 +190,28 @@ fn stop(app: &AppHandle) {
     if let Some(tx) = state.stop.locked().take() {
         let _ = tx.send(());
     }
+    *state.listening.locked() = None;
     // Requests still waiting get no answer: their senders drop and the handlers return an error.
     state.pending.locked().clear();
+}
+
+/// The endpoint's listener. A listener just stopped may hold the port a moment longer (it is closing): up to a
+/// second is waited for it.
+fn bind(port: u16) -> std::io::Result<std::net::TcpListener> {
+    let mut tries = 0;
+    loop {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => {
+                l.set_nonblocking(true)?;
+                return Ok(l);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 40 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn start(app: &AppHandle) {
@@ -183,10 +219,7 @@ fn start(app: &AppHandle) {
     let state = app.state::<AgentServer>();
     let port = state.config.locked().port;
     // Bound here (not in the task) so Settings learns at once that the port is taken.
-    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)).and_then(|l| {
-        l.set_nonblocking(true)?;
-        Ok(l)
-    }) {
+    let listener = match bind(port) {
         Ok(l) => l,
         Err(e) => {
             *state.error.locked() = Some(format!("Port {port} is not available: {e}"));
@@ -196,6 +229,7 @@ fn start(app: &AppHandle) {
     *state.error.locked() = None;
     let (tx, rx) = oneshot::channel::<()>();
     *state.stop.locked() = Some(tx);
+    *state.listening.locked() = Some(port);
     let router = Router::new()
         .route("/mcp", post(on_post).get(not_allowed).delete(not_allowed))
         .with_state(app.clone());
@@ -214,6 +248,7 @@ fn start(app: &AppHandle) {
             let state = app.state::<AgentServer>();
             *state.error.locked() = Some(e);
             state.stop.locked().take();
+            state.listening.locked().take();
         }
     });
 }
@@ -323,12 +358,7 @@ pub fn agent_server_set_enabled(app: AppHandle, enabled: bool) -> Result<AgentSe
         c.clone()
     };
     write_config(&app, &config)?;
-    if enabled {
-        start(&app);
-    } else {
-        stop(&app);
-        *state.error.locked() = None;
-    }
+    settle(&app);
     Ok(status(&app))
 }
 
@@ -346,9 +376,7 @@ pub fn agent_server_set_port(app: AppHandle, port: u16) -> Result<AgentServerSta
         c.clone()
     };
     write_config(&app, &config)?;
-    if config.enabled {
-        start(&app);
-    }
+    settle(&app);
     Ok(status(&app))
 }
 

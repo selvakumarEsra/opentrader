@@ -29,9 +29,18 @@ use tokio::sync::oneshot;
 
 const FILE: &str = "plugins.json";
 pub const DEFAULT_PORT: u16 = 47_822;
-/// The plugin catalog: the one published with this fork's latest app release (release.yml merges the signed plugin
-/// packages of the release into it). Its packages are signed with the same key as the app's updates.
-const CATALOG_URL: &str = "https://github.com/selvakumarEsra/opentrader/releases/latest/download/catalog.json";
+/// The plugin catalog: the one published with the app's latest release (release.yml merges the signed plugin
+/// packages of the release into it), next to the updater's `latest.json`. Its packages are signed with the same key
+/// as the app's updates, so the release's address is set once, in tauri.conf.json.
+fn catalog_url(app: &AppHandle) -> Result<String, String> {
+    catalog_url_of(app.config().plugins.0.get("updater")).ok_or_else(|| "The app names no release to read the plugin catalog from".into())
+}
+
+fn catalog_url_of(updater: Option<&serde_json::Value>) -> Option<String> {
+    let endpoint = updater?.get("endpoints")?.get(0)?.as_str()?;
+    let (folder, _) = endpoint.rsplit_once('/')?;
+    Some(format!("{folder}/catalog.json"))
+}
 const LOG_LINES: usize = 300;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -564,8 +573,8 @@ pub fn plugins_set_port(app: AppHandle, port: u16) -> Result<PluginsStatus, Stri
 /// The catalog's plugins.
 #[tauri::command]
 #[specta::specta]
-pub async fn plugin_catalog() -> Result<Vec<CatalogEntry>, String> {
-    let bytes = download(CATALOG_URL).await?;
+pub async fn plugin_catalog(app: AppHandle) -> Result<Vec<CatalogEntry>, String> {
+    let bytes = download(&catalog_url(&app)?).await?;
     Ok(package::for_platform(package::parse_catalog(&bytes)?, std::env::consts::OS))
 }
 
@@ -573,7 +582,7 @@ pub async fn plugin_catalog() -> Result<Vec<CatalogEntry>, String> {
 #[tauri::command]
 #[specta::specta]
 pub async fn plugin_install_catalog(app: AppHandle, id: String) -> Result<PluginsStatus, String> {
-    let entry = package::for_platform(package::parse_catalog(&download(CATALOG_URL).await?)?, std::env::consts::OS)
+    let entry = package::for_platform(package::parse_catalog(&download(&catalog_url(&app)?).await?)?, std::env::consts::OS)
         .into_iter()
         .find(|e| e.id == id)
         .ok_or_else(|| format!("{id} is not in the catalog"))?;
@@ -761,4 +770,16 @@ pub fn plugin_copy_files(app: AppHandle, id: String, step: u32, folders: Vec<Str
 #[specta::specta]
 pub fn plugin_logs(app: AppHandle, id: String) -> Vec<String> {
     app.state::<Plugins>().logs.locked().get(&id).map(|r| r.iter().cloned().collect()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_catalog_lies_next_to_the_updates() {
+        let updater = serde_json::json!({ "endpoints": ["https://github.com/o/r/releases/latest/download/latest.json"] });
+        assert_eq!(catalog_url_of(Some(&updater)).as_deref(), Some("https://github.com/o/r/releases/latest/download/catalog.json"));
+        assert_eq!(catalog_url_of(None), None);
+    }
 }

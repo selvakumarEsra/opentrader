@@ -10,6 +10,7 @@
  *
  * Chats are kept in kv (the 50 latest, pictures left out).
  */
+import { date } from "../../community-shared/dates";
 import { Channel } from "@tauri-apps/api/core";
 import { createSignal } from "solid-js";
 import { createStore, produce, reconcile } from "solid-js/store";
@@ -34,6 +35,8 @@ export type ToolStep = {
   result?: string;
   /** A picture the tool gave (a screenshot): shown, not kept, not sent. */
   image?: string;
+  /** An SDK model's id of this step, when the step was made first by its confirmation. */
+  alias?: string;
 };
 
 /** A file attached to a message: its text stays in attachments.ts, the chat keeps its id and name. */
@@ -452,8 +455,6 @@ export function rateAnswer(trace: string, rating: "good" | "bad"): void {
 /** The longest chat text an SDK model is given (the newest kept). */
 const MAX_TRANSCRIPT = 60_000;
 
-const ddmmyyyy = (d: Date) => `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
-
 /** The active chart, as get_chart tells it (empty when the tools are not there). */
 async function chartContext(): Promise<string> {
   const tool = server?.tools.find((t) => t.name === "get_chart");
@@ -469,8 +470,10 @@ async function chartContext(): Promise<string> {
 /** The question for an SDK model: today's date, the chart on screen, the chat so far, and the new message. */
 export function sdkPrompt(c: Chat, chart: string, today: Date): string {
   const past: string[] = [];
-  const ms = c.messages.slice(0, -1);
-  for (const m of ms) {
+  // The new message is the last user one (an empty answer may follow it, the one being written).
+  let at = c.messages.length - 1;
+  while (at >= 0 && c.messages[at].role !== "user") at--;
+  for (const m of c.messages.slice(0, Math.max(at, 0))) {
     if (m.role === "user") {
       past.push(`User: ${[m.text, ...(m.files ?? []).map(attachmentLine)].filter(Boolean).join("\n")}`);
     } else if (m.text || m.tools?.length) {
@@ -480,10 +483,10 @@ export function sdkPrompt(c: Chat, chart: string, today: Date): string {
   }
   let transcript = past.join("\n\n");
   if (transcript.length > MAX_TRANSCRIPT) transcript = `…${transcript.slice(-MAX_TRANSCRIPT)}`;
-  const last = c.messages[c.messages.length - 1];
+  const last = at >= 0 ? c.messages[at] : undefined;
   const question = last?.role === "user" ? [last.text, ...(last.files ?? []).map(attachmentLine)].filter(Boolean).join("\n") : "";
   return [
-    `Today is ${ddmmyyyy(today)}.`,
+    `Today is ${date(today.getTime() / 1000)}.`,
     chart ? `The chart on screen (get_chart):\n${chart}` : "",
     transcript ? `The chat so far:\n${transcript}` : "",
     `The user's message:\n${question}`,
@@ -510,12 +513,18 @@ export function applySdkEvent(m: Extract<ChatMessage, { role: "assistant" }>, e:
       m.status = undefined;
       m.text += e.text;
       break;
-    case "tool":
+    case "tool": {
       m.status = undefined;
-      (m.tools ??= []).push({ id: e.id, name: e.name, arguments: e.args, status: "running" });
+      // Its confirmation may have come first and made the step.
+      const early = m.tools?.find((x) => x.id.startsWith(EARLY) && x.name === e.name && !x.alias);
+      if (early) {
+        early.alias = e.id;
+        early.arguments = e.args;
+      } else (m.tools ??= []).push({ id: e.id, name: e.name, arguments: e.args, status: "running" });
       break;
+    }
     case "tool_done": {
-      const s = m.tools?.find((x) => x.id === e.id);
+      const s = m.tools?.find((x) => x.id === e.id || x.alias === e.id);
       if (!s) break;
       if (s.status === "denied") s.result = NOT_ALLOWED;
       else {
@@ -534,6 +543,9 @@ export function applySdkEvent(m: Extract<ChatMessage, { role: "assistant" }>, e:
   }
 }
 
+/** The id prefix of a step made by a confirmation that came before the model's own report of the call. */
+const EARLY = "confirm";
+
 // A destructive tool the SDK model calls: its step (the newest of that name still running) waits for Allow.
 setAssistantConfirm(async (name, args) => {
   if (currentSdk === null || stopped) return false;
@@ -542,7 +554,7 @@ setAssistantConfirm(async (name, args) => {
   if (m?.role !== "assistant") return false;
   let step = [...(m.tools ?? [])].reverse().find((t) => t.name === name && t.status === "running");
   if (!step) {
-    const id = `confirm${++requestSeq}`;
+    const id = `${EARLY}${++requestSeq}`;
     editLast((x) => (x.tools ??= []).push({ id, name, arguments: JSON.stringify(args), status: "running" }));
     step = { id, name, arguments: "", status: "running" };
   }
@@ -568,6 +580,7 @@ async function sendSdk(model: string): Promise<void> {
   try {
     const chart = await chartContext();
     const prompt = sdkPrompt(activeChat()!, chart, new Date());
+
     const channel = new Channel<string>();
     channel.onmessage = (data) => {
       let e: SdkEvent;

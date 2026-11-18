@@ -107,13 +107,8 @@ fn read_config(app: &AppHandle) -> Config {
 
 fn write_config(app: &AppHandle, config: &Config) -> Result<(), String> {
     let path = config_path(app).ok_or("No config folder")?;
-    files::save_json(&path, config).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    // Only the user may read it, from the moment it exists: it holds their tokens.
+    files::save_json_private(&path, config).map_err(|e| e.to_string())
 }
 
 // ── The login shell's environment ────────────────────────────────────────
@@ -126,7 +121,7 @@ fn shell_env() -> &'static HashMap<String, String> {
         #[cfg(unix)]
         if let Some(found) = login_shell_env() {
             for (k, v) in found {
-                if k == "PATH" || PROVIDERS.iter().any(|p| p.env.contains(&k.as_str())) {
+                if k.eq_ignore_ascii_case("PATH") || PROVIDERS.iter().any(|p| p.env.contains(&k.as_str())) {
                     env.insert(k, v);
                 }
             }
@@ -148,6 +143,12 @@ fn login_shell_env() -> Option<HashMap<String, String>> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    // Read while the shell runs: output larger than the pipe would block it.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut stdout, &mut out).ok().map(|_| out)
+    });
     let started = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -159,9 +160,7 @@ fn login_shell_env() -> Option<HashMap<String, String>> {
             }
         }
     }
-    let mut out = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
-    Some(parse_env(&out))
+    Some(parse_env(&reader.join().ok()??))
 }
 
 /// The `KEY=value` lines after the mark (what the shell's start-up files printed before it is left out).
@@ -173,6 +172,22 @@ fn parse_env(out: &str) -> HashMap<String, String> {
         .filter(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
+}
+
+/// The PATH of `env` (Windows names it `Path`).
+fn path_of(env: &HashMap<String, String>) -> Option<&String> {
+    env.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")).map(|(_, v)| v)
+}
+
+/// The login shell's PATH folders.
+fn path_dirs() -> Vec<PathBuf> {
+    path_of(shell_env()).map(|p| std::env::split_paths(p).collect()).unwrap_or_default()
+}
+
+/// The version of an nvm folder (`v22.1.0`), for picking the newest.
+fn node_version(dir: &Path) -> Vec<u32> {
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name.trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect()
 }
 
 fn home() -> Option<PathBuf> {
@@ -191,16 +206,18 @@ const NPM: &str = "npm";
 
 /// Node.js: on the login shell's PATH, else where installers put it (Homebrew, nvm, Volta).
 fn node_path() -> Option<PathBuf> {
-    let on_path = shell_env().get("PATH").into_iter().flat_map(|p| std::env::split_paths(p).collect::<Vec<_>>());
-    let mut places: Vec<PathBuf> = on_path.collect();
+    let mut places = path_dirs();
     places.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from));
+    if let Some(p) = std::env::var_os("ProgramFiles") {
+        places.push(PathBuf::from(p).join("nodejs"));
+    }
     if let Some(h) = home() {
         places.push(h.join(".volta/bin"));
         // The newest nvm version.
         if let Ok(rd) = std::fs::read_dir(h.join(".nvm/versions/node")) {
-            let mut versions: Vec<PathBuf> = rd.flatten().map(|e| e.path().join("bin")).collect();
-            versions.sort();
-            places.extend(versions.into_iter().rev());
+            let mut versions: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+            versions.sort_by_key(|d| std::cmp::Reverse(node_version(d)));
+            places.extend(versions.into_iter().map(|d| d.join("bin")));
         }
     }
     places.into_iter().map(|d| d.join(NODE)).find(|p| p.is_file())
@@ -209,16 +226,14 @@ fn node_path() -> Option<PathBuf> {
 /// The PATH the SDK programs run with: Node's folder first, then the login shell's.
 fn run_path(node: &Path) -> String {
     let mut dirs: Vec<PathBuf> = node.parent().map(Path::to_path_buf).into_iter().collect();
-    if let Some(p) = shell_env().get("PATH") {
-        dirs.extend(std::env::split_paths(p));
-    }
+    dirs.extend(path_dirs());
     std::env::join_paths(dirs).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 // ── Credentials ──────────────────────────────────────────────────────────
 /// A program on the login shell's PATH.
 fn on_path(name: &str) -> bool {
-    shell_env().get("PATH").is_some_and(|p| std::env::split_paths(p).any(|d| d.join(name).is_file() || d.join(format!("{name}.exe")).is_file()))
+    path_dirs().iter().any(|d| d.join(name).is_file() || d.join(format!("{name}.exe")).is_file())
 }
 
 /// `GEMINI_API_KEY` of Gemini CLI's `~/.gemini/.env`, where its users keep it.
@@ -405,19 +420,22 @@ async fn ensure_installed(app: &AppHandle, node: &Path, say: &impl Fn(&str)) -> 
 }
 
 // ── Runs ─────────────────────────────────────────────────────────────────
+/// A question: its window and that window's number for it (each window counts its own).
+type RunKey = (String, u32);
+
 /// The questions under way: their stop.
-static RUNNING: Mutex<Option<HashMap<u32, oneshot::Sender<()>>>> = Mutex::new(None);
+static RUNNING: Mutex<Option<HashMap<RunKey, oneshot::Sender<()>>>> = Mutex::new(None);
 /// The bridge programs running (their process ids), killed when the app quits.
-static CHILDREN: Mutex<Option<HashMap<u32, u32>>> = Mutex::new(None);
+static CHILDREN: Mutex<Option<HashMap<RunKey, u32>>> = Mutex::new(None);
 
 /// A question's entries, removed however it ends.
-struct Running(u32);
+struct Running(RunKey);
 
 impl Running {
-    fn new(request: u32) -> (Self, oneshot::Receiver<()>) {
+    fn new(key: RunKey) -> (Self, oneshot::Receiver<()>) {
         let (tx, rx) = oneshot::channel();
-        RUNNING.locked().get_or_insert_with(HashMap::new).insert(request, tx);
-        (Running(request), rx)
+        RUNNING.locked().get_or_insert_with(HashMap::new).insert(key.clone(), tx);
+        (Running(key), rx)
     }
 }
 
@@ -479,7 +497,8 @@ fn yes() -> bool {
 pub async fn assistant_cli_chat(app: AppHandle, window: tauri::Window, request: u32, id: String, body: String, on_event: Channel<String>) -> Result<(), String> {
     let q: Question = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     let provider = PROVIDERS.iter().find(|p| p.id == id).ok_or_else(|| format!("Unknown model {id}"))?;
-    let (_running, mut stop_rx) = Running::new(request);
+    let key: RunKey = (window.label().to_string(), request);
+    let (_running, mut stop_rx) = Running::new(key.clone());
     let send = |s: String| {
         let _ = on_event.send(s);
     };
@@ -526,7 +545,7 @@ pub async fn assistant_cli_chat(app: AppHandle, window: tauri::Window, request: 
     cmd.process_group(0);
     let mut child = cmd.spawn().map_err(|e| format!("Node.js could not start: {e}"))?;
     let pid = child.id().unwrap_or(0);
-    CHILDREN.locked().get_or_insert_with(HashMap::new).insert(request, pid);
+    CHILDREN.locked().get_or_insert_with(HashMap::new).insert(key, pid);
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(input.to_string().as_bytes()).await.map_err(|e| e.to_string())?;
         drop(stdin);
@@ -566,16 +585,25 @@ pub async fn assistant_cli_chat(app: AppHandle, window: tauri::Window, request: 
                 _ => break,
             },
             _ = &mut stop_rx => {
-                kill_tree(pid);
-                // What does not end in 1.5 s is killed.
-                if tokio::time::timeout(Duration::from_millis(1500), child.wait()).await.is_err() {
-                    let _ = child.kill().await;
-                }
+                stop(pid, &mut child).await;
                 return Ok(());
             }
         }
     }
-    let status = child.wait().await.map_err(|e| e.to_string())?;
+    // Its output is over: it is given a little time to exit, and Stop still works meanwhile.
+    let status = tokio::select! {
+        s = tokio::time::timeout(EXIT_WAIT, child.wait()) => match s {
+            Ok(s) => s.map_err(|e| e.to_string())?.to_string(),
+            Err(_) => {
+                stop(pid, &mut child).await;
+                "it did not exit".to_string()
+            }
+        },
+        _ = &mut stop_rx => {
+            stop(pid, &mut child).await;
+            return Ok(());
+        }
+    };
     let tail = errors.await.unwrap_or_default();
     if !ended {
         let why = if tail.is_empty() { format!("The model's program stopped ({status})") } else { tail.join(" ") };
@@ -584,11 +612,23 @@ pub async fn assistant_cli_chat(app: AppHandle, window: tauri::Window, request: 
     Ok(())
 }
 
-/// Stops a question under way (its answer so far stays).
+/// How long a bridge whose output is over may take to exit.
+const EXIT_WAIT: Duration = Duration::from_secs(10);
+
+/// Ends bridge `pid` and what it started; what does not end in 1.5 s is killed.
+async fn stop(pid: u32, child: &mut tokio::process::Child) {
+    kill_tree(pid);
+    if tokio::time::timeout(Duration::from_millis(1500), child.wait()).await.is_err() {
+        let _ = child.kill().await;
+    }
+}
+
+/// Stops a question under way in this window (its answer so far stays).
 #[tauri::command]
 #[specta::specta]
-pub fn assistant_cli_cancel(request: u32) {
-    if let Some(tx) = RUNNING.locked().as_mut().and_then(|r| r.remove(&request)) {
+pub fn assistant_cli_cancel(window: tauri::Window, request: u32) {
+    let key: RunKey = (window.label().to_string(), request);
+    if let Some(tx) = RUNNING.locked().as_mut().and_then(|r| r.remove(&key)) {
         let _ = tx.send(());
     }
 }
@@ -631,6 +671,19 @@ mod tests {
         let mut c = Config::default();
         c.tokens.insert("gemini".into(), "AIza".into());
         assert_eq!(credentials_source(&PROVIDERS[2], &c).as_deref(), Some("token typed in Settings"));
+    }
+
+    #[test]
+    fn the_newest_nvm_node_is_by_version_not_by_text() {
+        let mut dirs: Vec<PathBuf> = ["v9.11.2", "v22.1.0", "v18.20.4"].map(PathBuf::from).to_vec();
+        dirs.sort_by_key(|d| std::cmp::Reverse(node_version(d)));
+        assert_eq!(dirs[0], PathBuf::from("v22.1.0"));
+    }
+
+    #[test]
+    fn windows_path_is_found_whatever_its_case() {
+        let env = HashMap::from([("Path".to_string(), "C:\\nodejs".to_string())]);
+        assert_eq!(path_of(&env).map(String::as_str), Some("C:\\nodejs"));
     }
 
     #[test]

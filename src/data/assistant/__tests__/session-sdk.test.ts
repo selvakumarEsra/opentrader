@@ -94,6 +94,9 @@ describe("the assistant's SDK models", () => {
     expect(run.asked[run.asked.length - 1].id).toBe("claude");
     expect(run.asked[run.asked.length - 1].system).toBe(SDK_INSTRUCTIONS);
     expect(run.asked[run.asked.length - 1].prompt).toContain("NSE:RELIANCE");
+    // The question is the user's message, not a line of the chat so far (the empty answer follows it).
+    expect(run.asked[run.asked.length - 1].prompt.endsWith("The user's message:\nRSI of NSE:INFY on 1D?")).toBe(true);
+    expect(run.asked[run.asked.length - 1].prompt).not.toContain("The chat so far");
     expect(m.text).toBe("RSI is 61.");
     expect(m.model).toBe("claude");
     expect(m.status).toBeUndefined();
@@ -128,5 +131,26 @@ describe("the assistant's SDK models", () => {
     await send("delete my alert");
     expect(allowed).toBe(false);
     expect(last().tools![0]).toMatchObject({ status: "denied", result: "The user did not allow it." });
+  });
+
+  it("keep one step when the confirmation comes before the model's report of the call", async () => {
+    newChat();
+    run.script.push([
+      async () => {
+        const answer = assistantConfirm("delete_alert", { id: "a1" });
+        await Promise.resolve();
+        const id = last().tools![0].id;
+        answerConfirm(id, true);
+        await answer;
+      },
+      { t: "tool", id: "d1", name: "delete_alert", args: '{"id":"a1"}' },
+      { t: "tool_done", id: "d1", ok: true, result: "Deleted." },
+      { t: "text", text: "Deleted the alert." },
+      { t: "done" },
+    ]);
+    await send("delete my alert");
+    expect(last().tools).toHaveLength(1);
+    expect(last().tools![0]).toMatchObject({ name: "delete_alert", status: "done", result: "Deleted.", alias: "d1" });
+    expect(last().error).toBeUndefined();
   });
 });
