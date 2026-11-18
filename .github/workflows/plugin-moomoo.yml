@@ -1,7 +1,7 @@
 name: Plugin moomoo
 
 # Builds the moomoo plugin (plugins/moomoo) as one self-contained program per system (the whole plugin: the app's
-# plugin, backfill, record, the embedded store), each also zipped with its manifest (plugins/moomoo/package.py),
+# plugin, backfill, record, the embedded store), each also zipped with its manifest (plugins/package.py),
 # and releases them to OUR repository, selvakumarEsra/opentrader, never to upstream deepentropy/opentrader: the
 # release job runs only there and names it.
 #   - On a pushed tag plugin-moomoo-v<version> (git tag plugin-moomoo-v0.2.1 && git push origin plugin-moomoo-v0.2.1):
@@ -117,7 +117,7 @@ jobs:
 
       - name: Package
         run: |
-          zip=$(python package.py zip "$BINARY" ${{ matrix.platform }} dist)
+          zip=$(python ../package.py zip moomoo "$BINARY" ${{ matrix.platform }} dist)
           echo "ZIP=$zip" >> "$GITHUB_ENV"
           echo "Package: $zip"
 
@@ -126,7 +126,7 @@ jobs:
         run: |
           npx --yes @tauri-apps/cli@2.12.3 signer sign "$ZIP"
           test -f "$ZIP.sig"
-          python package.py entry "$ZIP" ${{ matrix.platform }} > dist/catalog-entry-${{ matrix.platform }}.json
+          python ../package.py entry moomoo "$ZIP" ${{ matrix.platform }} > dist/catalog-entry-${{ matrix.platform }}.json
 
       - name: Not signed
         if: env.TAURI_SIGNING_PRIVATE_KEY == ''

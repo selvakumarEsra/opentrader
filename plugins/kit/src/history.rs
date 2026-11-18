@@ -38,13 +38,17 @@ pub struct History<S> {
     pub store: Arc<Store>,
 }
 
-/// The newest `count` of `bars` starting in [from, to].
-pub fn window(bars: Vec<Bar>, from: i64, to: i64, count: usize) -> Vec<Bar> {
-    let mut w: Vec<Bar> = bars.into_iter().filter(|b| (from as f64..=to as f64).contains(&b[0])).collect();
-    if count > 0 && w.len() > count {
-        w.drain(..w.len() - count);
+/// The newest `count` of `bars` (0: all of them).
+pub fn newest(mut bars: Vec<Bar>, count: usize) -> Vec<Bar> {
+    if count > 0 && bars.len() > count {
+        bars.drain(..bars.len() - count);
     }
-    w
+    bars
+}
+
+/// The newest `count` of `bars` starting in [from, to] (0: all of them).
+pub fn window(bars: Vec<Bar>, from: i64, to: i64, count: usize) -> Vec<Bar> {
+    newest(bars.into_iter().filter(|b| (from as f64..=to as f64).contains(&b[0])).collect(), count)
 }
 
 /// The bars asked: those starting in [from, to], the newest `count` of them (0: all).
@@ -56,8 +60,26 @@ pub struct Span {
 }
 
 impl<S: Source> History<S> {
+    /// The bars of `span`: the store's, after asking the broker for the gaps that may hold bars. A refusal answers
+    /// the stored bars when there are any.
     pub async fn bars(&self, inst: &Instrument, cal: &Calendar, resolution: &str, span: Span, now: i64) -> Result<Vec<Bar>, String> {
-        let Span { from, to, count } = span;
+        let failed = self.fill(inst, cal, resolution, span, now).await?;
+        let key = Key::new(&inst.symbol, resolution, false);
+        let bars = self.store.read(&key, |s| s.window(span.from, span.to)).await;
+        match failed {
+            Some(e) if bars.is_empty() => Err(e),
+            Some(e) => {
+                println!("[warn] {} {resolution}: {e}; answering the stored bars", inst.symbol);
+                Ok(newest(bars, span.count))
+            }
+            None => Ok(newest(bars, span.count)),
+        }
+    }
+
+    /// Asks the broker for the gaps of `span` that may hold bars and stores what comes: Err when the resolution is
+    /// not served, else the broker's refusal that stopped it, if any.
+    pub async fn fill(&self, inst: &Instrument, cal: &Calendar, resolution: &str, span: Span, now: i64) -> Result<Option<String>, String> {
+        let Span { from, to, .. } = span;
         let secs = secs_of(resolution).ok_or_else(|| format!("Resolution {resolution} is not served"))?;
         let step = self.source.step(resolution).ok_or_else(|| format!("Resolution {resolution} is not served"))?;
         let key = Key::new(&inst.symbol, resolution, false);
@@ -65,51 +87,40 @@ impl<S: Source> History<S> {
         // The forming bar stays uncovered: it is asked again until it has closed.
         let forming = if secs >= 86_400 { cal.midnight(now) } else { now - now.rem_euclid(secs as i64) };
         let lo = self.source.oldest(resolution, now).map_or(from, |o| from.max(o));
-        let gaps: Vec<(i64, i64)> = if lo <= hi {
-            self.store.read(&key, |s| s.missing(lo, hi)).await.into_iter().filter(|&(a, b)| cal.may_hold_bars(secs, a, b)).collect()
-        } else {
-            Vec::new()
-        };
-        let mut failed = None;
+        if lo > hi {
+            return Ok(None);
+        }
+        let gaps: Vec<(i64, i64)> = self.store.read(&key, |s| s.missing(lo, hi)).await.into_iter().filter(|&(a, b)| cal.may_hold_bars(secs, a, b)).collect();
         // Newest first: a chart's first window is its latest bars.
-        'gaps: for &(a, b) in gaps.iter().rev() {
+        for &(a, b) in gaps.iter().rev() {
             let mut end = b;
             while end >= a {
                 let start = (end - step + 1).max(a);
-                match self.source.fetch(inst, resolution, start, end).await {
-                    Ok(got) => {
-                        let covered_to = end.min(forming - 1);
-                        self.store
-                            .update(&key, |s| {
-                                s.merge(&got);
-                                if covered_to >= start {
-                                    s.cover(start, covered_to);
-                                }
-                            })
-                            .await;
-                        // Nothing in a whole step: the history starts later.
-                        if got.is_empty() && start > a && end - start + 1 >= step {
-                            self.store.update(&key, |s| s.cover(a, start - 1)).await;
-                            break;
+                let got = match self.source.fetch(inst, resolution, start, end).await {
+                    Ok(got) => got,
+                    Err(e) => return Ok(Some(e)),
+                };
+                let covered_to = end.min(forming - 1);
+                // Nothing in a whole step: the history starts later.
+                let starts_later = got.is_empty() && start > a && end - start + 1 >= step;
+                self.store
+                    .update(&key, |s| {
+                        s.merge(&got);
+                        if covered_to >= start {
+                            s.cover(start, covered_to);
                         }
-                    }
-                    Err(e) => {
-                        failed = Some(e);
-                        break 'gaps;
-                    }
+                        if starts_later {
+                            s.cover(a, start - 1);
+                        }
+                    })
+                    .await;
+                if starts_later {
+                    break;
                 }
                 end = start - 1;
             }
         }
-        let bars = self.store.read(&key, |s| s.window(from, to)).await;
-        match failed {
-            Some(e) if bars.is_empty() => Err(e),
-            Some(e) => {
-                println!("[warn] {} {resolution}: {e}; answering the stored bars", inst.symbol);
-                Ok(window(bars, from, to, count))
-            }
-            None => Ok(window(bars, from, to, count)),
-        }
+        Ok(None)
     }
 }
 
@@ -178,7 +189,8 @@ mod tests {
     async fn a_weekend_gap_is_not_asked() {
         let h = history(Fake::default());
         let cal = Calendar::india("NSE");
-        let bars = h.bars(&inst(), &cal, "1", Span { from: ist("2026-11-14 00:00"), to: ist("2026-11-15 23:59"), count: 0 }, ist("2026-11-16 12:00")).await.unwrap();
+        let bars =
+            h.bars(&inst(), &cal, "1", Span { from: ist("2026-11-14 00:00"), to: ist("2026-11-15 23:59"), count: 0 }, ist("2026-11-16 12:00")).await.unwrap();
         assert!(bars.is_empty());
         assert!(h.source.asked.lock().unwrap().is_empty());
     }

@@ -13,6 +13,7 @@ use crate::history::Source;
 use crate::pace::Pace;
 use chrono::{NaiveDateTime, TimeZone, Timelike};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 /// Bars one answer may carry; more come in later pages.
 const PAGE: u32 = 1_000;
@@ -83,17 +84,17 @@ pub fn to_bars(market: Market, secs: u32, extended: bool, lines: &[KLine]) -> Ve
     bars
 }
 
-/// The newest `count` bars of `bars` in [`from`, `to`].
-pub fn window(mut bars: Vec<Bar>, from: f64, to: f64, count: usize) -> Vec<Bar> {
-    bars.retain(|b| b[0] >= from && b[0] <= to);
-    let cut = bars.len().saturating_sub(count);
-    bars.split_off(cut)
-}
-
 /// OpenD as the history source: forward-adjusted K-lines, every page, first pages paced to OpenD's limit.
 pub struct OpenD {
     pub client: Client,
     pub pace: Pace,
+}
+
+impl OpenD {
+    pub fn new(client: Client) -> Self {
+        // OpenD's limit on history requests: at most 60 first pages in any 30 s.
+        OpenD { client, pace: Pace::new(60, Duration::from_secs(30)) }
+    }
 }
 
 impl Source for OpenD {
@@ -190,7 +191,7 @@ mod tests {
         let mut blank = line("2025-05-09 00:00:00", 1.0);
         blank.is_blank = true;
         let lines = [blank, line("2025-05-12 00:00:00", 2.0), line("2025-05-13 00:00:00", 3.0), line("2025-05-14 00:00:00", 4.0)];
-        let bars = window(to_bars(Market::Us, 86_400, false, &lines), 0.0, f64::MAX, 2);
+        let bars = opentrader_plugin_kit::history::window(to_bars(Market::Us, 86_400, false, &lines), 0, i64::MAX, 2);
         let closes: Vec<f64> = bars.iter().map(|b| b[4]).collect();
         assert_eq!(closes, [3.0, 4.0]);
     }

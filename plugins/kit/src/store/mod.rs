@@ -108,9 +108,19 @@ impl Series {
 
     /// The bars starting in [a, b].
     pub fn window(&self, a: i64, b: i64) -> Vec<Bar> {
+        self.slice(a, b).to_vec()
+    }
+
+    /// How many bars start in [a, b], and the oldest one's start, without copying them.
+    pub fn count(&self, a: i64, b: i64) -> (usize, Option<i64>) {
+        let w = self.slice(a, b);
+        (w.len(), w.first().map(|x| x[0] as i64))
+    }
+
+    fn slice(&self, a: i64, b: i64) -> &[Bar] {
         let lo = self.bars.partition_point(|x| (x[0] as i64) < a);
         let hi = self.bars.partition_point(|x| (x[0] as i64) <= b);
-        self.bars[lo..hi.max(lo)].to_vec()
+        &self.bars[lo..hi.max(lo)]
     }
 
     pub fn at(&self, t: i64) -> Option<&Bar> {
@@ -128,6 +138,18 @@ impl Series {
 
     fn take_change(&mut self) -> Change {
         Change { cleared: std::mem::take(&mut self.cleared), added: std::mem::take(&mut self.added), covered: self.covered.clone() }
+    }
+
+    /// Puts back a change the backend did not take, before what changed since: the next flush writes both, so the
+    /// ranges it marks covered never name bars that were not written.
+    fn restore(&mut self, change: Change) {
+        // A drop since then already deletes everything, the failed bars with it.
+        if self.cleared && !change.cleared {
+            return;
+        }
+        self.cleared |= change.cleared;
+        let newer = std::mem::replace(&mut self.added, change.added);
+        self.added.extend(newer);
     }
 }
 
@@ -243,33 +265,39 @@ impl Store {
         locked(&self.series).clear();
     }
 
-    async fn ensure(&self, key: &Key) {
-        if locked(&self.series).contains_key(key) {
-            return;
+    /// Runs `f` on `key`'s series, loading it from the backend first when it is not in memory. The series is looked
+    /// up again under the lock `f` runs in: a `set_backend` between the load and `f` makes it load again.
+    async fn with<R>(&self, key: &Key, f: impl FnOnce(&mut Series) -> R) -> R {
+        let mut f = Some(f);
+        loop {
+            {
+                let mut all = locked(&self.series);
+                if let Some(s) = all.get_mut(key) {
+                    let f = f.take().expect("runs once");
+                    return f(s);
+                }
+            }
+            let backend = self.backend.read().await.clone();
+            let loaded = backend.load(key).await.unwrap_or_else(|e| {
+                println!("[warn] the stored bars of {} could not be read: {e}", key.symbol);
+                Series::default()
+            });
+            locked(&self.series).entry(key.clone()).or_insert(loaded);
         }
-        let backend = self.backend.read().await.clone();
-        let loaded = backend.load(key).await.unwrap_or_else(|e| {
-            println!("[warn] the stored bars of {} could not be read: {e}", key.symbol);
-            Series::default()
-        });
-        locked(&self.series).entry(key.clone()).or_insert(loaded);
     }
 
     pub async fn read<R>(&self, key: &Key, f: impl FnOnce(&Series) -> R) -> R {
-        self.ensure(key).await;
-        let all = locked(&self.series);
-        f(all.get(key).expect("ensured above"))
+        self.with(key, |s| f(s)).await
     }
 
     /// Changes `key`'s series; it is written at the next `flush`.
     pub async fn update<R>(&self, key: &Key, f: impl FnOnce(&mut Series) -> R) -> R {
-        self.ensure(key).await;
-        let r = f(locked(&self.series).get_mut(key).expect("ensured above"));
+        let r = self.with(key, f).await;
         locked(&self.dirty).insert(key.clone());
         r
     }
 
-    /// Writes the changed series to the backend.
+    /// Writes the changed series to the backend. A series the backend refuses keeps its change for the next flush.
     pub async fn flush(&self) {
         let keys: Vec<Key> = locked(&self.dirty).drain().collect();
         if keys.is_empty() {
@@ -280,15 +308,91 @@ impl Store {
             let change = locked(&self.series).get_mut(&key).map(Series::take_change);
             let Some(change) = change else { continue };
             if let Err(e) = backend.save(&key, &change).await {
-                println!("[warn] the bars of {} could not be stored in {}: {e}", key.symbol, backend.name());
+                println!("[warn] the bars of {} could not be stored in {}: {e}; they are tried again", key.symbol, backend.name());
+                if let Some(s) = locked(&self.series).get_mut(&key) {
+                    s.restore(change);
+                    locked(&self.dirty).insert(key);
+                }
             }
         }
+    }
+}
+
+/// The store of the settings (Settings > Plugins): ClickHouse when `clickhouseUrl` is given (and it can be set up),
+/// else None. The database defaults to `trading_db`, the user to `default`.
+pub fn backend_of(settings: &HashMap<String, String>) -> Option<Backend> {
+    let get = |k: &str| settings.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+    let url = get("clickhouseUrl");
+    if url.is_empty() {
+        return None;
+    }
+    let db = Some(get("clickhouseDatabase")).filter(|d| !d.is_empty()).unwrap_or_else(|| "trading_db".into());
+    let user = Some(get("clickhouseUser")).filter(|u| !u.is_empty()).unwrap_or_else(|| "default".into());
+    match clickhouse::ClickHouse::new(&url, &db, &user, settings.get("clickhousePassword").map_or("", |s| s)) {
+        Ok(c) => Some(Backend::ClickHouse(c)),
+        Err(e) => {
+            println!("[warn] {e}; bars stay in the embedded store");
+            None
+        }
+    }
+}
+
+/// The store settings in use, so that `plugin.configure` moves the store only when they change.
+#[derive(Default)]
+pub struct StoreSettings(tokio::sync::Mutex<Option<String>>);
+
+impl StoreSettings {
+    /// Moves `store` to the backend of `settings` when they changed. The first configure with no ClickHouse keeps the
+    /// embedded store opened at start.
+    pub async fn apply(&self, store: &Store, settings: &HashMap<String, String>) {
+        let get = |k: &str| settings.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+        let wanted = format!("{}|{}|{}|{}", get("clickhouseUrl"), get("clickhouseDatabase"), get("clickhouseUser"), get("clickhousePassword"));
+        let mut current = self.0.lock().await;
+        if current.as_deref() == Some(wanted.as_str()) {
+            return;
+        }
+        let backend = backend_of(settings);
+        if backend.is_some() || current.is_some() {
+            store.set_backend(backend.unwrap_or_else(Backend::embedded)).await;
+        }
+        *current = Some(wanted);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_change_is_put_back_before_the_newer_one() {
+        let mut s = Series::default();
+        s.merge(&[bar(0, 1.0)]);
+        let failed = s.take_change();
+        s.merge(&[bar(60, 2.0)]);
+        s.restore(failed);
+        let c = s.take_change();
+        assert_eq!(c.added.iter().map(|b| b[0]).collect::<Vec<_>>(), [0.0, 60.0]);
+        // A refused drop is tried again; a drop since a refused write makes the write needless.
+        s.clear();
+        let failed = s.take_change();
+        s.restore(failed);
+        assert!(s.take_change().cleared);
+        s.merge(&[bar(0, 1.0)]);
+        let failed = s.take_change();
+        s.clear();
+        s.restore(failed);
+        let c = s.take_change();
+        assert!(c.cleared && c.added.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_series_dropped_by_a_backend_move_is_loaded_again() {
+        let store = Store::new(Backend::Memory);
+        let key = Key::new("NSE:INFY", "1", false);
+        store.update(&key, |s| s.merge(&[bar(0, 1.0)])).await;
+        store.set_backend(Backend::Memory).await;
+        assert!(store.read(&key, |s| s.window(0, 100).is_empty()).await);
+    }
 
     pub fn bar(t: i64, c: f64) -> Bar {
         [t as f64, c, c, c, c, 1.0]
@@ -314,6 +418,7 @@ mod tests {
         s.merge(&[bar(60, 2.0), bar(120, 3.0)]);
         assert_eq!(s.window(0, 200).iter().map(|b| b[4]).collect::<Vec<_>>(), [0.5, 2.0, 3.0]);
         assert_eq!(s.window(60, 60).len(), 1);
+        assert_eq!((s.count(30, 200), s.count(200, 300)), ((2, Some(60)), (0, None)));
         assert_eq!(s.at(120).map(|b| b[4]), Some(3.0));
         assert!(s.at(30).is_none());
         let c = s.take_change();

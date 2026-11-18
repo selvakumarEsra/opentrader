@@ -6,6 +6,7 @@
  * forming. When OpenD refuses (quota, no connection), the stored bars are answered.
  */
 use crate::bars::{self, kl_type, Bar};
+use opentrader_plugin_kit::history::{newest, window};
 use crate::hours::{has_trading, may_hold_bars};
 use crate::market::Market;
 use crate::opend::proto::{KLine, Security};
@@ -78,24 +79,24 @@ impl<S: Source> History<S> {
         };
         let gaps = open_gaps(self.store.read(&key, |s| s.missing(from, to)).await);
         if gaps.is_empty() {
-            return Ok(bars::window(self.store.read(&key, |s| s.window(from, to)).await, a.from, a.to, a.count));
+            return Ok(newest(self.store.read(&key, |s| s.window(from, to)).await, a.count));
         }
         if let Some(rolled) = self.rolled(&a, ext, secs, &gaps).await {
             let mut all = self.store.read(&key, |s| s.window(from, to)).await;
             all.retain(|b| !gaps.iter().any(|&(x, y)| b[0] as i64 >= x && b[0] as i64 <= y));
             all.extend(rolled);
             all.sort_by(|x, y| x[0].total_cmp(&y[0]));
-            return Ok(bars::window(all, a.from, a.to, a.count));
+            return Ok(window(all, from, to, a.count));
         }
         match self.fetch(&a, &key, kl, secs, ext, gaps[0].0, to, now).await {
-            Ok(()) => Ok(bars::window(self.store.read(&key, |s| s.window(from, to)).await, a.from, a.to, a.count)),
+            Ok(()) => Ok(newest(self.store.read(&key, |s| s.window(from, to)).await, a.count)),
             Err(e) => {
                 let stored = self.store.read(&key, |s| s.window(from, to)).await;
                 if stored.is_empty() {
                     Err(e)
                 } else {
                     println!("[warn] {}: stored bars only ({e})", a.symbol);
-                    Ok(bars::window(stored, a.from, a.to, a.count))
+                    Ok(newest(stored, a.count))
                 }
             }
         }
@@ -172,7 +173,7 @@ impl<S: Source> History<S> {
             .await;
         if changed && begin > a.from as i64 {
             println!("[info] {}: adjusted prices changed, its stored {} bars are fetched again", a.symbol, a.resolution);
-            self.store.update(key, |s| s.clear()).await;
+            // The stored bars are dropped only with the new ones in hand: a refusal here keeps them.
             let lines = self
                 .source
                 .klines(a.sec, kl, ext, bars::wall_of(a.market, a.from as i64), bars::wall_of(a.market, end))
@@ -180,6 +181,7 @@ impl<S: Source> History<S> {
             let all = bars::to_bars(a.market, secs, ext, &lines);
             let covered_to = cut(&all, lines.len() >= bars::MAX_BARS);
             self.store.update(key, |s| {
+                s.clear();
                 s.merge(&all);
                 s.cover(a.from as i64, covered_to);
             }).await;
@@ -211,18 +213,20 @@ mod tests {
         lines: Mutex<Vec<(String, f64)>>,
         asks: AtomicUsize,
         fail: bool,
+        /// Fails from this ask on (0: the first).
+        fail_from: usize,
     }
 
     impl Fake {
         fn new(lines: &[(&str, f64)]) -> Self {
-            Fake { lines: Mutex::new(lines.iter().map(|(t, c)| (t.to_string(), *c)).collect()), asks: AtomicUsize::new(0), fail: false }
+            Fake { lines: Mutex::new(lines.iter().map(|(t, c)| (t.to_string(), *c)).collect()), asks: AtomicUsize::new(0), fail: false, fail_from: usize::MAX }
         }
     }
 
     impl Source for Fake {
         async fn klines(&self, _: &Security, _: i32, _: bool, begin: String, end: String) -> Result<Vec<KLine>, String> {
-            self.asks.fetch_add(1, Ordering::Relaxed);
-            if self.fail {
+            let n = self.asks.fetch_add(1, Ordering::Relaxed);
+            if self.fail || n >= self.fail_from {
                 return Err("quota exceeded".into());
             }
             let lines = self.lines.lock().unwrap().clone();
@@ -300,6 +304,23 @@ mod tests {
         assert_eq!(bars.iter().map(|b| b[4]).collect::<Vec<_>>(), [0.5, 1.0, 1.5]);
         // The second ask already spans the whole window: it is the new series.
         assert_eq!(h.source.asks.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_refused_refetch_after_changed_prices_keeps_the_stored_bars() {
+        let mut h = history(Fake::new(&DAYS[..2]));
+        let sec = sec();
+        let thursday = us("2025-05-08 23:00:00");
+        h.bars(ask(&sec, "1D", us("2025-05-06 00:00:00"), thursday), thursday).await.unwrap();
+        *h.source.lines.lock().unwrap() = vec![(DAYS[0].0.into(), 0.5), (DAYS[1].0.into(), 1.0), (DAYS[2].0.into(), 1.5)];
+        // The ask that sees the change is answered, the whole window's again is refused.
+        h.source.fail_from = 2;
+        let saturday = us("2025-05-10 12:00:00");
+        let bars = h.bars(ask(&sec, "1D", us("2025-05-06 00:00:00"), saturday), saturday).await.unwrap();
+        assert_eq!(bars.iter().map(|b| b[4]).collect::<Vec<_>>(), [1.0, 2.0]);
+        h.store.flush().await;
+        let key = Key::new("US:AAPL", "1D", false);
+        assert_eq!(h.store.read(&key, |s| s.window(0, i64::MAX).len()).await, 2, "nothing was dropped");
     }
 
     #[tokio::test]

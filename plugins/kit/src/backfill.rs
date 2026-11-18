@@ -10,11 +10,11 @@
  *
  * Exit status: 0 when every symbol was filled, 1 when one failed, 2 for wrong arguments.
  */
-use crate::calendar::Calendar;
 use crate::catalog::Catalog;
-use crate::feed::{backend_of, Provider};
+use crate::feed::Provider;
 use crate::history::{History, Span};
-use crate::store::{Backend, Store};
+use crate::store::{backend_of, Backend, Key, Store};
+use chrono::{NaiveDate, TimeZone};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,24 +27,23 @@ const DEFAULT_FROM: &str = "01/01/2000";
 #[derive(Debug, Clone, PartialEq)]
 pub struct Opts {
     pub symbols: Vec<String>,
-    /// UNIX seconds: 00:00 IST of --from.
-    pub from: i64,
+    /// --from: bars from its midnight in each exchange's zone.
+    pub from: NaiveDate,
     pub resolutions: Vec<String>,
     /// The store settings (`clickhouseUrl`…), as in Settings > Plugins.
     pub store: HashMap<String, String>,
     pub env_file: Option<String>,
 }
 
-/// dd/mm/yyyy as 00:00 IST.
-pub fn ist_midnight(text: &str) -> Option<i64> {
-    let d = chrono::NaiveDate::parse_from_str(text.trim(), "%d/%m/%Y").ok()?;
-    Some(d.and_hms_opt(0, 0, 0)?.and_utc().timestamp() - 19_800)
+/// A dd/mm/yyyy date.
+pub fn date_of(text: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(text.trim(), "%d/%m/%Y").ok()
 }
 
 /// The command line after `backfill`. Symbols come from the arguments and --file (one or more a line, comma or
 /// space separated, `#` comments).
 pub fn parse(args: &[String]) -> Result<Opts, String> {
-    let mut opts = Opts { symbols: Vec::new(), from: 0, resolutions: vec!["1".into(), "1D".into()], store: HashMap::new(), env_file: None };
+    let mut opts = Opts { symbols: Vec::new(), from: NaiveDate::MIN, resolutions: vec!["1".into(), "1D".into()], store: HashMap::new(), env_file: None };
     let mut from = DEFAULT_FROM.to_string();
     let mut list = String::new();
     let mut it = args.iter();
@@ -86,7 +85,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
     if opts.symbols.is_empty() {
         return Err("No symbols: name them (NSE:RELIANCE) or give --file".into());
     }
-    opts.from = ist_midnight(&from).ok_or_else(|| format!("--from {from}: not a dd/mm/yyyy date"))?;
+    opts.from = date_of(&from).ok_or_else(|| format!("--from {from}: not a dd/mm/yyyy date"))?;
     if opts.resolutions.is_empty() {
         return Err("--resolutions names none".into());
     }
@@ -108,7 +107,9 @@ pub fn load_env_file(path: &str) -> Result<usize, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         let (k, v) = (k.trim(), v.trim().trim_matches('"').trim_matches('\''));
         if !k.is_empty() && std::env::var_os(k).is_none() {
             std::env::set_var(k, v);
@@ -146,13 +147,23 @@ pub async fn run<P: Provider>(provider: P, opts: &Opts) -> Result<usize, String>
             failed += 1;
             continue;
         };
-        let cal = Calendar::india(inst.exchange());
+        let cal = P::calendar(inst.exchange());
+        let from = cal.midnight_of(opts.from);
         for res in &opts.resolutions {
             let started = std::time::Instant::now();
-            match history.bars(&inst, &cal, res, Span { from: opts.from, to: now, count: 0 }, now).await {
-                Ok(bars) => {
-                    let first = bars.first().and_then(|b| chrono::DateTime::from_timestamp(b[0] as i64 + 19_800, 0)).map(|d| d.format("%d/%m/%Y").to_string());
-                    println!("[info] {} {res}: {} bars stored{} ({:.1}s)", inst.symbol, bars.len(), first.map(|f| format!(" from {f}")).unwrap_or_default(), started.elapsed().as_secs_f64());
+            let refused = history.fill(&inst, &cal, res, Span { from, to: now, count: 0 }, now).await;
+            let (stored, first) = store.read(&Key::new(&inst.symbol, res, false), |s| s.count(from, now)).await;
+            match refused {
+                Ok(refused) if stored > 0 || refused.is_none() => {
+                    if let Some(e) = refused {
+                        println!("[warn] {} {res}: {e}; the stored bars stay", inst.symbol);
+                    }
+                    let first = first.and_then(|t| cal.tz.timestamp_opt(t, 0).single()).map(|d| format!(" from {}", d.format("%d/%m/%Y")));
+                    println!("[info] {} {res}: {stored} bars stored{} ({:.1}s)", inst.symbol, first.unwrap_or_default(), started.elapsed().as_secs_f64());
+                }
+                Ok(refused) => {
+                    println!("[error] {} {res}: {}", inst.symbol, refused.unwrap_or_default());
+                    failed += 1;
                 }
                 Err(e) => {
                     println!("[error] {} {res}: {e}", inst.symbol);
@@ -211,13 +222,14 @@ mod tests {
 
     #[test]
     fn the_command_line_is_read() {
-        let o = parse(&args(&["nse:reliance", "NSE:INFY,NSE:TCS", "--from", "01/01/2025", "--resolutions", "1D", "--clickhouse", "http://localhost:8123"])).unwrap();
+        let o = parse(&args(&["nse:reliance", "NSE:INFY,NSE:TCS", "--from", "01/01/2025", "--resolutions", "1D", "--clickhouse", "http://localhost:8123"]))
+            .unwrap();
         assert_eq!(o.symbols, ["NSE:RELIANCE", "NSE:INFY", "NSE:TCS"]);
-        assert_eq!(o.from, 1_735_669_800); // 01/01/2025 00:00 IST
+        assert_eq!(o.from, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
         assert_eq!(o.resolutions, ["1D"]);
         assert_eq!(o.store.get("clickhouseUrl").map(String::as_str), Some("http://localhost:8123"));
         let d = parse(&args(&["NSE:INFY"])).unwrap();
-        assert_eq!((d.resolutions.clone(), d.from), (vec!["1".to_string(), "1D".to_string()], ist_midnight(DEFAULT_FROM).unwrap()));
+        assert_eq!((d.resolutions.clone(), d.from), (vec!["1".to_string(), "1D".to_string()], date_of(DEFAULT_FROM).unwrap()));
     }
 
     #[test]

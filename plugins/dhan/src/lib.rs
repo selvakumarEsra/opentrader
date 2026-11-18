@@ -12,60 +12,39 @@ pub mod history;
 pub mod instruments;
 
 use auth::{Credentials, Urls};
+use opentrader_plugin_kit::calendar::Calendar;
 use opentrader_plugin_kit::catalog::Instrument;
 use opentrader_plugin_kit::feed::{Event, Provider};
 use opentrader_plugin_kit::history::Source;
 use opentrader_plugin_kit::pace::Pace;
-use opentrader_plugin_kit::Bar;
+use opentrader_plugin_kit::token::Tokens;
+use opentrader_plugin_kit::{now, Bar};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, watch};
 
-/// A refused token request is not tried again sooner.
-const LOGIN_RETRY_SECS: i64 = 60;
-
+/// A Dhan access token made from the PIN and TOTP, as kept on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Token {
+pub struct Token {
     access_token: String,
     client_id: String,
     ends: i64,
 }
 
+impl opentrader_plugin_kit::token::Token for Token {
+    fn access(&self) -> &str {
+        &self.access_token
+    }
+}
+
 pub struct Dhan {
     pub urls: Urls,
-    creds: RwLock<Credentials>,
-    token: tokio::sync::Mutex<Option<Token>>,
-    failed: Mutex<Option<(i64, String)>>,
+    pub tokens: Tokens<Credentials, Token>,
     pace: Pace,
     agent: ureq::Agent,
-    /// Told when the settings change (the feed tries again at once).
-    pub configured: Notify,
-}
-
-fn now() -> i64 {
-    chrono::Utc::now().timestamp()
-}
-
-fn token_file() -> Option<PathBuf> {
-    opentrader_plugin_kit::store::cache_dir().map(|d| d.join("token.json"))
-}
-
-fn write_private(path: &PathBuf, body: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, body)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)
 }
 
 impl Default for Dhan {
@@ -78,86 +57,45 @@ impl Dhan {
     pub fn new(urls: Urls) -> Self {
         Dhan {
             urls,
-            creds: RwLock::new(Credentials::default()),
-            token: tokio::sync::Mutex::new(None),
-            failed: Mutex::new(None),
+            tokens: Tokens::new("Dhan"),
             // Dhan's data APIs: 5 requests a second.
             pace: Pace::new(4, Duration::from_secs(1)),
             agent: ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(60))).build().into(),
-            configured: Notify::new(),
         }
-    }
-
-    fn creds(&self) -> Credentials {
-        self.creds.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn client_id(&self) -> String {
-        self.creds().client_id
+        self.tokens.creds().client_id
     }
 
     pub async fn set_credentials(&self, c: Credentials) {
-        let changed = { *self.creds.read().unwrap_or_else(|e| e.into_inner()) != c };
-        if changed {
-            *self.creds.write().unwrap_or_else(|e| e.into_inner()) = c;
-            *self.token.lock().await = None;
-            *self.failed.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            self.configured.notify_waiters();
-        }
+        self.tokens.set(c).await;
     }
 
     /// The access token: the one given in the settings, else the day's one in memory or on disk, else a new one.
     pub async fn token(&self) -> Result<String, String> {
-        let c = self.creds();
+        let c = self.tokens.creds();
         if let Some(name) = c.missing() {
             return Err(format!("Set {name} in Settings > Plugins > Dhan"));
         }
         if !c.access_token.is_empty() {
             return Ok(c.access_token);
         }
-        let mut held = self.token.lock().await;
+        let client = c.client_id.clone();
         // A token is used until 10 minutes before it ends.
-        let usable = |t: &Token| t.client_id == c.client_id && t.ends - 600 > now();
-        if let Some(t) = held.as_ref().filter(|t| usable(t)) {
-            return Ok(t.access_token.clone());
-        }
-        if let Some(t) = token_file().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice::<Token>(&b).ok()).filter(usable) {
-            *held = Some(t.clone());
-            return Ok(t.access_token);
-        }
-        if let Some((at, why)) = self.failed.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            if now() - at < LOGIN_RETRY_SECS {
-                return Err(why);
-            }
-        }
-        let (urls, made, login) = (self.urls.clone(), now(), c.clone());
-        match tokio::task::spawn_blocking(move || auth::generate(&login, &urls, made)).await.map_err(|e| e.to_string())? {
-            Ok((access_token, ends)) => {
+        let usable = move |t: &Token| t.client_id == client && t.ends - 600 > now();
+        let urls = self.urls.clone();
+        self.tokens
+            .get(usable, move || {
+                let (access_token, ends) = auth::generate(&c, &urls, now())?;
                 println!("[info] made Dhan's access token for {}", c.client_id);
-                let t = Token { access_token: access_token.clone(), client_id: c.client_id, ends };
-                if let Some(f) = token_file() {
-                    if let Err(e) = write_private(&f, &serde_json::to_vec(&t).unwrap_or_default()) {
-                        println!("[warn] the Dhan token could not be kept on disk: {e}");
-                    }
-                }
-                *held = Some(t);
-                Ok(access_token)
-            }
-            Err(e) => {
-                *self.failed.lock().unwrap_or_else(|e| e.into_inner()) = Some((now(), e.clone()));
-                Err(e)
-            }
-        }
+                Ok(Token { access_token, client_id: c.client_id, ends })
+            })
+            .await
     }
 
     pub async fn invalidate(&self, access_token: &str) {
-        let mut held = self.token.lock().await;
-        if held.as_ref().is_some_and(|t| t.access_token == access_token) {
-            *held = None;
-        }
-        if let Some(f) = token_file() {
-            let _ = std::fs::remove_file(f);
-        }
+        self.tokens.invalidate(access_token).await;
     }
 
     /// POST `body` to `path` of the API with the token, making a new token once when Dhan refuses it.
@@ -182,7 +120,7 @@ impl Dhan {
             .map_err(|e| e.to_string())??;
             let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             let refused = status == 401 || v["errorCode"] == "DH-901";
-            if refused && attempt == 0 && self.creds().access_token.is_empty() {
+            if refused && attempt == 0 && self.tokens.creds().access_token.is_empty() {
                 self.invalidate(&token).await;
                 continue;
             }
@@ -217,6 +155,11 @@ impl Source for Dhan {
 impl Provider for Dhan {
     const ID: &'static str = "dhan";
     const INTERVALS: &'static [&'static str] = history::INTERVALS;
+    const CURRENCY: &'static str = "INR";
+
+    fn calendar(exchange: &str) -> Calendar {
+        Calendar::india(exchange)
+    }
 
     async fn configure(&self, settings: &HashMap<String, String>) {
         self.set_credentials(Credentials::from_settings(settings)).await;
@@ -238,6 +181,6 @@ impl Provider for Dhan {
     }
 
     async fn stream(self: Arc<Self>, wanted: watch::Receiver<Vec<Instrument>>, events: mpsc::UnboundedSender<Event>) {
-        feed::run(self, wanted, events).await
+        opentrader_plugin_kit::socket::run(self, wanted, events).await
     }
 }

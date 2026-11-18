@@ -352,7 +352,7 @@ names it. Catalog entries (when signed) point at that repository's release.
 
 implementations:
   - .github/workflows/plugin-moomoo.yml
-  - plugins/moomoo/package.py:make_zip
+  - plugins/package.py:make_zip
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-014.A1 -->

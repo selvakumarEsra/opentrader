@@ -32,12 +32,7 @@ fn main() {
             }
         }
     }
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    let (Some(addr), Some(token)) = (env("OPENTRADER_PLUGIN_ADDR"), env("OPENTRADER_PLUGIN_TOKEN")) else {
-        eprintln!("OPENTRADER_PLUGIN_ADDR and OPENTRADER_PLUGIN_TOKEN are not set: OpenTrader starts this program itself");
-        std::process::exit(2);
-    };
-    let plugin = env("OPENTRADER_PLUGIN_ID").unwrap_or_else(|| "moomoo".into());
+    let (addr, plugin, token) = opentrader_plugin_kit::session::from_env(opentrader_moomoo::ID);
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
         Err(e) => {

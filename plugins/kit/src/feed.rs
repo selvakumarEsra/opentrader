@@ -11,8 +11,9 @@ use crate::calendar::Calendar;
 use crate::catalog::{Catalog, Instrument};
 use crate::history::{History, Source, Span};
 use crate::live::{store_minute, Minutes, Tick};
-use crate::rpc::{params, Out, RpcError, BAD_PARAMS, PARSE_ERROR, UNKNOWN_METHOD};
-use crate::store::{clickhouse::ClickHouse, Backend, Store};
+use crate::rpc::{params, Out, RpcError, BAD_PARAMS, UNKNOWN_METHOD};
+use crate::session::Handler;
+use crate::store::{Backend, Store, StoreSettings};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -38,6 +39,11 @@ pub trait Provider: Source + Send + Sync + 'static {
     const ID: &'static str;
     /// The resolutions `data.symbolInfo` offers.
     const INTERVALS: &'static [&'static str];
+    /// The currency of the broker's prices.
+    const CURRENCY: &'static str;
+
+    /// The trading week of `exchange` (as in `EXCHANGE:SYMBOL`): which gaps may hold bars, where a day starts.
+    fn calendar(exchange: &str) -> Calendar;
 
     /// The user's settings (credentials), at start and whenever they change.
     fn configure(&self, settings: &HashMap<String, String>) -> impl Future<Output = ()> + Send;
@@ -67,7 +73,7 @@ struct Feed<P: Provider> {
     provider: Arc<P>,
     history: History<Arc<P>>,
     store: Arc<Store>,
-    store_settings: tokio::sync::Mutex<Option<String>>,
+    store_settings: StoreSettings,
     catalog: Catalog,
     /// `data.subscribe`'s symbols, and the "Always record" ones.
     data: Mutex<BTreeSet<String>>,
@@ -81,21 +87,28 @@ fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn now() -> i64 {
-    chrono::Utc::now().timestamp()
-}
+use crate::now;
+pub use crate::store::backend_of;
 
 /// The "Always record" setting's symbols (`NSE:INFY, NFO:NIFTY26NOVFUT`, separated by commas, spaces or new lines)
-/// and the entries that are not symbols.
+/// and the entries that are not `EXCHANGE:SYMBOL`.
 pub fn record_list(text: &str) -> (BTreeSet<String>, Vec<String>) {
+    record_list_with(text, |e| match e.split_once(':') {
+        Some((x, t)) if !x.is_empty() && !t.is_empty() => Some(e.to_ascii_uppercase()),
+        _ => None,
+    })
+}
+
+/// `record_list`, each entry made the plugin's symbol by `symbol` (None: not one).
+pub fn record_list_with(text: &str, symbol: impl Fn(&str) -> Option<String>) -> (BTreeSet<String>, Vec<String>) {
     let mut ok = BTreeSet::new();
     let mut refused = Vec::new();
     for e in text.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).filter(|e| !e.is_empty()) {
-        match e.split_once(':') {
-            Some((x, t)) if !x.is_empty() && !t.is_empty() => {
-                ok.insert(e.to_ascii_uppercase());
+        match symbol(e) {
+            Some(s) => {
+                ok.insert(s);
             }
-            _ => refused.push(e.to_string()),
+            None => refused.push(e.to_string()),
         }
     }
     (ok, refused)
@@ -162,9 +175,9 @@ impl<P: Provider> Feed<P> {
             "data.symbolInfo" => {
                 let p: TickerParams = params(method, p)?;
                 let i = self.instrument(&p.ticker).await?;
-                let cal = Calendar::india(i.exchange());
+                let cal = P::calendar(i.exchange());
                 Ok(json!({
-                    "description": i.name, "type": i.kind, "currency": "INR", "timezone": cal.timezone(),
+                    "description": i.name, "type": i.kind, "currency": P::CURRENCY, "timezone": cal.timezone(),
                     "session": cal.session, "extended": null, "holidays": "", "pricescale": i.pricescale(), "minmov": 1,
                     "intervals": P::INTERVALS,
                 }))
@@ -172,7 +185,7 @@ impl<P: Provider> Feed<P> {
             "data.bars" => {
                 let p: BarsParams = params(method, p)?;
                 let i = self.instrument(&p.ticker).await?;
-                let cal = Calendar::india(i.exchange());
+                let cal = P::calendar(i.exchange());
                 let bars = self.history.bars(&i, &cal, &p.resolution, Span { from: p.from as i64, to: p.to as i64, count: p.count_back }, now()).await?;
                 Ok(json!({ "bars": bars }))
             }
@@ -183,8 +196,10 @@ impl<P: Provider> Feed<P> {
     async fn notification(self: Arc<Self>, method: &str, p: Value) {
         match method {
             "plugin.configure" => {
-                let Ok(p) = serde_json::from_value::<ConfigureParams>(p) else { return };
-                self.configure_store(&p.settings).await;
+                let Ok(p) = serde_json::from_value::<ConfigureParams>(p) else {
+                    return;
+                };
+                self.store_settings.apply(&self.store, &p.settings).await;
                 let (record, refused) = record_list(p.settings.get("alwaysRecord").map_or("", |s| s));
                 if !refused.is_empty() {
                     println!("[warn] Always record: {} left out (symbols are EXCHANGE:SYMBOL, such as NSE:INFY)", refused.join(", "));
@@ -196,7 +211,9 @@ impl<P: Provider> Feed<P> {
                 tokio::spawn(async move { self.fresh_list().await });
             }
             "data.subscribe" => {
-                let Ok(p) = serde_json::from_value::<SubscribeParams>(p) else { return };
+                let Ok(p) = serde_json::from_value::<SubscribeParams>(p) else {
+                    return;
+                };
                 *locked(&self.data) = p.tickers.into_iter().map(|t| t.trim().to_ascii_uppercase()).collect();
                 self.resubscribe();
             }
@@ -220,7 +237,7 @@ impl<P: Provider> Feed<P> {
             match e {
                 Event::Connected => locked(&self.minutes).reset(),
                 Event::Tick(t) => {
-                    let cal = Calendar::india(t.symbol.split_once(':').map_or("", |(x, _)| x));
+                    let cal = P::calendar(t.symbol.split_once(':').map_or("", |(x, _)| x));
                     let (closed, quote) = locked(&self.minutes).tick(&t, &cal);
                     if let Some(bar) = closed {
                         store_minute(&self.store, &t.symbol, bar).await;
@@ -232,46 +249,22 @@ impl<P: Provider> Feed<P> {
             }
         }
     }
-
-    /// Settings > Plugins: ClickHouse when its URL is given, else the embedded store.
-    async fn configure_store(&self, settings: &HashMap<String, String>) {
-        let get = |k: &str| settings.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
-        let url = get("clickhouseUrl");
-        let wanted = format!("{url}|{}|{}|{}", get("clickhouseDatabase"), get("clickhouseUser"), get("clickhousePassword"));
-        let mut current = self.store_settings.lock().await;
-        if current.as_deref() == Some(wanted.as_str()) {
-            return;
-        }
-        let backend = backend_of(settings);
-        if backend.is_some() || current.is_some() {
-            self.store.set_backend(backend.unwrap_or_else(Backend::embedded)).await;
-        }
-        *current = Some(wanted);
-    }
 }
 
-/// The store of the settings: ClickHouse when `clickhouseUrl` is given (and reachable to configure), else None.
-pub fn backend_of(settings: &HashMap<String, String>) -> Option<Backend> {
-    let get = |k: &str| settings.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
-    let url = get("clickhouseUrl");
-    if url.is_empty() {
-        return None;
+impl<P: Provider> Handler for Feed<P> {
+    async fn request(self: Arc<Self>, method: String, params: Value) -> Result<Value, RpcError> {
+        Feed::request(&self, &method, params).await
     }
-    let db = Some(get("clickhouseDatabase")).filter(|d| !d.is_empty()).unwrap_or_else(|| "trading_db".into());
-    let user = Some(get("clickhouseUser")).filter(|u| !u.is_empty()).unwrap_or_else(|| "default".into());
-    match ClickHouse::new(&url, &db, &user, settings.get("clickhousePassword").map_or("", |s| s)) {
-        Ok(c) => Some(Backend::ClickHouse(c)),
-        Err(e) => {
-            println!("[warn] {e}; bars stay in the embedded store");
-            None
-        }
+
+    async fn notification(self: Arc<Self>, method: String, params: Value) {
+        Feed::notification(self, &method, params).await
     }
 }
 
 /// One session with the app at `addr`, serving `provider`, until the app closes it.
 pub async fn run<P: Provider>(addr: &str, plugin: &str, token: &str, provider: P) -> Result<(), String> {
     crate::set_plugin(P::ID);
-    let (out, mut lines) = crate::session::connect(addr, plugin, token, env!("CARGO_PKG_VERSION")).await?;
+    let (out, lines) = crate::session::connect(addr, plugin, token, env!("CARGO_PKG_VERSION")).await?;
     let provider = Arc::new(provider);
     let store = Arc::new(Store::new(Backend::embedded()));
     let (wanted, wanted_rx) = watch::channel(Vec::new());
@@ -279,7 +272,7 @@ pub async fn run<P: Provider>(addr: &str, plugin: &str, token: &str, provider: P
         history: History { source: provider.clone(), store: store.clone() },
         provider: provider.clone(),
         store,
-        store_settings: tokio::sync::Mutex::new(None),
+        store_settings: StoreSettings::default(),
         catalog: Catalog::open(crate::store::cache_dir().map(|d| d.join("instruments.json"))),
         data: Mutex::new(BTreeSet::new()),
         record: Mutex::new(BTreeSet::new()),
@@ -308,26 +301,7 @@ pub async fn run<P: Provider>(addr: &str, plugin: &str, token: &str, provider: P
         }
     });
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let msg: Value = match serde_json::from_str(&line) {
-            Ok(m) => m,
-            Err(e) => {
-                out.answer(Value::Null, Err(RpcError::new(PARSE_ERROR, format!("Parse error: {e}"))));
-                continue;
-            }
-        };
-        let Some(method) = msg.get("method").and_then(Value::as_str).map(str::to_string) else { continue };
-        let p = msg.get("params").cloned().unwrap_or(Value::Null);
-        let me = feed.clone();
-        match msg.get("id").cloned() {
-            Some(id) => {
-                tokio::spawn(async move { me.out.answer(id, me.request(&method, p).await) });
-            }
-            None => {
-                tokio::spawn(async move { me.notification(&method, p).await });
-            }
-        }
-    }
+    crate::session::serve(lines, out, feed.clone()).await;
     feed.store.flush().await;
     Ok(())
 }

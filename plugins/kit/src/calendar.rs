@@ -37,7 +37,8 @@ impl Calendar {
         self.midnight_of(day)
     }
 
-    fn midnight_of(&self, day: NaiveDate) -> i64 {
+    /// The start of `day` in the exchange's zone.
+    pub fn midnight_of(&self, day: NaiveDate) -> i64 {
         self.tz.from_local_datetime(&day.and_hms_opt(0, 0, 0).unwrap_or_default()).earliest().map_or(0, |d| d.timestamp())
     }
 
@@ -49,7 +50,9 @@ impl Calendar {
         }
         let first = self.tz.timestamp_opt(a, 0).single().map(|d| d.date_naive());
         let last = self.tz.timestamp_opt(b, 0).single().map(|d| d.date_naive());
-        let (Some(mut day), Some(last)) = (first, last) else { return true };
+        let (Some(mut day), Some(last)) = (first, last) else {
+            return true;
+        };
         // Any week holds weekdays.
         if (last - day).num_days() > 7 {
             return true;
@@ -81,7 +84,9 @@ impl Calendar {
 
     /// Whether `t` is in a weekday's session.
     pub fn is_open(&self, t: i64) -> bool {
-        let Some(local) = self.tz.timestamp_opt(t, 0).single() else { return false };
+        let Some(local) = self.tz.timestamp_opt(t, 0).single() else {
+            return false;
+        };
         if matches!(local.weekday(), Weekday::Sat | Weekday::Sun) {
             return false;
         }

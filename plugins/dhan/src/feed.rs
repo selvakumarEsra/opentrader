@@ -11,16 +11,12 @@
  *   50 disconnect      reason int16 @8
  */
 use crate::Dhan;
-use futures_util::{SinkExt, StreamExt};
 use opentrader_plugin_kit::catalog::Instrument;
-use opentrader_plugin_kit::feed::Event;
 use opentrader_plugin_kit::live::Tick;
+use opentrader_plugin_kit::socket::{Broker, Closed};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::tungstenite::Message;
+use std::collections::HashMap;
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -132,101 +128,66 @@ pub fn requests(code: u8, list: &[&Instrument]) -> Vec<String> {
         .collect()
 }
 
-/// The feed for the plugin's life: connected while there is something to stream and a token, again after a drop.
-pub async fn run(d: Arc<Dhan>, mut wanted: watch::Receiver<Vec<Instrument>>, events: mpsc::UnboundedSender<Event>) {
-    let mut wait = Duration::from_secs(2);
-    let mut prev_close: HashMap<String, f64> = HashMap::new();
-    loop {
-        if wanted.borrow().is_empty() {
-            if wanted.changed().await.is_err() {
-                return;
-            }
-            continue;
-        }
-        let token = match d.token().await {
-            Ok(t) => t,
-            Err(e) => {
-                println!("[warn] live prices are off: {e}");
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-                    _ = d.configured.notified() => {}
+/// Dhan's feed for the kit's stream loop: instruments are held by their segment and security id; the previous closes
+/// it sends are kept for the ticks after them.
+impl Broker for Dhan {
+    const NAME: &'static str = "Dhan's feed";
+    type State = HashMap<String, f64>;
+
+    async fn token(&self) -> Result<String, String> {
+        Dhan::token(self).await
+    }
+
+    async fn invalidate(&self, token: &str) {
+        Dhan::invalidate(self, token).await
+    }
+
+    fn configured(&self) -> &Notify {
+        &self.tokens.configured
+    }
+
+    fn url(&self, token: &str) -> String {
+        format!("{}/?version=2&token={token}&clientId={}&authType=2", self.urls.feed.trim_end_matches('/'), self.client_id())
+    }
+
+    fn key(&self, inst: &Instrument) -> String {
+        inst.key.clone()
+    }
+
+    fn subscribe(&self, new: &[&Instrument], gone: &[&Instrument]) -> Vec<String> {
+        requests(18, gone).into_iter().chain(requests(17, new)).collect()
+    }
+
+    fn goodbye(&self) -> Vec<String> {
+        vec![json!({"RequestCode": 12}).to_string()]
+    }
+
+    fn frame(
+        &self,
+        prev_close: &mut HashMap<String, f64>,
+        frame: &[u8],
+        held: &HashMap<String, Instrument>,
+        now: i64,
+        ticks: &mut Vec<Tick>,
+    ) -> Result<(), Closed> {
+        for p in parse(frame) {
+            match p {
+                Packet::PrevClose { key, close } => {
+                    prev_close.insert(key, close);
                 }
-                continue;
-            }
-        };
-        let url = format!("{}/?version=2&token={token}&clientId={}&authType=2", d.urls.feed.trim_end_matches('/'), d.client_id());
-        let ws = match tokio_tungstenite::connect_async(url.as_str()).await {
-            Ok((ws, _)) => ws,
-            Err(e) => {
-                println!("[warn] Dhan feed: {}", e.to_string().replace(&token, "…"));
-                tokio::time::sleep(wait).await;
-                wait = (wait * 2).min(Duration::from_secs(60));
-                continue;
-            }
-        };
-        wait = Duration::from_secs(2);
-        println!("[info] connected to Dhan's feed");
-        let _ = events.send(Event::Connected);
-        let (mut tx, mut rx) = ws.split();
-        let mut held: HashMap<String, Instrument> = HashMap::new();
-        'session: loop {
-            let list = wanted.borrow_and_update().clone();
-            let want: HashMap<String, Instrument> = list.into_iter().map(|i| (i.key.clone(), i)).collect();
-            let keys: HashSet<&String> = want.keys().collect();
-            let gone: Vec<&Instrument> = held.iter().filter(|(k, _)| !keys.contains(k)).map(|(_, i)| i).collect();
-            let new: Vec<&Instrument> = want.iter().filter(|(k, _)| !held.contains_key(*k)).map(|(_, i)| i).collect();
-            for m in requests(18, &gone).into_iter().chain(requests(17, &new)) {
-                if tx.send(Message::text(m)).await.is_err() {
-                    break 'session;
+                Packet::Trade { key, price, time, volume, open, high, low } => {
+                    let Some(inst) = held.get(&key) else { continue };
+                    let prev_close = prev_close.get(&key).copied();
+                    ticks.push(Tick { symbol: inst.symbol.clone(), time: unix_of(time, now), price, day_volume: volume, open, high, low, prev_close });
                 }
-            }
-            held = want;
-            if held.is_empty() {
-                let _ = tx.send(Message::text(json!({"RequestCode": 12}).to_string())).await;
-                let _ = tx.send(Message::Close(None)).await;
-                break 'session;
-            }
-            loop {
-                tokio::select! {
-                    changed = wanted.changed() => {
-                        if changed.is_err() { return; }
-                        continue 'session;
-                    }
-                    msg = rx.next() => match msg {
-                        Some(Ok(Message::Binary(b))) => {
-                            let now = chrono::Utc::now().timestamp();
-                            for p in parse(&b) {
-                                match p {
-                                    Packet::PrevClose { key, close } => {
-                                        prev_close.insert(key, close);
-                                    }
-                                    Packet::Trade { key, price, time, volume, open, high, low } => {
-                                        let Some(inst) = held.get(&key) else { continue };
-                                        let tick = Tick {
-                                            symbol: inst.symbol.clone(), time: unix_of(time, now), price, day_volume: volume,
-                                            open, high, low, prev_close: prev_close.get(&key).copied(),
-                                        };
-                                        let _ = events.send(Event::Tick(tick));
-                                    }
-                                    Packet::Disconnect { reason } => {
-                                        println!("[warn] Dhan closed the feed (code {reason})");
-                                        // 807: the access token ended.
-                                        if reason == 807 {
-                                            d.invalidate(&token).await;
-                                        }
-                                        break 'session;
-                                    }
-                                }
-                            }
-                        }
-                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break 'session,
-                        Some(Ok(_)) => {}
-                    }
+                Packet::Disconnect { reason } => {
+                    println!("[warn] Dhan closed the feed (code {reason})");
+                    // 807: the access token ended.
+                    return Err(if reason == 807 { Closed::TokenEnded } else { Closed::ByBroker });
                 }
             }
         }
-        println!("[info] Dhan's feed closed");
-        tokio::time::sleep(wait).await;
+        Ok(())
     }
 }
 
@@ -272,7 +233,15 @@ mod tests {
             parse(&msg),
             vec![
                 Packet::PrevClose { key: "1|2885".into(), close: 1480.0 },
-                Packet::Trade { key: "1|2885".into(), price: 1502.5, time: 1_763_005_530, volume: Some(12_345.0), open: Some(1490.0), high: Some(1510.0), low: Some(1485.0) },
+                Packet::Trade {
+                    key: "1|2885".into(),
+                    price: 1502.5,
+                    time: 1_763_005_530,
+                    volume: Some(12_345.0),
+                    open: Some(1490.0),
+                    high: Some(1510.0),
+                    low: Some(1485.0)
+                },
             ]
         );
     }

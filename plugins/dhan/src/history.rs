@@ -42,9 +42,13 @@ pub fn request(inst: &Instrument, resolution: &str, from: i64, to: i64) -> (&'st
     }
 }
 
-/// The bars of an answer; daily bars start at their day's midnight in Asia/Kolkata.
+/// The bars of an answer; daily bars start at their day's midnight in Asia/Kolkata. Dhan's "No data" (a holiday, a
+/// span before the listing) is no bars, not a refusal: the history goes on to older spans.
 pub fn candles(v: &Value, daily: bool) -> Result<Vec<Bar>, String> {
     if let Some(why) = v["errorMessage"].as_str() {
+        if why.trim().eq_ignore_ascii_case("no data") {
+            return Ok(Vec::new());
+        }
         return Err(format!("Dhan: {why}"));
     }
     let col = |k: &str| v[k].as_array().cloned().unwrap_or_default();
@@ -88,6 +92,10 @@ mod tests {
         // A daily bar stamped in the day starts at its midnight.
         let d = json!({"open":[1],"high":[1],"low":[1],"close":[1],"volume":[1],"timestamp":[1_763_005_500]});
         assert_eq!(candles(&d, true).unwrap()[0][0] as i64, 1_762_972_200);
-        assert_eq!(candles(&json!({"errorType":"Data_Error","errorCode":"DH-905","errorMessage":"No data"}), false).unwrap_err(), "Dhan: No data");
+        assert_eq!(candles(&json!({"errorType":"Data_Error","errorCode":"DH-905","errorMessage":"No data"}), false).unwrap(), Vec::<Bar>::new());
+        assert_eq!(
+            candles(&json!({"errorType":"Input_Exception","errorCode":"DH-905","errorMessage":"Invalid SecurityId"}), false).unwrap_err(),
+            "Dhan: Invalid SecurityId"
+        );
     }
 }

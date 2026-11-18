@@ -13,18 +13,19 @@ name = "opentrader-dhan"
 path = "src/main.rs"
 
 [dependencies]
-opentrader-plugin-kit = { path = "../kit" }
+opentrader-plugin-kit = { path = "../kit", features = ["socket"] }
 tokio = { version = "1.52", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
 ureq = "3"
 csv = "1"
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [profile.release]
 strip = true
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["full", "test-util"] }
+# The tests' stand-in for the broker's stream.
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

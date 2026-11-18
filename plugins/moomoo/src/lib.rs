@@ -20,24 +20,22 @@ pub mod trade;
 use bars::OpenD;
 use history::{Ask, History};
 use market::security_of;
-use std::collections::{BTreeSet, HashMap};
-use store::{clickhouse::ClickHouse, Backend, Store};
+use std::collections::BTreeSet;
+use store::{Backend, Store, StoreSettings};
 use opend::client::{Client, Event};
 use opend::proto;
-use pace::Pace;
-use rpc::{params, Out, RpcError, BAD_PARAMS, PARSE_ERROR, UNKNOWN_METHOD};
+use opentrader_plugin_kit::session::{self, Handler};
+use rpc::{params, Out, RpcError, BAD_PARAMS, UNKNOWN_METHOD};
 use search::Catalog;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use stream::{Quotes, Subscriptions};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-pub const API: u32 = 2;
-const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+/// The plugin's id: its folder and tables.
+pub const ID: &str = "moomoo";
 /// How often dropped symbols are checked for their minute being up.
 const RELEASE_EVERY: Duration = Duration::from_secs(10);
 /// How often streamed bars are written to the store.
@@ -49,7 +47,7 @@ struct Plugin {
     history: History<OpenD>,
     store: Arc<Store>,
     /// The store's settings in use, to move only when they change.
-    store_settings: tokio::sync::Mutex<Option<String>>,
+    store_settings: StoreSettings,
     /// What the stream's closed minutes cover.
     minute_cover: Mutex<stream::MinuteCover>,
     catalog: Catalog,
@@ -72,48 +70,18 @@ pub async fn run_session(addr: &str, plugin: &str, token: &str) -> Result<(), St
 
 /// `run_session`, with OpenD first looked for at `opend` (until `plugin.configure` gives the user's address).
 pub async fn run_session_with(addr: &str, plugin: &str, token: &str, opend: &str) -> Result<(), String> {
-    let stream = TcpStream::connect(addr).await.map_err(|e| format!("OpenTrader is not reachable at {addr}: {e}"))?;
-    let _ = stream.set_nodelay(true);
-    let (read, mut write) = stream.into_split();
-    let (out, mut queue) = Out::channel();
-    tokio::spawn(async move {
-        while let Some(line) = queue.recv().await {
-            if write.write_all(line.as_bytes()).await.is_err() {
-                return;
-            }
-        }
-    });
-    let mut lines = BufReader::new(read).lines();
-
-    out.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "hello",
-        "params": { "plugin": plugin, "token": token, "api": API, "version": env!("CARGO_PKG_VERSION") } }));
-    let answer = tokio::time::timeout(HELLO_TIMEOUT, async {
-        while let Ok(Some(line)) = lines.next_line().await {
-            match serde_json::from_str::<Value>(&line) {
-                Ok(msg) if msg.get("method").is_none() && msg.get("id") == Some(&json!(1)) => return Some(msg),
-                _ => println!("[warn] ignored before hello: {line}"),
-            }
-        }
-        None
-    })
-    .await
-    .map_err(|_| "OpenTrader did not answer hello".to_string())?
-    .ok_or("OpenTrader closed the connection during hello")?;
-    if let Some(e) = answer.get("error") {
-        let message = e.get("message").and_then(Value::as_str).unwrap_or("refused");
-        return Err(format!("OpenTrader refused the plugin: {message}"));
-    }
-    println!("[info] connected to OpenTrader at {addr}");
+    opentrader_plugin_kit::set_plugin(ID);
+    let (out, lines) = session::connect(addr, plugin, token, env!("CARGO_PKG_VERSION")).await?;
 
     let (client, events) = Client::new(opend.to_string());
     tokio::spawn(client.clone().run());
     let store = Arc::new(Store::new(Backend::embedded()));
     let me = Arc::new(Plugin {
-        history: History { source: OpenD { client: client.clone(), pace: Pace::history() }, store: store.clone() },
+        history: History { source: OpenD::new(client.clone()), store: store.clone() },
         broker: trade::Broker::new(client.clone(), out.clone()),
         client,
         store,
-        store_settings: tokio::sync::Mutex::new(None),
+        store_settings: StoreSettings::default(),
         minute_cover: Mutex::new(stream::MinuteCover::default()),
         catalog: Catalog::with_dir(store::cache_dir()),
         subs: tokio::sync::Mutex::new(Subscriptions::default()),
@@ -130,27 +98,8 @@ pub async fn run_session_with(addr: &str, plugin: &str, token: &str, opend: &str
     let broker = me.clone();
     tokio::spawn(async move { broker.broker.refresh_often().await });
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let msg: Value = match serde_json::from_str(&line) {
-            Ok(m) => m,
-            Err(e) => {
-                out.answer(Value::Null, Err(RpcError::new(PARSE_ERROR, format!("Parse error: {e}"))));
-                continue;
-            }
-        };
-        let Some(method) = msg.get("method").and_then(Value::as_str).map(str::to_string) else { continue };
-        let p = msg.get("params").cloned().unwrap_or(Value::Null);
-        let me = me.clone();
-        match msg.get("id").cloned() {
-            // Requests run on their own: a long history doesn't hold a search up.
-            Some(id) => {
-                tokio::spawn(async move { me.out.answer(id, me.request(&method, p).await) });
-            }
-            None => {
-                tokio::spawn(async move { me.notification(&method, p).await });
-            }
-        }
-    }
+    // Requests run on their own (a long history doesn't hold a search up); notifications in order.
+    session::serve(lines, out, me.clone()).await;
     me.store.flush().await;
     Ok(())
 }
@@ -182,17 +131,7 @@ struct ConfigureParams {
 
 /// The "Always record" setting's symbols (separated by commas, spaces or new lines), and the entries refused.
 pub fn record_list(text: &str) -> (BTreeSet<String>, Vec<String>) {
-    let mut ok = BTreeSet::new();
-    let mut refused = Vec::new();
-    for entry in text.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).filter(|e| !e.is_empty()) {
-        match security_of(entry).and_then(|(_, sec)| market::symbol_of(&sec)) {
-            Some(symbol) => {
-                ok.insert(symbol);
-            }
-            None => refused.push(entry.to_string()),
-        }
-    }
-    (ok, refused)
+    opentrader_plugin_kit::feed::record_list_with(text, |e| security_of(e).and_then(|(_, sec)| market::symbol_of(&sec)))
 }
 
 fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -252,7 +191,7 @@ impl Plugin {
         }))
     }
 
-    async fn notification(&self, method: &str, p: Value) {
+    async fn notification(self: &Arc<Self>, method: &str, p: Value) {
         match method {
             "plugin.configure" => {
                 let Ok(p) = serde_json::from_value::<ConfigureParams>(p) else { return };
@@ -260,7 +199,7 @@ impl Plugin {
                 let port = p.settings.get("port").and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(11111);
                 self.client.set_addr(format!("{host}:{port}"));
                 self.client.set_key(p.settings.get("rsaKeyFile").cloned());
-                self.configure_store(&p.settings).await;
+                self.store_settings.apply(&self.store, &p.settings).await;
                 let (record, refused) = record_list(p.settings.get("alwaysRecord").map_or("", |s| s));
                 if !refused.is_empty() {
                     println!("[warn] Always record: {} left out (symbols are EXCHANGE:CODE, such as US:AAPL)", refused.join(", "));
@@ -290,11 +229,14 @@ impl Plugin {
     }
 
     /// Subscribes what the app asks for and the "Always record" symbols; the others are released once OpenD allows.
-    async fn resubscribe(&self) {
+    /// The set changes now, in the order of the notifications; OpenD is asked on its own task, so that a slow OpenD
+    /// does not hold up the requests after them.
+    async fn resubscribe(self: &Arc<Self>) {
         let mut wanted: BTreeSet<String> = locked(&self.data_tickers).union(&locked(&self.quote_tickers)).cloned().collect();
         wanted.extend(locked(&self.record_tickers).iter().cloned());
         let new = self.subs.lock().await.set(wanted, tokio::time::Instant::now());
-        self.subscribe(new).await;
+        let me = self.clone();
+        tokio::spawn(async move { me.subscribe(new).await });
     }
 
     async fn subscribe(&self, symbols: Vec<String>) {
@@ -385,33 +327,15 @@ impl Plugin {
             self.store.flush().await;
         }
     }
+}
 
-    /// Settings > Plugins: ClickHouse when its URL is given, else the embedded store.
-    async fn configure_store(&self, settings: &HashMap<String, String>) {
-        let get = |k: &str| settings.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
-        let url = get("clickhouseUrl");
-        let wanted = format!("{url}|{}|{}|{}", get("clickhouseDatabase"), get("clickhouseUser"), get("clickhousePassword"));
-        let mut current = self.store_settings.lock().await;
-        if current.as_deref() == Some(wanted.as_str()) {
-            return;
-        }
-        let backend = if url.is_empty() {
-            None
-        } else {
-            let db = Some(get("clickhouseDatabase")).filter(|d| !d.is_empty()).unwrap_or_else(|| "trading_db".into());
-            match ClickHouse::new(&url, &db, &get("clickhouseUser"), settings.get("clickhousePassword").map_or("", |s| s)) {
-                Ok(c) => Some(Backend::ClickHouse(c)),
-                Err(e) => {
-                    println!("[warn] {e}; bars stay in the embedded store");
-                    None
-                }
-            }
-        };
-        // The first configure with no ClickHouse keeps the embedded store opened at start.
-        if backend.is_some() || current.is_some() {
-            self.store.set_backend(backend.unwrap_or_else(Backend::embedded)).await;
-        }
-        *current = Some(wanted);
+impl Handler for Plugin {
+    async fn request(self: Arc<Self>, method: String, params: Value) -> Result<Value, RpcError> {
+        Plugin::request(&self, &method, params).await
+    }
+
+    async fn notification(self: Arc<Self>, method: String, params: Value) {
+        Plugin::notification(&self, &method, params).await
     }
 }
 

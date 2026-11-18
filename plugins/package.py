@@ -1,5 +1,5 @@
-"""The package of a plugin built on plugins/kit (zerodha, dhan), for the plugin release workflow
-(.github/workflows/plugin-india.yml). The moomoo plugin has its own (plugins/moomoo/package.py).
+"""The package of a data plugin (moomoo, zerodha, dhan), for the plugin release workflows
+(.github/workflows/plugin-moomoo.yml, plugin-india.yml).
 
     python plugins/package.py zip   PLUGIN BINARY PLATFORM OUT_DIR   # writes the program and the zip, prints the zip
     python plugins/package.py entry PLUGIN ZIP PLATFORM               # prints the catalog entry of a signed ZIP

@@ -19,6 +19,12 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 ureq = { version = "3", default-features = false }
 hmac = "0.12"
 sha1 = "0.10"
+# The WebSocket stream loop (`socket`), for the plugins whose broker streams over a WebSocket.
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+
+[features]
+socket = ["dep:tokio-tungstenite", "dep:futures-util"]
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["full", "test-util"] }

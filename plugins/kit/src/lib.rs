@@ -9,6 +9,9 @@
  *   history  `data.bars` from the store, asking the broker only for what is missing
  *   live     ticks into quotes and 1-minute bars written to the store
  *   feed     a whole data plugin over a broker (`Provider`)
+ *   token    a broker's access token: kept in memory and on disk, made again when refused
+ *   socket   a broker's WebSocket stream of ticks, connected again after a drop (feature `socket`)
+ *   backfill the plugin program as an unattended command filling the store
  *   totp     RFC 6238 codes for broker logins
  */
 pub mod backfill;
@@ -20,7 +23,10 @@ pub mod live;
 pub mod pace;
 pub mod rpc;
 pub mod session;
+#[cfg(feature = "socket")]
+pub mod socket;
 pub mod store;
+pub mod token;
 pub mod totp;
 
 use std::sync::OnceLock;
@@ -36,7 +42,13 @@ pub fn set_plugin(name: &'static str) {
     let _ = PLUGIN.set(name);
 }
 
-/// The plugin's name; `moomoo` until `set_plugin`.
+/// The plugin's name, as `set_plugin` gave it. Every plugin names itself first: without a name the store would not
+/// know its folder or tables.
 pub fn plugin() -> &'static str {
-    PLUGIN.get().copied().unwrap_or("moomoo")
+    PLUGIN.get().copied().expect("opentrader_plugin_kit::set_plugin must be called before the store is used")
+}
+
+/// Now, in UNIX seconds.
+pub fn now() -> i64 {
+    chrono::Utc::now().timestamp()
 }

@@ -9,16 +9,12 @@
  * `close` is the previous session's close. One-byte frames are heartbeats.
  */
 use crate::Zerodha;
-use futures_util::{SinkExt, StreamExt};
 use opentrader_plugin_kit::catalog::Instrument;
-use opentrader_plugin_kit::feed::Event;
 use opentrader_plugin_kit::live::Tick;
+use opentrader_plugin_kit::socket::{Broker, Closed};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::tungstenite::Message;
+use std::collections::HashMap;
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Packet {
@@ -118,97 +114,64 @@ pub fn tick_of(p: &Packet, inst: &Instrument, now: i64) -> Tick {
     }
 }
 
-/// The stream for the plugin's life: connected while there is something to stream and a token, again after a drop.
-pub async fn run(z: Arc<Zerodha>, mut wanted: watch::Receiver<Vec<Instrument>>, events: mpsc::UnboundedSender<Event>) {
-    let mut wait = Duration::from_secs(2);
-    loop {
-        if wanted.borrow().is_empty() {
-            if wanted.changed().await.is_err() {
-                return;
-            }
-            continue;
+/// Kite's stream for the kit's stream loop: instruments are held by their token, in full mode.
+impl Broker for Zerodha {
+    const NAME: &'static str = "Kite's stream";
+    type State = ();
+
+    async fn token(&self) -> Result<String, String> {
+        Zerodha::token(self).await
+    }
+
+    async fn invalidate(&self, token: &str) {
+        Zerodha::invalidate(self, token).await
+    }
+
+    fn configured(&self) -> &Notify {
+        &self.tokens.configured
+    }
+
+    fn url(&self, token: &str) -> String {
+        format!("{}/?api_key={}&access_token={token}", self.urls.ws.trim_end_matches('/'), self.api_key())
+    }
+
+    fn refused(&self, error: &str) -> bool {
+        error.contains("403")
+    }
+
+    fn key(&self, inst: &Instrument) -> String {
+        inst.id.clone()
+    }
+
+    fn subscribe(&self, new: &[&Instrument], gone: &[&Instrument]) -> Vec<String> {
+        let tokens = |list: &[&Instrument]| list.iter().filter_map(|i| i.id.parse::<u32>().ok()).collect::<Vec<u32>>();
+        let (new, gone) = (tokens(new), tokens(gone));
+        let mut out = Vec::new();
+        if !gone.is_empty() {
+            out.push(json!({"a":"unsubscribe","v":gone}).to_string());
         }
-        let token = match z.token().await {
-            Ok(t) => t,
-            Err(e) => {
-                println!("[warn] live prices are off: {e}");
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-                    _ = z.configured.notified() => {}
-                }
-                continue;
-            }
-        };
-        let url = format!("{}/?api_key={}&access_token={}", z.urls.ws.trim_end_matches('/'), z.api_key(), token);
-        let ws = match tokio_tungstenite::connect_async(url.as_str()).await {
-            Ok((ws, _)) => ws,
-            Err(e) => {
-                let text = e.to_string();
-                if text.contains("403") {
-                    z.invalidate(&token).await;
-                }
-                println!("[warn] Kite stream: {}", text.replace(&token, "…"));
-                tokio::time::sleep(wait).await;
-                wait = (wait * 2).min(Duration::from_secs(60));
-                continue;
-            }
-        };
-        wait = Duration::from_secs(2);
-        println!("[info] connected to Kite's stream");
-        let _ = events.send(Event::Connected);
-        let (mut tx, mut rx) = ws.split();
-        let mut held: HashSet<u32> = HashSet::new();
-        'session: loop {
-            // The set to hold: subscribe the new ones in full mode, unsubscribe the dropped ones.
-            let list = wanted.borrow_and_update().clone();
-            let by_token: HashMap<u32, Instrument> = list.iter().filter_map(|i| i.id.parse::<u32>().ok().map(|t| (t, i.clone()))).collect();
-            let want: HashSet<u32> = by_token.keys().copied().collect();
-            let new: Vec<u32> = want.difference(&held).copied().collect();
-            let gone: Vec<u32> = held.difference(&want).copied().collect();
-            if !gone.is_empty() && tx.send(Message::text(json!({"a":"unsubscribe","v":gone}).to_string())).await.is_err() {
-                break 'session;
-            }
-            if !new.is_empty() {
-                let sent = tx.send(Message::text(json!({"a":"subscribe","v":new}).to_string())).await.is_ok()
-                    && tx.send(Message::text(json!({"a":"mode","v":["full", new]}).to_string())).await.is_ok();
-                if !sent {
-                    break 'session;
-                }
-            }
-            held = want;
-            if held.is_empty() {
-                let _ = tx.send(Message::Close(None)).await;
-                break 'session;
-            }
-            loop {
-                tokio::select! {
-                    changed = wanted.changed() => {
-                        if changed.is_err() { return; }
-                        continue 'session;
-                    }
-                    msg = rx.next() => match msg {
-                        Some(Ok(Message::Binary(frame))) => {
-                            let now = chrono::Utc::now().timestamp();
-                            for p in packets(&frame) {
-                                let Some(packet) = parse(p, |t| by_token.get(&t).map_or(100.0, |i| divisor_of(&i.segment))) else { continue };
-                                if let Some(inst) = by_token.get(&packet.token) {
-                                    let _ = events.send(Event::Tick(tick_of(&packet, inst, now)));
-                                }
-                            }
-                        }
-                        Some(Ok(Message::Text(text))) => {
-                            if text.contains("\"error\"") {
-                                println!("[warn] Kite stream: {text}");
-                            }
-                        }
-                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break 'session,
-                        Some(Ok(_)) => {}
-                    }
-                }
+        if !new.is_empty() {
+            out.push(json!({"a":"subscribe","v":new}).to_string());
+            out.push(json!({"a":"mode","v":["full", new]}).to_string());
+        }
+        out
+    }
+
+    fn frame(&self, _: &mut (), frame: &[u8], held: &HashMap<String, Instrument>, now: i64, ticks: &mut Vec<Tick>) -> Result<(), Closed> {
+        for p in packets(frame) {
+            let inst_of = |t: u32| held.get(&t.to_string());
+            let Some(packet) = parse(p, |t| inst_of(t).map_or(100.0, |i| divisor_of(&i.segment))) else { continue };
+            if let Some(inst) = inst_of(packet.token) {
+                ticks.push(tick_of(&packet, inst, now));
             }
         }
-        println!("[info] Kite's stream closed");
-        tokio::time::sleep(wait).await;
+        Ok(())
+    }
+
+    fn text(&self, text: &str) {
+        if text.contains("\"error\"") {
+            println!("[warn] Kite stream: {text}");
+        }
     }
 }
 
@@ -270,7 +233,10 @@ mod tests {
         let f = frame(&[idx, ltp]);
         let ps = packets(&f);
         let i = parse(ps[0], |_| 100.0).unwrap();
-        assert_eq!((i.price, i.high, i.low, i.open, i.close, i.time, i.volume), (24000.5, Some(24100.0), Some(23900.0), Some(23950.0), Some(23800.0), Some(1_763_017_240), None));
+        assert_eq!(
+            (i.price, i.high, i.low, i.open, i.close, i.time, i.volume),
+            (24000.5, Some(24100.0), Some(23900.0), Some(23950.0), Some(23800.0), Some(1_763_017_240), None)
+        );
         let l = parse(ps[1], |_| 10_000_000.0).unwrap();
         assert_eq!((l.token, l.price), (5, 0.0012345));
         // A heartbeat and a cut frame hold nothing.

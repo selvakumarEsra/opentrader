@@ -72,7 +72,9 @@ impl Minutes {
                 if f.whole {
                     closed = Some(f.bar);
                 }
-                let base = f.last_volume.or(t.day_volume);
+                // The day's volume starts again each trading day: a new day's first minute starts from none.
+                let new_day = cal.midnight(m) != cal.midnight(f.bar[0] as i64);
+                let base = if new_day { t.day_volume.map(|_| 0.0) } else { f.last_volume.or(t.day_volume) };
                 *f = Forming { bar: [m as f64, p, p, p, p, 0.0], whole: true, base, last_volume: t.day_volume.or(base) };
                 if let (Some(v), Some(b)) = (t.day_volume, base) {
                     f.bar[5] = (v - b).max(0.0);
@@ -151,6 +153,19 @@ mod tests {
         store_minute(&store, "NSE:INFY", closed[0]).await;
         let key = Key::new("NSE:INFY", "1", false);
         assert!(store.read(&key, |s| s.covered_at(t0 + 60) && s.covered_at(t0 + 119) && !s.covered_at(t0 + 120)).await);
+    }
+
+    #[test]
+    fn a_new_days_first_minute_counts_from_none() {
+        let cal = Calendar::india("NSE");
+        let mut m = Minutes::default();
+        let evening = 1_763_027_400; // 15:20 IST
+        m.tick(&tick(evening, 100.0, 4_000_000.0), &cal);
+        m.tick(&tick(evening + 60, 100.0, 5_000_000.0), &cal);
+        let morning = evening + 86_400 - 6 * 3600 + 300; // 09:25 IST the next day
+        m.tick(&tick(morning, 101.0, 20_000.0), &cal);
+        let (closed, _) = m.tick(&tick(morning + 60, 101.0, 30_000.0), &cal);
+        assert_eq!(closed.map(|b| b[5]), Some(20_000.0));
     }
 
     #[test]

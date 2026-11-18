@@ -13,11 +13,11 @@ use crate::history::{Ask, History, Source};
 use crate::market::security_of;
 use crate::opend::client::{Client, Event};
 use crate::opend::proto;
-use crate::pace::Pace;
-use crate::store::{clickhouse::ClickHouse, Backend, Store};
+use crate::store::{backend_of, Backend, Store};
 use crate::stream::{self, MinuteCover, Quotes};
 use chrono::{NaiveDate, TimeZone, Utc};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -203,11 +203,15 @@ pub async fn backfill<S: Source>(history: &History<S>, symbols: &[String], resol
     out
 }
 
-fn backend_of(o: &Options) -> Result<Backend, String> {
-    match &o.clickhouse {
-        Some(url) => Ok(Backend::ClickHouse(ClickHouse::new(url, &o.database, &o.user, &o.password)?)),
-        None => Ok(Backend::embedded()),
-    }
+/// The store of the options: ClickHouse with --clickhouse (an error when it cannot be set up), else the embedded one.
+fn store_of(o: &Options) -> Result<Backend, String> {
+    let Some(url) = &o.clickhouse else { return Ok(Backend::embedded()) };
+    let settings: HashMap<String, String> =
+        [("clickhouseUrl", url), ("clickhouseDatabase", &o.database), ("clickhouseUser", &o.user), ("clickhousePassword", &o.password)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+    backend_of(&settings).ok_or_else(|| format!("the ClickHouse store at {url} could not be set up"))
 }
 
 /// Connects to OpenD and waits for InitConnect.
@@ -234,14 +238,15 @@ async fn print_quota(client: &Client, when: &str) {
 
 /// Runs a command; Ok(false) when some of it failed.
 pub async fn run(o: Options) -> Result<bool, String> {
-    let store = Arc::new(Store::new(backend_of(&o)?));
+    opentrader_plugin_kit::set_plugin(crate::ID);
+    let store = Arc::new(Store::new(store_of(&o)?));
     let (client, mut events) = connect(&o).await?;
     match o.command {
         Command::Backfill => {
             // Nothing is subscribed: the events are only connections.
             tokio::spawn(async move { while events.recv().await.is_some() {} });
             print_quota(&client, "before").await;
-            let history = History { source: bars::OpenD { client: client.clone(), pace: Pace::history() }, store: store.clone() };
+            let history = History { source: bars::OpenD::new(client.clone()), store: store.clone() };
             let outcomes = backfill(&history, &o.symbols, &o.resolutions, o.from, Utc::now().timestamp()).await;
             store.flush().await;
             print_quota(&client, "after").await;
