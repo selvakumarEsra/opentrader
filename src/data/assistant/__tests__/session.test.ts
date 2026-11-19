@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("../../kv", () => ({ getItem: () => null, setItem: () => undefined, removeItem: () => undefined, onExternalChange: () => () => undefined }));
+// The built-in model, chosen (an SDK model is the default).
+vi.mock("../../kv", () => ({ getItem: (k: string) => (k === "ot:assistant:model" ? "builtin" : null), setItem: () => undefined, removeItem: () => undefined, onExternalChange: () => () => undefined }));
 vi.mock("@tauri-apps/api/core", () => ({
   Channel: class {
     onmessage: (d: string) => void = () => {};

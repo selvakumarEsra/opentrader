@@ -24,24 +24,38 @@ A model can read and change charts, indicators, drawings, alerts and watchlists;
 places, changes or cancels an order.
 
 <!-- id: REQ-ASSIST-CLI-001 -->
-## The assistant panel MUST let the user choose its model among the built-in one and the ready SDK models
+## The user MUST choose the assistant's model, an SDK model by default, the built-in one only when chosen
 
-A model menu in the assistant panel lists Built-in, Claude Code, Codex and Gemini. A model without credentials (or
-without Node.js 18+ on this computer) is listed disabled, with what it needs. The choice is kept (src/data/kv.ts) and used for the next
-questions of every chat; the built-in model stays the default.
+The assistant answers with Claude Code, Codex or Gemini by default: the first of them that is ready, in that order,
+until the user chooses one. The built-in model (a 2.3 GB download) is used only when the user chooses it, or, when
+they turn on "Answer with the built-in model when the chosen one is not ready", in place of a chosen SDK model that is
+not ready. The choice is made in Settings > Coding agents > AI assistant models and in the panel's model menu; a
+model without credentials (or without Node.js 18+ on this computer) is listed disabled, with what it needs. The choice
+is kept (src/data/kv.ts) and used for the next questions of every chat. The panel never asks to download the built-in
+model unless it is the model in use; that screen offers the ready SDK models instead.
 
 implementations:
   - src/data/assistant/models.ts:activeModel
+  - src/data/assistant/models.ts:chosenModel
+  - src/data/assistant/models.ts:notReady
   - src/window/assistant/AssistantPanel.tsx:ChatView
+  - src/window/assistant/LocalModel.tsx:AssistantSetup
   - src/window/header/app-settings/AssistantModels.tsx:AssistantModels
   - src-tauri/src/assistant_cli.rs:assistant_cli_status
 
+verifies:
+  - src/data/assistant/__tests__/models.test.ts
+
 ## Acceptance
 <!-- id: REQ-ASSIST-CLI-001.A1 -->
-- With a Claude Code token (or login) and no Codex or Gemini credentials, the menu enables Built-in and Claude Code and shows Codex and Gemini disabled, each naming the token it needs.
+- With a Claude Code login and nothing chosen, the panel opens on the chat (no download screen) and the first question goes to Claude Code; with only a Codex login, to Codex.
 <!-- id: REQ-ASSIST-CLI-001.A2 -->
-- The chosen model is still chosen after the app restarts; a chosen model that is no longer ready falls back to Built-in, saying so in the panel.
+- With Codex chosen in Settings, the panel's menu shows Codex checked, and the next question goes to Codex; the choice is kept after a restart.
 <!-- id: REQ-ASSIST-CLI-001.A3 -->
+- A chosen SDK model that is not ready leaves the composer disabled with a note naming what it needs and where to set it, unless the fallback is on: then the built-in model answers (if installed), saying so.
+<!-- id: REQ-ASSIST-CLI-001.A4 -->
+- The download screen shows only with Built-in chosen (or as the fallback); it lists the ready SDK models to use instead.
+<!-- id: REQ-ASSIST-CLI-001.A5 -->
 - Changing the model mid-chat keeps the chat: the next question goes to the new model with the chat so far.
 
 <!-- id: REQ-ASSIST-CLI-002 -->

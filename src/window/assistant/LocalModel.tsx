@@ -1,14 +1,19 @@
 /*
- * First open of the assistant: one sentence, a beta warning and Activate, which downloads its model
- * (src/data/assistant/local.ts).
+ * The built-in model's download screen, shown only while it is the assistant's model (specs/assistant-cli-models.md,
+ * REQ-ASSIST-CLI-001): one sentence, a beta warning and Activate, which downloads it (src/data/assistant/local.ts),
+ * and the ready SDK models to use instead.
  * Nothing comes with the installer; Remove is in the panel's menu once it is there.
  */
-import { Show, onMount } from "solid-js";
+import { For, Show, onMount } from "solid-js";
 import { translateWith } from "../../i18n/translator";
+import { chooseModel, cliModels, refreshModels } from "../../data/assistant/models";
 import { cancelLocal, gb, installLocal, localBlocker, localError, localInfo, localProgress, refreshLocal } from "../../data/assistant/local";
 
 export function AssistantSetup() {
-  onMount(() => void refreshLocal());
+  onMount(() => {
+    void refreshLocal();
+    void refreshModels();
+  });
   const busy = () => !!localInfo()?.installing || !!localProgress();
   const pct = () => {
     const p = localProgress();
@@ -49,6 +54,18 @@ export function AssistantSetup() {
           )}
         </Show>
         <Show when={localError()}>{(e) => <p class="asst-status is-error">{e()}</p>}</Show>
+        <Show when={cliModels().some((m) => m.ready)}>
+          <div class="asst-setup-or">
+            <span class="asst-muted">Or answer with your own account, nothing to download:</span>
+            <For each={cliModels().filter((m) => m.ready)}>
+              {(m) => (
+                <button type="button" class="asst-btn" onClick={() => chooseModel(m.id)}>
+                  {translateWith("Use {0}", m.name)}
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
       </div>
     </div>
   );

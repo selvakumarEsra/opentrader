@@ -1,11 +1,23 @@
 /*
- * Settings > Coding agents > AI ASSISTANT MODELS (specs/assistant-cli-models.md): the token and the model name of each
- * SDK model the assistant panel can choose (Claude Code, Codex, Gemini). A typed token is kept on this computer
+ * Settings > Coding agents > AI ASSISTANT MODELS (specs/assistant-cli-models.md): which model the assistant answers
+ * with (an SDK model by default, the built-in one only when chosen, REQ-ASSIST-CLI-001), and the token and the model
+ * name of each SDK model (Claude Code, Codex, Gemini). A typed token is kept on this computer
  * (readable by the user only) and never shown again; an empty field uses the environment's or the login's.
  */
 import { createSignal, For, onMount, Show } from "solid-js";
 import { commands, type CliModel } from "../../../bindings";
-import { cliStatus, refreshModels, setModelsStatus } from "../../../data/assistant/models";
+import {
+  BUILTIN,
+  builtinFallback,
+  chooseModel,
+  chosenModel,
+  cliStatus,
+  hasChosen,
+  refreshModels,
+  setBuiltinFallback,
+  setModelsStatus,
+} from "../../../data/assistant/models";
+import { CheckField } from "../../../components/form";
 import { Section } from "./parts";
 import { translateWith } from "../../../i18n/translator";
 
@@ -77,8 +89,8 @@ export function AssistantModels() {
   return (
     <Section label="AI ASSISTANT MODELS">
       <div class="app-settings-note">
-        The AI assistant can answer with Claude Code, Codex or Gemini instead of its built-in model, run on this computer through each one's SDK
-        with your own account (Node.js 18 or newer needed; the first question sets the SDKs up). The model reads your charts and data with the
+        The AI assistant answers with Claude Code, Codex or Gemini, run on this computer through each one's SDK with your own account (Node.js 18
+        or newer needed; the first question sets the SDKs up), or with its built-in model if you choose it. The model reads your charts and data with the
         tools above, only during your question, and cannot place orders. Your questions go to that model's provider, not to OpenTrader.
       </div>
       <Show when={cliStatus()} fallback={<div class="app-settings-note">Looking for Node.js and your credentials…</div>}>
@@ -86,6 +98,32 @@ export function AssistantModels() {
           <>
             <Show when={!s().node}>
               <span class="app-settings-field-error">Node.js was not found: install it from nodejs.org, then reopen Settings.</span>
+            </Show>
+            <label class="app-settings-field">
+              <span class="app-settings-field-label">Answer with</span>
+              <select class="app-settings-input" value={chosenModel()} onChange={(e) => chooseModel(e.currentTarget.value)}>
+                <For each={s().models}>
+                  {(m) => (
+                    <option value={m.id} data-no-translate>
+                      {m.ready ? m.name : `${m.name} (${translateWith("needs {0}", m.need ?? "")})`}
+                    </option>
+                  )}
+                </For>
+                <option value={BUILTIN}>Built-in model (on this computer, a 2.3 GB download)</option>
+              </select>
+            </label>
+            <Show when={!hasChosen()}>
+              <div class="app-settings-note">Until you choose, the first ready of Claude Code, Codex and Gemini answers.</div>
+            </Show>
+            <Show when={chosenModel() !== BUILTIN}>
+              <div class="app-settings-agents-row">
+                <CheckField
+                  variant="settings"
+                  label="Answer with the built-in model when the chosen one is not ready"
+                  checked={builtinFallback()}
+                  onChange={() => setBuiltinFallback(!builtinFallback())}
+                />
+              </div>
             </Show>
             <For each={s().models}>{(m) => <ModelRow m={m} />}</For>
           </>

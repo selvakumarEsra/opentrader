@@ -636,6 +636,17 @@
   margin-top: 0;
   padding-top: 24px;
 }
+/* The download screen's other way: the ready SDK models. */
+.asst-setup-or {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+.asst-setup-or > .asst-muted {
+  flex-basis: 100%;
+}
 /* Before Activate: the assistant is a beta and says so. */
 .asst-beta {
   margin: 0;

@@ -22,7 +22,7 @@ import { Popup } from "./Popup";
 import { AssistantSetup } from "./LocalModel";
 import { gb, localError, localInfo, localProgress, refreshLocal, removeLocal, setUpdateLater, updateBytes, updateLater, updateLocal } from "../../data/assistant/local";
 import { stepTitle } from "./steps";
-import { activeModel, BUILTIN, chooseModel, chosenModel, cliModels, fellBack, modelName, refreshModels } from "../../data/assistant/models";
+import { activeModel, BUILTIN, chooseModel, chosenModel, cliModels, fellBack, modelName, notReady, refreshModels } from "../../data/assistant/models";
 import "../../styles/screener.css";
 import "../../styles/community.css";
 import "../../styles/assistant.css";
@@ -42,8 +42,8 @@ export function AssistantPanel(props: { ticker: string }) {
     void refreshLocal();
     void refreshModels();
   });
-  // The built-in model needs its download; an SDK model does not.
-  const ready = canAsk;
+  // The download screen shows only while the built-in model is the one in use and not yet downloaded.
+  const needsDownload = () => activeModel() === BUILTIN && !localInfo()?.installed;
   const overlay = () => assistantPanel.mode() === "overlay";
   const [view, setView] = createSignal<"chat" | "chats">("chat");
 
@@ -105,7 +105,7 @@ export function AssistantPanel(props: { ticker: string }) {
         </header>
         <div class="asst-body">
           <Switch>
-            <Match when={localInfo() && !ready()}>
+            <Match when={localInfo() && needsDownload()}>
               <AssistantSetup />
             </Match>
             <Match when={view() === "chats"}>
@@ -121,9 +121,9 @@ export function AssistantPanel(props: { ticker: string }) {
   );
 }
 
-/** Questions can be sent: the built-in model is installed, or an SDK model is chosen (and ready). */
-/** Whether a question can be asked: an SDK model, or the built-in one installed. */
-const canAsk = () => activeModel() !== BUILTIN || !!localInfo()?.installed;
+/** Whether a question can be asked: the SDK model in use is ready (or not yet known not to be), or the built-in one
+ *  is in use and installed. */
+const canAsk = () => (activeModel() === BUILTIN ? !!localInfo()?.installed : !notReady());
 
 function ChatView(props: { ticker: string; onOpenChats: () => void }) {
   const [menuOpen, setMenuOpen] = createSignal(false);
@@ -226,10 +226,6 @@ function ChatView(props: { ticker: string; onOpenChats: () => void }) {
         </button>
         <Show when={modelOpen()}>
           <Popup onClose={() => setModelOpen(false)} class="asst-chat-menu asst-model-menu">
-            <button type="button" class="asst-menu-item" role="menuitemradio" aria-checked={chosenModel() === BUILTIN} onClick={() => { setModelOpen(false); chooseModel(BUILTIN); }}>
-              <span>Built-in</span>
-              <span class="asst-muted">On this computer, offline</span>
-            </button>
             <For each={cliModels()}>
               {(m) => (
                 <button
@@ -248,11 +244,18 @@ function ChatView(props: { ticker: string; onOpenChats: () => void }) {
                 </button>
               )}
             </For>
+            <button type="button" class="asst-menu-item" role="menuitemradio" aria-checked={chosenModel() === BUILTIN} onClick={() => { setModelOpen(false); chooseModel(BUILTIN); }}>
+              <span>Built-in</span>
+              <span class="asst-muted">On this computer, offline</span>
+            </button>
             <div class="asst-menu-sep" />
             <p class="asst-muted asst-menu-note">Tokens and model names: Settings &gt; Coding agents.</p>
           </Popup>
         </Show>
       </div>
+      <Show when={notReady()}>
+        {(m) => <p class="asst-status is-error">{translateWith("{0} is not ready: it needs {1}. Set it up in Settings > Coding agents, or choose another model.", m().name, m().need ?? "")}</p>}
+      </Show>
       <Show when={fellBack()}>
         {(m) => <p class="asst-status">{translateWith("{0} is not ready ({1}): the built-in model answers.", m().name, m().need ?? "")}</p>}
       </Show>
