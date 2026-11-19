@@ -88,6 +88,5 @@ push a tag `plugin-moomoo-v<version>` and the release of that tag gets `moomoo-<
 `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
 The key is the app's release key (default `~/.tauri/opentrader-updater.key`), its password in
-`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` or `<key>.password`. The catalog (`plugins/catalog.json`) lists one package per
-plugin, so it takes the Windows package, as for the other broker plugins; macOS and Linux users install the zip from
-a file.
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` or `<key>.password`. The plugin runs on Windows, macOS and Linux: the catalog
+lists one package per system, and Settings > Plugins offers the one for this computer.

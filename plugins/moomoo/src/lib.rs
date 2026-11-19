@@ -275,7 +275,15 @@ impl Plugin {
                     tokio::spawn(async move { me.broker.push(p, &s2c).await });
                 }
                 Event::Push { proto: proto::QOT_UPDATE_KL, s2c } => {
-                    let closed = self.quotes.lock().unwrap_or_else(|e| e.into_inner()).minute_push(&s2c, now);
+                    let (closed, sent) = {
+                        let subs = self.subs.lock().await;
+                        let mut quotes = self.quotes.lock().unwrap_or_else(|e| e.into_inner());
+                        let closed = quotes.minute_push(&s2c, now);
+                        // The chart moves on the minute's close too (REQ-MOOMOO-005.A4).
+                        let symbol = s2c.get("security").and_then(|v| serde_json::from_value::<proto::Security>(v.clone()).ok()).and_then(|s| market::symbol_of(&s));
+                        (closed, symbol.and_then(|sym| quotes.minute_quote(&sym, &subs, now)))
+                    };
+                    self.send_quotes(sent.into_iter().collect());
                     if let Some((symbol, bar)) = closed {
                         stream::store_minute(&self.store, &self.minute_cover, &symbol, bar).await;
                     }
@@ -285,17 +293,7 @@ impl Plugin {
                         let subs = self.subs.lock().await;
                         self.quotes.lock().unwrap_or_else(|e| e.into_inner()).basic_push(&s2c, &subs, now)
                     };
-                    let (data, watched) = (locked(&self.data_tickers).clone(), locked(&self.quote_tickers).clone());
-                    for q in sent {
-                        let ticker = q["ticker"].as_str().unwrap_or_default();
-                        if watched.contains(ticker) {
-                            // Basic quotes carry no bid and ask: the ticket shows the last price.
-                            self.out.notify("broker.quote", json!({ "ticker": ticker, "bid": null, "ask": null, "last": q["price"] }));
-                        }
-                        if data.contains(ticker) {
-                            self.out.notify("data.quote", q);
-                        }
-                    }
+                    self.send_quotes(sent);
                 }
                 Event::Push { .. } => {}
             }
@@ -316,6 +314,24 @@ impl Plugin {
                 if let Err(e) = self.client.request(proto::QOT_SUB, stream::sub_request(&due, false)).await {
                     println!("[warn] could not stop live prices of {}: {e}", due.join(", "));
                 }
+            }
+        }
+    }
+
+    /// Live quotes to the app: `data.quote` for the chart's symbols, `broker.quote` for the order ticket's.
+    fn send_quotes(&self, sent: Vec<Value>) {
+        if sent.is_empty() {
+            return;
+        }
+        let (data, watched) = (locked(&self.data_tickers).clone(), locked(&self.quote_tickers).clone());
+        for q in sent {
+            let ticker = q["ticker"].as_str().unwrap_or_default();
+            if watched.contains(ticker) {
+                // Basic quotes carry no bid and ask: the ticket shows the last price.
+                self.out.notify("broker.quote", json!({ "ticker": ticker, "bid": null, "ask": null, "last": q["price"] }));
+            }
+            if data.contains(ticker) {
+                self.out.notify("data.quote", q);
             }
         }
     }

@@ -21,7 +21,7 @@ length, SHA-1 of the body, 8 reserved bytes) and a body. The plugin uses the
 JSON body format (format 1), so it needs no protobuf toolchain.
 
 Version 2 adds trading (`broker`), encrypted OpenD connections, pre/post-market
-bars, a disk cache of bars, and the Windows package that is the catalog entry.
+bars, a disk cache of bars, and the packages for Windows, macOS and Linux that are its catalog entries.
 
 <!-- id: REQ-MOOMOO-001 -->
 ## OpenD messages MUST be framed and checked exactly
@@ -107,13 +107,17 @@ implementations:
 `data.subscribe` gives the whole set of symbols to stream. The plugin subscribes
 new symbols to Basic quotes and 1-minute K-lines (2 quota units each). It sends
 one `data.quote` per push: the last price, the previous close, the forming
-minute bar and the day's bar. A dropped symbol is unsubscribed once it has been
+minute bar and the day's bar. A 1-minute K-line push moves the chart too, without
+waiting for the next Basic push: its close is the price, and the day's bar takes
+its high, low and close. It is sent only once a Basic quote has been seen for the
+symbol, so the previous close and the day's bar are known. A dropped symbol is unsubscribed once it has been
 held for 1 minute, since OpenD refuses an earlier cancel. After a reconnect the
 whole set is subscribed again.
 
 implementations:
   - plugins/moomoo/src/stream.rs:Subscriptions
   - plugins/moomoo/src/stream.rs:quote_of
+  - plugins/moomoo/src/stream.rs:Quotes.minute_quote
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-005.A1 -->
@@ -122,6 +126,8 @@ implementations:
 - A Basic push for `US:AAPL` gives `{"ticker":"US:AAPL","price":cur,"prevClose":lastClose,"day":[midnight,open,high,low,cur,volume]}`, together with the last 1-minute bar seen for it.
 <!-- id: REQ-MOOMOO-005.A3 -->
 - A push for a symbol not in the set is not sent to the app.
+<!-- id: REQ-MOOMOO-005.A4 -->
+- After a Basic push for `US:AAPL` (cur 200.5, high 202, low 197), a 1-minute K-line push (high 203, low 199, close 202.5) gives a `data.quote` with price 202.5, the Basic push's previous close, the day `[midnight, open, 203, 197, 202.5, volume]` and that minute bar. A K-line push before any Basic push for the symbol sends nothing.
 
 <!-- id: REQ-MOOMOO-006 -->
 ## `data.search` MUST find symbols by code or name
@@ -273,19 +279,22 @@ implementations:
 `build.ps1` (Windows) and `build.sh` (macOS, Linux) build the release program.
 They zip it with the manifest, whose entry and platforms are set for that
 system. They sign the zip with the release key (`npx tauri signer sign`) and
-write the catalog entry. The catalog gets the Windows package, as for the other
-broker plugins. A missing key stops the build before any catalog entry is
+write the catalog entry. The catalog gets one package per system: Windows, macOS
+and Linux. A missing key stops the build before any catalog entry is
 written.
 
 implementations:
   - plugins/moomoo/build.ps1
   - plugins/moomoo/build.sh
+  - plugins/moomoo/opentrader-plugin.json
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-011.A1 -->
 - `build.sh` without the key leaves the unsigned zip and says it was not signed. No catalog entry is written.
 <!-- id: REQ-MOOMOO-011.A2 -->
 - The zip's manifest names `opentrader-moomoo.exe` and `["windows"]` from `build.ps1`, and `opentrader-moomoo` and that system from `build.sh`.
+<!-- id: REQ-MOOMOO-011.A3 -->
+- The plugin's own manifest names `windows`, `macos` and `linux`: it runs on each of them, with OpenD on that computer or another one.
 
 <!-- id: REQ-MOOMOO-012 -->
 ## `opentrader-moomoo backfill` MUST fill the bar store with a list's whole history in one run

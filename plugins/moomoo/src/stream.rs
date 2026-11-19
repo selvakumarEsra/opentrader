@@ -120,10 +120,11 @@ pub async fn store_minute(store: &Store, cover: &std::sync::Mutex<MinuteCover>, 
         .await;
 }
 
-/// The forming 1-minute bar of each symbol, kept to send with its next price.
+/// The forming 1-minute bar and the last Basic quote of each symbol, kept to send with its next price.
 #[derive(Default)]
 pub struct Quotes {
     minute: HashMap<String, Bar>,
+    basic: HashMap<String, BasicQot>,
 }
 
 impl Quotes {
@@ -141,13 +142,36 @@ impl Quotes {
         (previous[0] < bar[0]).then_some((symbol, previous))
     }
 
-    /// A Basic push: one `data.quote` per wanted symbol in it.
-    pub fn basic_push(&self, s2c: &Value, subs: &Subscriptions, now: i64) -> Vec<Value> {
+    /// The `data.quote` of a K-line push, sent so the chart moves without waiting for the next Basic push: the
+    /// minute's close is the price, and the day's bar takes the minute's high, low and close. None until a Basic
+    /// quote was seen for the symbol (the previous close and the day's bar are not known before).
+    pub fn minute_quote(&self, symbol: &str, subs: &Subscriptions, now: i64) -> Option<Value> {
+        if !subs.wants(symbol) {
+            return None;
+        }
+        let (basic, minute) = (self.basic.get(symbol)?, self.minute.get(symbol)?);
+        let q = BasicQot {
+            high_price: basic.high_price.max(minute[2]),
+            low_price: if basic.low_price > 0.0 { basic.low_price.min(minute[3]) } else { minute[3] },
+            cur_price: minute[4],
+            update_timestamp: Some(now as f64),
+            ..basic.clone()
+        };
+        Some(quote_of(symbol, &q, Some(minute), now))
+    }
+
+    /// A Basic push: one `data.quote` per wanted symbol in it. Each quote is kept for the K-line pushes after it.
+    pub fn basic_push(&mut self, s2c: &Value, subs: &Subscriptions, now: i64) -> Vec<Value> {
         let list: Vec<BasicQot> = serde_json::from_value(s2c.get("basicQotList").cloned().unwrap_or(json!([]))).unwrap_or_default();
-        list.iter()
+        list.into_iter()
             .filter_map(|q| {
                 let symbol = symbol_of(&q.security)?;
-                subs.wants(&symbol).then(|| quote_of(&symbol, q, self.minute.get(&symbol), now))
+                if !subs.wants(&symbol) {
+                    return None;
+                }
+                let quote = quote_of(&symbol, &q, self.minute.get(&symbol), now);
+                self.basic.insert(symbol, q);
+                Some(quote)
             })
             .collect()
     }
@@ -246,5 +270,28 @@ mod tests {
         assert_eq!(q["day"], json!([midnight, 198.0, 202.0, 197.0, 200.5, 1_000_000.0]));
         let minute_start = bars::unix_of(Market::Us, "2025-05-09 10:00:00").unwrap() as f64;
         assert_eq!(q["minute"][0].as_f64(), Some(minute_start));
+    }
+
+    // REQ-MOOMOO-005.A4
+    #[tokio::test(start_paused = true)]
+    async fn a_minute_push_after_a_basic_one_moves_the_price() {
+        let mut subs = Subscriptions::default();
+        subs.set(s(&["US:AAPL"]), Instant::now());
+        let mut quotes = Quotes::default();
+        let now = bars::unix_of(Market::Us, "2025-05-09 10:00:30").unwrap();
+        let kl = |high: f64, low: f64, close: f64| json!({"klType":1,"rehabType":1,"security":{"market":11,"code":"AAPL"},
+            "klList":[{"time":"2025-05-09 10:01:00","isBlank":false,"openPrice":200,"highPrice":high,"lowPrice":low,"closePrice":close,"volume":"900"}]});
+        quotes.minute_push(&kl(201.0, 199.0, 200.5), now);
+        assert_eq!(quotes.minute_quote("US:AAPL", &subs, now), None);
+        let qot = json!({"security":{"market":11,"code":"AAPL"},"highPrice":202,"openPrice":198,"lowPrice":197,"curPrice":200.5,
+            "lastClosePrice":196,"volume":"1000000","updateTimestamp":now as f64});
+        quotes.basic_push(&json!({"basicQotList":[qot]}), &subs, now);
+        quotes.minute_push(&kl(203.0, 199.0, 202.5), now + 10);
+        let q = quotes.minute_quote("US:AAPL", &subs, now + 10).unwrap();
+        assert_eq!((q["price"].as_f64(), q["prevClose"].as_f64(), q["time"].as_i64()), (Some(202.5), Some(196.0), Some(now + 10)));
+        let midnight = bars::unix_of(Market::Us, "2025-05-09 00:00:00").unwrap();
+        assert_eq!(q["day"], json!([midnight, 198.0, 203.0, 197.0, 202.5, 1_000_000.0]));
+        assert_eq!(q["minute"][4].as_f64(), Some(202.5));
+        assert_eq!(quotes.minute_quote("US:MSFT", &subs, now + 10), None);
     }
 }
