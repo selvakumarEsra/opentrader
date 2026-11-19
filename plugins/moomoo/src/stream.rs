@@ -9,7 +9,7 @@ use crate::opend::proto::{self, BasicQot, KLine, Security};
 use crate::store::{Key, Store};
 use chrono::{TimeZone, Timelike};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -120,11 +120,41 @@ pub async fn store_minute(store: &Store, cover: &std::sync::Mutex<MinuteCover>, 
         .await;
 }
 
-/// The forming 1-minute bar and the last Basic quote of each symbol, kept to send with its next price.
+/// How many Basic and K-line pushes each symbol got since the last report: the push rate, for the log.
+#[derive(Default)]
+pub struct PushCount {
+    counts: BTreeMap<String, (u32, u32)>,
+}
+
+impl PushCount {
+    pub fn basic(&mut self, symbol: &str) {
+        self.counts.entry(symbol.to_string()).or_default().0 += 1;
+    }
+
+    pub fn minute(&mut self, symbol: &str) {
+        self.counts.entry(symbol.to_string()).or_default().1 += 1;
+    }
+
+    /// The log line of the counts so far, which start again from zero; None when there was no push.
+    pub fn report(&mut self) -> Option<String> {
+        if self.counts.is_empty() {
+            return None;
+        }
+        let parts: Vec<String> = std::mem::take(&mut self.counts)
+            .into_iter()
+            .map(|(symbol, (basic, minute))| format!("{symbol} {basic} basic, {minute} K-line"))
+            .collect();
+        Some(format!("[debug] pushes in the last minute: {}", parts.join("; ")))
+    }
+}
+
+/// The forming 1-minute bar and the last Basic quote of each symbol, kept to send with its next price, and the
+/// pushes counted for the log.
 #[derive(Default)]
 pub struct Quotes {
     minute: HashMap<String, Bar>,
     basic: HashMap<String, BasicQot>,
+    pub pushes: PushCount,
 }
 
 impl Quotes {
@@ -132,6 +162,7 @@ impl Quotes {
     /// When the push starts a newer bar, the one it replaces has closed: that one is returned, to be stored.
     pub fn minute_push(&mut self, s2c: &Value, now: i64) -> Option<(String, Bar)> {
         let symbol = s2c.get("security").and_then(|v| serde_json::from_value::<Security>(v.clone()).ok()).and_then(|s| symbol_of(&s))?;
+        self.pushes.minute(&symbol);
         let (market, _) = security_of(&symbol)?;
         let lines: Vec<KLine> = serde_json::from_value(s2c.get("klList").cloned().unwrap_or(json!([]))).unwrap_or_default();
         let last = lines.iter().rev().find(|k| !k.is_blank)?;
@@ -166,6 +197,7 @@ impl Quotes {
         list.into_iter()
             .filter_map(|q| {
                 let symbol = symbol_of(&q.security)?;
+                self.pushes.basic(&symbol);
                 if !subs.wants(&symbol) {
                     return None;
                 }
@@ -293,5 +325,19 @@ mod tests {
         assert_eq!(q["day"], json!([midnight, 198.0, 203.0, 197.0, 202.5, 1_000_000.0]));
         assert_eq!(q["minute"][4].as_f64(), Some(202.5));
         assert_eq!(quotes.minute_quote("US:MSFT", &subs, now + 10), None);
+    }
+
+    // REQ-MOOMOO-005.A5
+    #[test]
+    fn pushes_are_counted_per_symbol_for_the_log() {
+        let mut count = PushCount::default();
+        for _ in 0..3 {
+            count.basic("US:AAPL");
+        }
+        count.minute("US:AAPL");
+        count.minute("US:AAPL");
+        count.basic("HK:00700");
+        assert_eq!(count.report().as_deref(), Some("[debug] pushes in the last minute: HK:00700 1 basic, 0 K-line; US:AAPL 3 basic, 2 K-line"));
+        assert_eq!(count.report(), None);
     }
 }

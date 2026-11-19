@@ -110,7 +110,9 @@ one `data.quote` per push: the last price, the previous close, the forming
 minute bar and the day's bar. A 1-minute K-line push moves the chart too, without
 waiting for the next Basic push: its close is the price, and the day's bar takes
 its high, low and close. It is sent only once a Basic quote has been seen for the
-symbol, so the previous close and the day's bar are known. A dropped symbol is unsubscribed once it has been
+symbol, so the previous close and the day's bar are known. Once a minute the plugin
+writes to its log how many Basic and K-line pushes each symbol got in that minute,
+so the push rate of an account can be seen; a minute with no push writes nothing. A dropped symbol is unsubscribed once it has been
 held for 1 minute, since OpenD refuses an earlier cancel. After a reconnect the
 whole set is subscribed again.
 
@@ -118,6 +120,7 @@ implementations:
   - plugins/moomoo/src/stream.rs:Subscriptions
   - plugins/moomoo/src/stream.rs:quote_of
   - plugins/moomoo/src/stream.rs:Quotes.minute_quote
+  - plugins/moomoo/src/stream.rs:PushCount
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-005.A1 -->
@@ -128,6 +131,8 @@ implementations:
 - A push for a symbol not in the set is not sent to the app.
 <!-- id: REQ-MOOMOO-005.A4 -->
 - After a Basic push for `US:AAPL` (cur 200.5, high 202, low 197), a 1-minute K-line push (high 203, low 199, close 202.5) gives a `data.quote` with price 202.5, the Basic push's previous close, the day `[midnight, open, 203, 197, 202.5, volume]` and that minute bar. A K-line push before any Basic push for the symbol sends nothing.
+<!-- id: REQ-MOOMOO-005.A5 -->
+- After 3 Basic and 2 K-line pushes for `US:AAPL` and 1 Basic push for `HK:00700`, the minute's log line is `[debug] pushes in the last minute: HK:00700 1 basic, 0 K-line; US:AAPL 3 basic, 2 K-line`, and the next minute with no push writes no line.
 
 <!-- id: REQ-MOOMOO-006 -->
 ## `data.search` MUST find symbols by code or name

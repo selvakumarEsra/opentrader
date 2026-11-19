@@ -40,6 +40,8 @@ pub const ID: &str = "moomoo";
 const RELEASE_EVERY: Duration = Duration::from_secs(10);
 /// How often streamed bars are written to the store.
 const FLUSH_EVERY: Duration = Duration::from_secs(30);
+/// How often the pushes counted are written to the log.
+const COUNT_EVERY: Duration = Duration::from_secs(60);
 pub const DEFAULT_OPEND: &str = "127.0.0.1:11111";
 
 struct Plugin {
@@ -94,6 +96,7 @@ pub async fn run_session_with(addr: &str, plugin: &str, token: &str, opend: &str
     tokio::spawn(me.clone().pump(events));
     tokio::spawn(me.clone().release());
     tokio::spawn(me.clone().flush_often());
+    tokio::spawn(me.clone().count_often());
     me.broker.send_state().await;
     let broker = me.clone();
     tokio::spawn(async move { broker.broker.refresh_often().await });
@@ -332,6 +335,19 @@ impl Plugin {
             }
             if data.contains(ticker) {
                 self.out.notify("data.quote", q);
+            }
+        }
+    }
+
+    /// Once a minute, the pushes each symbol got in it, to the log (REQ-MOOMOO-005.A5).
+    async fn count_often(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(COUNT_EVERY);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let line = self.quotes.lock().unwrap_or_else(|e| e.into_inner()).pushes.report();
+            if let Some(line) = line {
+                println!("{line}");
             }
         }
     }
