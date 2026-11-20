@@ -27,7 +27,7 @@ import {
   setReplayTradingSave,
 } from "../replay";
 import { symbolSessions } from "../session";
-import { ALL_CAPABILITIES, type TradingCapabilities } from "./capabilities";
+import { ALL_CAPABILITIES, ANY_INSTRUMENT, type Instrument, type TradingCapabilities } from "./capabilities";
 import { DEFAULT_REPLAY_SETTINGS, ReplayAccount, type ReplayAccountSnapshot, type ReplaySettings } from "./replay-account";
 import type { OrderRequest, TradingEvent, TradingExecution, TradingOrder, TradingPosition, TradingQuote } from "./types";
 
@@ -49,6 +49,8 @@ export type SessionResult = {
 
 type SymbolMeta = {
   mintick: number;
+  /** Money a unit makes per price point (a future's multiplier). */
+  pointValue: number;
   timezone: string;
   currency: string | null;
   description: string;
@@ -92,6 +94,7 @@ export const replayBroker = createRoot(() => {
     void Promise.all([getTickerInfo(symbol).catch(() => null), symbolSessions(symbol).catch(() => null)]).then(([info, sess]) => {
       metas.set(symbol, {
         mintick: sess?.mintick ?? 0.01,
+        pointValue: sess?.pointValue ?? 1,
         timezone: sess?.timeZone ?? DEFAULT_SYMBOL.timezone,
         // Economic series have no currency: not tradable. An imported series
         // has none either but is a price series: traded in US dollars unless
@@ -145,7 +148,7 @@ export const replayBroker = createRoot(() => {
     const s = settingsOf(paneId);
     acc = new ReplayAccount(
       p.symbol,
-      { ...DEFAULT_SYMBOL, mintick: m.mintick, timezone: m.timezone, qtyStep: 0.01 },
+      { ...DEFAULT_SYMBOL, mintick: m.mintick, pointValue: m.pointValue, timezone: m.timezone, qtyStep: 0.01 },
       s,
       currencyOf(s, m),
       p.last,
@@ -263,6 +266,14 @@ export const replayBroker = createRoot(() => {
     tradability: () => tradabilityOf(activeId()),
     /** Paper trading takes every order type, brackets, partial closes and modifications. */
     capabilities: (): TradingCapabilities => ALL_CAPABILITIES,
+    /** The replayed symbol's point value (a future's multiplier); any quantity. */
+    instrument: (paneId?: number | null): Instrument => {
+      version();
+      const id = paneId ?? activeId();
+      const sym = id !== null ? panes.get(id)?.symbol : undefined;
+      const pv = sym ? meta(sym)?.pointValue : undefined;
+      return pv && pv !== 1 ? { ...ANY_INSTRUMENT, pointValue: pv } : ANY_INSTRUMENT;
+    },
     /** The focused chart's symbol. */
     symbol: (): string | null => {
       version();

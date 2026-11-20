@@ -69,6 +69,10 @@ export type OrderRequest = {
   stopPrice: number | null;
   takeProfit: number | null;
   stopLoss: number | null;
+  /** The values picked in the broker's own ticket fields (a product type); left out, the last ones picked. */
+  fields?: Record<string, string>;
+  /** The time in force picked (a broker duration id); left out, the last one picked or the broker's default. */
+  duration?: string;
 };
 
 /** Order notifications (toasts). `label`: "Market", "Limit", "Stop",

@@ -149,14 +149,21 @@ Return at most 50 matches; an empty query may return the most used symbols. `typ
 | `session` | Regular session in the usual datafeed grammar, for example `0930-1600` (Monday to Friday), `0930-1600:23456` (explicit days, 1 = Sunday), `1700-1700:23456` (overnight, opens the evening before), `24x7`, or several intervals `0900-1130,1230-1530`. |
 | `extended` | The whole traded day, when it is wider than `session`. |
 | `holidays` | Full-close days, `YYYYMMDD,YYYYMMDD`. |
+| `barOrigin` | Optional, `"HHMM"` in `timezone`. Send it when your intraday bars start on a clock grid that ignores the session opens, as a broker terminal's do: 5-minute bars at 01:00, 01:05… when trading opens at 01:01, 4-hour bars at 00:00, 04:00… of the server's day. Give the time of day the grid starts from (the server's midnight: `"1700"` in New York for a New York close server). The app then shows your bars as they are, builds the other sizes on that grid, and puts live minutes, alerts, the countdown and scripts' `time(tf)` on it too. Without it, bars start at the session opens (see `intervals`). |
 | `pricescale`, `minmov` | One tick is `minmov / pricescale`. For example, 100000 and 1 give 0.00001. |
+| `pointValue` | Optional, 1 when left out. The money one unit of quantity makes when the price moves by 1, in `currency`. A future counted in contracts gives its multiplier: 65 for an NSE NIFTY future, 50 for an E-mini S&P. Symbol info shows it, and scripts (`syminfo.pointvalue`), the strategy tester and Bar Replay trading compute profits with it. |
 | `intervals` | The resolutions served: minutes (`"1"`, `"5"`, `"60"`…), seconds (`"1S"`…), `"1D"`, `"1W"`, `"1M"`. Intraday bars start on the clock grid of their size in the symbol's time zone (a `"60"` bar starts on the hour). Other minute or second sizes are built by the app from a served size that divides them. Bars that start at the session open (09:30, 10:30…) are built from a served size that divides the time from midnight to the open; with none (only `"60"` for a 09:30 open), the bars keep the served grid (09:00, 10:00…) and the one the open falls in is stamped at the open. Weeks and months are built from days. The interval picker offers only these; another interval shows that it is not supported. |
+| `history` | Optional. How far back your source serves each family of bars, in calendar days: `{"second":3,"minute":30,"day":365}`, any of the three. The app then asks for nothing older (scrolling back stops there) and never more bars than fit in what it asks. Weeks and months follow `day`. Without it, the app asks as far back as the chart goes (30 years of days) and you answer what you have. |
+
+**Unknown symbols.** Answer a symbol you don't know (an expired contract, a renamed ticker) with the error code `-32004`. The app then stops asking for it and streaming it until the plugin connects again, and the watchlist shows it in red. Another error is taken as a failure of the moment.
 
 ### `data.bars` (app → plugin, request)
 
 `{"ticker":"EURUSD","resolution":"5","from":1730000000,"to":1730600000,"countBack":2000}` → `{"bars":[[1730000100,1.0812,1.0815,1.0809,1.0811,320],…]}`
 
-Return the bars whose start is in `[from, to]`, oldest first. When there are more than `countBack`, return the newest `countBack` of them. Return an empty list when there are none: the app reads that as the start of the history.
+Return the bars whose start is in `[from, to]`, oldest first. When there are more than `countBack`, return the newest `countBack` of them. You may return fewer, the newest ones: the app then asks for the older ones before the oldest bar you returned when the chart needs them. Return an empty list when there are none: the app reads that as the start of the history.
+
+The app keeps a symbol's recent bars a while, so the chart, the Details panel and the quote of one symbol share one request; after that, it asks only for the bars from the last one it has. When your source is busy (rate limited), answer with the error code `-32005`: the app asks again later, waiting longer each time (1 s, then up to 15 s).
 
 ### `data.subscribe` (app → plugin, notification)
 
@@ -193,11 +200,22 @@ The user connects the app to one broker plugin at a time from **Trade > Connect 
 2. the plugin's own symbols, when it is also a data plugin;
 3. `broker.resolveSymbol`.
 
-**Quantities** are in units: shares, currency units, contracts. A broker that counts lots converts. With a contract size of 100,000, 0.01 lot is 1,000 units.
+**Quantities** are in units: shares, currency units or contracts. A broker that counts lots converts. With a contract size of 100,000, 0.01 lot is 1,000 units. A broker that only takes whole lots says so in `broker.instrument`: the order ticket then steps and checks the quantity by the lot.
+
+The unit and the point value go together. A future can be counted either way, as long as orders, positions and point value agree:
+
+- in contracts, as charting platforms usually count futures: a NIFTY lot of 65 is 1, `pointValue` 65 (in `data.symbolInfo` or `broker.instrument`), `qtyStep` 1. The plugin multiplies by 65 when it sends an order to a broker that counts underlying units, and divides the positions, orders and fills it reports;
+- in underlying units: one lot is 65, `pointValue` 1, `qtyStep` 65.
+
+When `broker.instrument` gives no point value, the order ticket uses the symbol's (`data.symbolInfo`) for the plugin's own symbols.
+
+**Ticket fields.** A broker that needs a choice with each order that the app doesn't have (a product type: intraday, delivery, carry forward…) declares it in `capabilities.ticketFields`, or per ticker in `broker.instrument`. The order ticket shows each field as a selector and sends the values picked in `fields`; the chart's one-click orders send the last values picked. A modified order keeps the fields it was placed with, from `orders[].fields`.
+
+**Time in force.** A broker that lets the user pick how long an order stays working declares its durations in `capabilities.durations`, or per ticker in `broker.instrument`. The order ticket shows them in a selector (only those whose `orderTypes` include the ticket's order type) and sends the id picked in `duration`; the chart's one-click orders send the last one picked, else the default. A modified order keeps its duration, from `orders[].duration`. A broker that declares none receives no `duration` and keeps its own.
 
 ### `broker.state` (plugin → app, notification)
 
-The whole account. Send it once after `hello`, then whenever any part changes: an order, a fill, a position, the balance or the P&L. A few per second are fine.
+The whole account. Send it once after `hello`, then whenever any part changes: an order, a fill, a position, the balance, the P&L, and `connected` turning true or false. A few per second are fine. The app keeps the last one it got: a plugin that sends `connected: false` at start and nothing once it is logged in stays "not connected". The app also asks for it with `broker.getState` when the plugin connects and when the order ticket or the account manager opens.
 
 ```json
 {
@@ -209,7 +227,11 @@ The whole account. Send it once after `hello`, then whenever any part changes: a
                "values": [{ "label": "Leverage", "value": "1:30" }] },
   "positionMode": "hedging",
   "capabilities": { "orderTypes": ["market", "limit", "stop", "stopLimit"], "brackets": true,
-                    "positionBrackets": true, "partialClose": true, "modifyOrders": true },
+                    "positionBrackets": true, "partialClose": true, "modifyOrders": true,
+                    "ticketFields": [],
+                    "durations": [{ "id": "day", "label": "Day", "default": true },
+                                  { "id": "gtc", "label": "Good Till Cancel" },
+                                  { "id": "ioc", "label": "Immediate or Cancel", "orderTypes": ["market", "limit"] }] },
   "positions": [{ "id": "8812", "ticker": "EURUSD", "side": "buy", "qty": 1000, "avgPrice": 1.0811,
                   "last": 1.0823, "unrealizedPnl": 1.2, "takeProfit": 1.09, "stopLoss": null }],
   "orders": [{ "id": "8813", "ticker": "EURUSD", "side": "sell", "type": "limit", "qty": 1000,
@@ -226,7 +248,11 @@ The whole account. Send it once after `hello`, then whenever any part changes: a
 | `capabilities` | What the broker supports. The order ticket, the chart and the DOM offer only that: `orderTypes` are the ticket's order types; without `brackets` a new order has no take profit / stop loss; without `positionBrackets` there is no Protect position; without `partialClose` a position closes whole; without `modifyOrders` orders are not dragged or modified. A field left out is supported. |
 | `positionMode` | `netting` gives one position per symbol. `hedging` allows several, each closed on its own. A chart shows a hedging account's positions of a symbol as one net position. |
 | `orders[].status` | `placing`, `working`, `inactive`, `filled`, `cancelled` or `rejected`. Keep recent filled, cancelled and rejected orders for the account manager's filters. |
+| `capabilities.ticketFields` | The broker's own choices for each order, for example `[{"id":"product","label":"Product","options":[{"value":"MIS","label":"Intraday"},{"value":"CNC","label":"Delivery"}],"default":"MIS"}]`. `default` is the value picked at first (the first option when left out). Leave it out or empty when there are none. |
+| `capabilities.durations` | The times in force the broker takes: `id` goes with the order and comes back in `orders[].duration`, `label` is what the ticket shows (the id when left out), `orderTypes` the order types it applies to (all when left out), `default: true` marks the one picked at first (else the first that applies). Leave it out or empty to keep the broker's own. |
+| `orders[].duration` | The order's time in force, a `durations` id: shown in the account manager and sent back by `broker.modify`. |
 | `orders[].takeProfit`, `stopLoss` | The brackets an order opens its position with. |
+| `orders[].fields` | The ticket fields' values the order was placed with (`{"product":"CNC"}`): `broker.modify` sends them back. |
 | `positions[].takeProfit`, `stopLoss` | A position's brackets. |
 
 ### `broker.event` (plugin → app, notification)
@@ -251,9 +277,11 @@ An order notification, shown as a toast:
 
 | Method | Params | Result |
 |---|---|---|
+| `broker.getState` | `{}` | The whole account, as `broker.state` sends it. Optional: a plugin that answers `-32601` is only read from its `broker.state`. |
 | `broker.resolveSymbol` | `{"symbol":"NASDAQ:AAPL","ticker":"AAPL"}` | `{"ticker":"AAPL.US"}`, or `{"ticker":null}` when the broker doesn't trade it. |
+| `broker.instrument` | `{"ticker":"NIFTY25NOVFUT"}` | How the ticker trades, every field optional: `{"qtyMin":65,"qtyStep":65,"qtyMax":1800,"pointValue":1,"ticketFields":[…]}`. `qtyStep` is the lot in units; orders are whole multiples of it. `pointValue` is the money one unit makes when the price moves by 1 (a futures multiplier; 1 when left out): the ticket's risk sizing and tick value use it. `ticketFields` and `durations` replace the capabilities' for this ticker. Asked once per ticker and connection. Optional: a plugin that answers `-32601` trades any quantity with a point value of 1. |
 | `broker.selectAccount` | `{"account":"51234567"}` | `{}`. Then send the new account's `broker.state`. |
-| `broker.place` | `{"ticker","side","type","qty","limitPrice","stopPrice","takeProfit","stopLoss"}` | `{"orderId":"8813"}`. An error answer is shown as a rejected order with its message. |
+| `broker.place` | `{"ticker","side","type","qty","limitPrice","stopPrice","takeProfit","stopLoss","fields","duration"}` | `{"orderId":"8813"}`. An error answer is shown as a rejected order with its message. `fields` holds the ticket fields' values (`{"product":"CNC"}`), `{}` without any. `duration` is a `durations` id, left out when the broker declares none. |
 | `broker.modify` | the same as `broker.place`, plus `"orderId"` | `{}` |
 | `broker.cancel` | `{"orderId":"8813"}` | `{}` |
 | `broker.closePosition` | `{"positionId":"8812","qty":null}` | `{}`. `qty` null closes the whole position. |
@@ -263,4 +291,4 @@ There is also one notification, `broker.watchQuote` (app → plugin): `{"tickers
 
 Answer a request once the broker has accepted or refused it. Report what happens afterwards (fills, cancellations) through `broker.state` and `broker.event`.
 
-Errors use the JSON-RPC codes: `-32700` parse error, `-32601` unknown method, `-32602` bad parameters. Use `-32000` for anything else. The `message` is shown to the user.
+Errors use the JSON-RPC codes: `-32700` parse error, `-32601` unknown method, `-32602` bad parameters, `-32004` unknown symbol (`data.symbolInfo`) and `-32005` busy, try again later (`data.bars`). Use `-32000` for anything else. The `message` is shown to the user.

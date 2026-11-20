@@ -33,10 +33,10 @@ export type TicketDraft = {
   /** Offsets typed, in ticks ("" = at the base). */
   limitOffset?: string;
   stopOffset?: string;
-  /** Quantity typed in units or as a risk (money / % balance). */
-  qtyType?: "units" | "riskUsd" | "riskPct";
-  qtyEquiv?: "units" | "riskUsd" | "riskPct";
-  /** The risk typed (qtyType riskUsd / riskPct). */
+  /** Quantity typed in units, as the order's value (money / % balance) or as a risk (money / % balance). */
+  qtyType?: QtyFieldType;
+  qtyEquiv?: QtyFieldType;
+  /** The value typed when the quantity is not in units (qtyType money, balancePct, riskUsd, riskPct). */
   risk?: string;
   /** Exits typed as a price, ticks, % price, money or % balance. */
   tpType?: ExitFieldType;
@@ -49,6 +49,10 @@ export type TicketDraft = {
   /** Order preset to apply when the ticket opens (chart Buy / Sell buttons
    *  with an active preset). */
   applyPreset?: string;
+  /** The values picked in the broker's own ticket fields (field id → value). */
+  fields?: Record<string, string>;
+  /** The time in force picked (a broker duration id). */
+  duration?: string;
 };
 
 /** What the open order ticket offers the chart's project order line. */
@@ -64,6 +68,8 @@ export type TicketActions = {
   setType: (t: OrderType) => void;
   setQty: (qty: number) => void;
 };
+
+export type QtyFieldType = "units" | "money" | "balancePct" | "riskUsd" | "riskPct";
 
 export type ExitFieldType = "price" | "ticks" | "pricePct" | "cash" | "balancePct";
 
@@ -119,7 +125,7 @@ function parsePresets(raw: string): OrderPreset[] {
   return Array.isArray(v) ? v.filter((p): p is OrderPreset => !!p && typeof p.id === "string" && typeof p.title === "string" && typeof p.orderType === "string") : [];
 }
 
-type TicketPrefs = { qty: string; orderType: OrderType };
+type TicketPrefs = { qty: string; orderType: OrderType; fields?: Record<string, string>; duration?: string };
 const DEFAULT_PREFS: TicketPrefs = { qty: "1", orderType: "market" };
 
 /** Decimals of a price step (0.01 → 2). */
@@ -144,6 +150,17 @@ const [prefs, setPrefs] = createRoot(() =>
 export function ticketQty(): number {
   const q = Number(prefs().qty);
   return Number.isFinite(q) && q > 0 ? q : 1;
+}
+
+/** The broker ticket fields' last picked values (a product type): the next orders start from them, the chart's
+ *  one-click orders too. */
+export function ticketFieldPrefs(): Record<string, string> {
+  return prefs().fields ?? {};
+}
+
+/** The time in force last picked (#349): the next orders start from it when the broker takes it for their type. */
+export function ticketDurationPref(): string | undefined {
+  return prefs().duration;
 }
 
 /** The quantity of the next orders (chart Buy / Sell quantity calculator). */
@@ -226,6 +243,7 @@ export const tradingUi = createRoot(() => {
       stopLoss: "",
       editing: null,
       paneId: null,
+      fields: { ...p.fields },
     };
   };
 
@@ -251,7 +269,7 @@ export const tradingUi = createRoot(() => {
     setSent,
     /** Remember the ticket choices the next order starts from. */
     savePrefs(d: TicketDraft) {
-      setPrefs({ qty: d.qty, orderType: d.orderType });
+      setPrefs({ qty: d.qty, orderType: d.orderType, fields: { ...prefs().fields, ...d.fields }, duration: d.duration ?? prefs().duration });
     },
     /** A new order's draft (the ticket's starting values). */
     newDraft,

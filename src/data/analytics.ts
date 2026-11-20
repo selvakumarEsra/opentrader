@@ -1,7 +1,8 @@
 /*
  * Usage statistics (PostHog, US cloud): which features are used, by how many
- * installs (desktop) or visits (web), and from where, and the AI assistant's
- * conversations (src/data/assistant/telemetry.ts). No cookies, no account; one
+ * installs (desktop) or visits (web), and from where, the app's errors
+ * (src/data/error-reports.ts) and the AI assistant's conversations
+ * (src/data/assistant/telemetry.ts). No cookies, no account; one
  * random id per desktop install, one per browser tab session on the web. Users
  * can switch it off (Settings > Service > Privacy).
  *
@@ -13,10 +14,16 @@
  *
  * Off in development builds and when the build has no project key
  * (`VITE_POSTHOG_KEY`).
+ *
+ * A chart or widget embedded in another website (#339) sends one event when it
+ * loads, `embed_view`: which embed and the site's address, without the IP
+ * address (its visitors have no switch to turn it off) and nothing else.
  */
 import { createSignal } from "solid-js";
 import * as kv from "./kv";
 import { commands } from "../bindings";
+import { startErrorReports } from "./error-reports";
+import { embedConfig } from "../embed/config";
 
 const KEY = (import.meta.env.VITE_POSTHOG_KEY as string | undefined) ?? "";
 const WEB = import.meta.env.MODE === "web";
@@ -35,6 +42,8 @@ const MAX_QUEUE = 200;
 /** Event properties: values, or JSON for the assistant's conversation events (PostHog LLM analytics). */
 type Props = Record<string, unknown>;
 type Queued = { event: string; properties: Props; timestamp: string };
+
+const EMBED = embedConfig();
 
 const [enabled, setEnabledSignal] = createSignal(kv.getItem(ENABLED_KEY) !== "false");
 
@@ -95,6 +104,7 @@ let timer: number | undefined;
  *  privacy policy names, aside). */
 export function track(event: string, props: Props = {}): void {
   if (!analyticsAvailable() || !enabled()) return;
+  if (EMBED && event !== "embed_view") return;
   id ??= anonymousId();
   if (queue.length >= MAX_QUEUE) queue.shift();
   queue.push({
@@ -109,7 +119,7 @@ export function track(event: string, props: Props = {}): void {
       app_version: VERSION,
       os: os(),
       // The relay adds the IP address only when this is true.
-      ip_consent: !IP_DECLINED,
+      ip_consent: !IP_DECLINED && !EMBED,
     },
   });
   timer ??= window.setTimeout(flush, FLUSH_MS);
@@ -132,15 +142,34 @@ export function flush(): void {
   void fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body, keepalive: true }).catch(() => undefined);
 }
 
+/** The address (host name) of the site an embed is shown on, "" when unknown. */
+function embeddingSite(): string {
+  const origin = location.ancestorOrigins?.[0] ?? document.referrer;
+  try {
+    return origin ? new URL(origin).hostname : "";
+  } catch {
+    return "";
+  }
+}
+
 /** Start: the "app opened" event, and a last flush when the page hides.
  *  Desktop: `first_launch` when no settings of an earlier run were found (a
  *  new install, not an update), to compare installs with the web version's
  *  download link clicks. */
 export function initAnalytics(): void {
   if (!analyticsAvailable()) return;
+  if (EMBED) {
+    track("embed_view", { widget: EMBED.widget, site: embeddingSite() });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") flush();
+    });
+    return;
+  }
   const props: Props = { screen_width: Math.round(window.screen.width / 100) * 100 };
   if (!WEB) props.first_launch = kv.startedEmpty();
   track("app_opened", props);
+  // App errors (src/data/error-reports.ts), from now on through the same switch.
+  startErrorReports(track);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") flush();
   });

@@ -34,6 +34,7 @@ import { whenAlertLeader } from "./data/alert-backend";
 import { startScreenAlerts } from "./data/screen-alerts";
 import { AlertToasts, type AlertToastData } from "./window/alerts/AlertToast";
 import { UpdateRequiredBanner } from "./window/shell/UpdateRequiredBanner";
+import { NewBuildBanner } from "./window/shell/NewBuildBanner";
 import { loadTabTitleParts, saveTabTitleParts, type TabTitlePartState } from "./window/shell/tab-title";
 import { reopenLabel } from "./window/shell/closed-stack";
 import { initShellBus } from "./window/shell/shell-bus";
@@ -78,7 +79,14 @@ import { installKeyboardShortcuts } from "./window/shell/keyboard-shortcuts";
 import { installAppRequests } from "./window/shell/app-requests";
 import { installLayoutSources } from "./window/shell/layout-sources";
 import { ReplayToolbar } from "./window/replay/ReplayToolbar";
+import { embedConfig } from "./embed/config";
+import { chartLinkOf, type ChartLink } from "./data/chart-link";
+import { startDeepLinks, type OpenedLink } from "./data/deep-link";
+import { requestOpenPost } from "./data/community/notifications";
+import { installEmbedHost, openEmbedPopup, seedEmbedWatchlist } from "./embed/host";
+import { EmbedSidePanel } from "./embed/EmbedSidePanel";
 import { replayEnabled, replayToolbarShown, setReplaySessionStore, setReplayTabSource } from "./data/replay";
+import { setDiagnosticsHost } from "./data/diagnostics";
 import { ReplaySettingsDialog } from "./window/replay/ReplaySettingsDialog";
 import { ReplayEndDialog } from "./window/replay/ReplayEndDialog";
 import { OrderTicket } from "./window/trading/OrderTicket";
@@ -87,6 +95,9 @@ import { TradingToasts } from "./window/trading/TradingToasts";
 import { tradingUi } from "./data/trading/trading-ui";
 import { replayBroker } from "./data/trading/replay-broker";
 import { pluginBroker } from "./data/trading/plugin-broker";
+import { events } from "./bindings";
+import { refreshPluginSessions } from "./data/session/symbol-sessions";
+import { forgetUnknownSymbols } from "./data/unknown-symbols";
 import { createDrawingStore } from "./window/drawings/drawing-store";
 import { createChartBridge } from "./window/right-rail/community/chart-bridge";
 import { setChartBridge } from "./data/community/chart-share";
@@ -150,6 +161,7 @@ import {
   setOakPanelOpen,
   setSettingsDialogOpen,
   setSettingsDialogTab,
+  setActiveRailTab,
   setSymbolDialogOpen,
   setTemplateNameDialogOpen,
   settingsDialogOpen,
@@ -162,6 +174,8 @@ import {
 } from "./window/shell/app-dialogs";
 
 function App() {
+  // A chart embedded in another website (#338): its settings, or null.
+  const embed = embedConfig();
   // App theme, set before the charts are created (see app-theme.ts).
   const { theme, themeSetting, setThemeSetting, observeTheme } = createAppTheme();
 
@@ -396,6 +410,8 @@ function App() {
     moveDrawingToDisplayIndex,
   } = drawingStore;
   const chartEdits = createChartEdits(appTabs, undo, drawingStore);
+  // Settings > About > Copy diagnostic info and the get_diagnostics agent tool read the tabs and drawings.
+  setDiagnosticsHost({ tabs: appTabs, drawings: drawingStore });
   const {
     patchStudyInputs,
     addIndicator,
@@ -420,6 +436,17 @@ function App() {
   // in the main window; then from the main menu.
   const AppOnboarding = lazy(() => import("./window/shell/AppOnboarding").then((m) => ({ default: m.AppOnboarding })));
   onMount(() => { if (isTauri() && windowLabel === "main") openFirstStartOnboarding(); });
+
+  // A data plugin that connects again may describe its symbols otherwise (an update: #340's bar grid): each window
+  // reads their sessions again and reloads its charts when one changed.
+  onMount(() => {
+    if (!isTauri()) return;
+    const stop = events.pluginsChanged.listen(() => {
+      forgetUnknownSymbols();
+      void refreshPluginSessions().then((changed) => changed && emitAppEvent("chart-reload-data"));
+    });
+    onCleanup(() => void stop.then((f) => f()));
+  });
 
   // Synced folders of CSV files (#267): the main window keeps them in sync.
   onMount(() => {
@@ -460,6 +487,46 @@ function App() {
     emitAppEvent("chart-show-range", { from, to, replayAt: r.replayAt, done: r.onFramed });
   });
   onCleanup(() => tradeJournal.setNavigator(null));
+
+  // Chart links (#350): the symbol and interval of a link on every chart of the shown tab (the web version opened on
+  // `/chart/?symbol=…`, the reference site's way), or of a new tab (a link the desktop app opens, as the reference
+  // app does). A symbol not found is still shown (its chart says so); an interval the symbol has not is left out.
+  const showChartLink = (link: ChartLink, newTab: boolean) => {
+    void toFullSymbol(link.symbol)
+      .catch(() => link.symbol)
+      .then((full) => {
+        const iv = link.interval && symbolServesResolution(full, link.interval) ? link.interval : undefined;
+        batch(() => {
+          if (newTab || !activeTab().isChart) appTabs.newTab();
+          patchAllPanes({ symbol: full, ...(iv ? { interval: iv } : {}) });
+        });
+        broadcastLink("symbol", full);
+        if (iv) broadcastLink("interval", iv);
+      });
+  };
+  /** A link the app opens: a Community post (its panel) or a chart (a new tab). */
+  const openLink = (link: OpenedLink) => {
+    if ("chart" in link) return showChartLink(link.chart, true);
+    setActiveRailTab("community");
+    requestOpenPost(link.post, { openChart: true });
+  };
+  if (!embed && !isTauri()) {
+    const link = chartLinkOf(location.search);
+    if (link) showChartLink(link, false);
+  }
+  onMount(() => {
+    if (embed || !isTauri()) return;
+    let stop: (() => void) | null = null;
+    let gone = false;
+    void startDeepLinks(openLink).then(
+      (s) => (gone ? s() : (stop = s)),
+      (e) => console.warn("[deep-link] links not taken", e),
+    );
+    onCleanup(() => {
+      gone = true;
+      stop?.();
+    });
+  });
 
   // Symbol notes (#301): a note keeps the shown charts; a click on it puts them back, each chart framed on its span
   // once its data is in (the charts a larger template adds listen from their first frame).
@@ -633,7 +700,16 @@ function App() {
         }),
       onSelect: (rowId) => layouts.onManageLayoutsSelect(rowId),
     },
-    "take-a-snapshot": { onSelect: (rowId) => snapshotRows[rowId]?.() },
+    "take-a-snapshot": {
+      // An embedded chart has no community to share to.
+      build: embed
+        ? () => {
+            const def = HEADER_MENUS["take-a-snapshot"];
+            return { ...def, sections: def.sections.map((s) => ({ ...s, items: s.items.filter((i) => !i.id.includes("community")) })).filter((s) => s.items.length) };
+          }
+        : undefined,
+      onSelect: (rowId) => snapshotRows[rowId]?.(),
+    },
     // A favourite row adds that study to the focused pane (one more instance when it is already on the chart).
     "show-favorite-indicators": { build: buildFavoriteIndicatorsMenu, onSelect: (rowId) => addIndicator(rowId) },
     "indicator-templates": {
@@ -698,10 +774,27 @@ function App() {
     // OS notification, webhook POST) and race the shared kv fire log. The
     // backend names the window that runs it (another one takes over when it
     // is closed). The other windows still read the store for their alert UI.
-    whenAlertLeader(windowLabel, () => {
-      startAlertEngine(windowLabel);
-      startScreenAlerts();
-    });
+    // An embedded chart keeps no alerts (#338).
+    if (!embed)
+      whenAlertLeader(windowLabel, () => {
+        startAlertEngine(windowLabel);
+        startScreenAlerts();
+      });
+    if (embed) {
+      seedEmbedWatchlist(embed);
+      onCleanup(
+        installEmbedHost(embed, {
+          symbol,
+          interval,
+          charts: () => activeTab().panes.map((p) => ({ symbol: p.symbol, interval: p.interval })),
+          setSymbol,
+          setChartSymbols: (list) => patchActive({ panes: activeTab().panes.map((p, i) => (list[i] && list[i] !== p.symbol ? { ...p, symbol: list[i] } : p)) }),
+          setInterval,
+          setChartType,
+          setTheme: setThemeSetting,
+        }),
+      );
+    }
     let toastSeq = 0;
     const offFire = onAlertFire((f) => {
       setAlertToasts((list) => [...list, { id: `${f.time}-${++toastSeq}`, alertId: f.alertId, symbol: f.symbol, message: f.message, time: f.time, sound: f.sound }]);
@@ -711,6 +804,7 @@ function App() {
 
   return (
     <div class="flex h-full w-full flex-col">
+      <Show when={!embed}>
       <div class="tab-bar" data-tauri-drag-region>
         <TabPanel
           tabs={tabs()}
@@ -723,6 +817,7 @@ function App() {
           onCloseOthers={appTabs.closeOthers}
           onCloseToRight={appTabs.closeToRight}
           onCopySymbol={appTabs.copyTabSymbol}
+          onCopyLink={appTabs.copyTabLink}
           onDetach={appTabs.detachTab}
           onDropOnWindow={appTabs.dropTabOnWindow}
           onReload={appTabs.reloadTab}
@@ -742,9 +837,11 @@ function App() {
           onReopen={() => void appTabs.reopenClosed()}
           themeSetting={themeSetting()}
           onThemeChange={setThemeSetting}
+          onOpenLink={openLink}
         />
         <WindowControls />
       </div>
+      </Show>
       {/* Main layout (header toolbar + chart area) | screener split view.
           The split view takes its width from the right; in its fullscreen
           mode the main layout is hidden (kept mounted). The panels keep their
@@ -759,7 +856,17 @@ function App() {
           display: screenerPanel.open() && screenerPanel.placement() === "right" && screenerPanel.fullscreen() ? "none" : undefined,
         }}
       >
+      <Show when={!embed?.hideTopToolbar}>
       <HeaderToolbar
+        embed={
+          embed
+            ? {
+                symbolSearch: embed.allowSymbolChange,
+                snapshot: !embed.hideSnapshotButton,
+                onPopup: embed.popupButton ? () => openEmbedPopup(embed, activeFullSymbol() ?? symbol(), interval()) : undefined,
+              }
+            : undefined
+        }
         symbol={tickerOf(symbol())}
         interval={interval()}
         chartType={chartType()}
@@ -795,6 +902,7 @@ function App() {
         redoLabel={undo.redoLabel()}
         onCompare={() => setCompareDialogOpen(true)}
       />
+      </Show>
       {/* chart-area — flex row: drawing toolbar | chart-pane | right rail.
           Mirrors the mock's `.chart-area` (App.tsx) so the right rail spans
           the full height and the bottom bar lives inside the chart-pane. */}
@@ -937,6 +1045,7 @@ function App() {
           <Show when={replayToolbarShown()}>
             <ReplayToolbar />
           </Show>
+          <Show when={!embed || embed.dateRanges}>
           <BottomBar
             interval={interval()}
             setInterval={setInterval}
@@ -948,6 +1057,7 @@ function App() {
             maximized={maximized()}
             onToggleMaximize={toggleMaximize}
           />
+          </Show>
           {/* Strategy Tester: the reference app's footer report, shown while the
               active chart holds a strategy. */}
           <StrategyTesterPanel
@@ -979,6 +1089,22 @@ function App() {
         <Show when={replayEnabled() || !!pluginBroker.status()?.active}>
           <OrderTicket />
         </Show>
+        <Show
+          when={!embed}
+          fallback={
+            <Show when={embed && (embed.watchlist.length > 0 || embed.movers || embed.details)}>
+              <EmbedSidePanel
+                watchlist={!!embed?.watchlist.length}
+                movers={!!embed?.movers}
+                details={!!embed?.details}
+                activeSymbol={activeFullSymbol() ?? symbol()}
+                interval={interval()}
+                onSymbolSelect={onSymbolPicked}
+                onAddCompare={addCompareFromList}
+              />
+            </Show>
+          }
+        >
         <RightRail
           activeTab={activeRailTab()}
           setActiveTab={onRailTabSelect}
@@ -1004,6 +1130,7 @@ function App() {
           collapsedTab={(id) => (id === "screener-dialog-button" && screenerPanel.collapsed()) || (id === "assistant-button" && assistantPanel.collapsed())}
           onOpenAlertSettings={() => setAppSettingsTab("alerts")}
         />
+        </Show>
       </div>
       </div>
       <Show when={screenerPanel.open() && screenerPanel.placement() === "right"}>
@@ -1146,6 +1273,7 @@ function App() {
       {/* Settings → Alerts → "Automatically hide toasts" (focused pane, default
           on): off keeps a popup until it is closed. */}
       <UpdateRequiredBanner />
+      <NewBuildBanner />
       <AlertToasts
         toasts={alertToasts()}
         autoHide={appearanceFrom(activePaneState().settings).autoHideToasts ?? true}

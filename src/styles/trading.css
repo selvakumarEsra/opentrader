@@ -1727,3 +1727,41 @@ html.theme-light {
     transform: rotate(360deg);
   }
 }
+
+/* A field picked from a list (the time in force, the broker's own fields, #346 / #349): the value in a box with a
+   caret at its end, as the reference's read-only select. */
+.trd-tk-select {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  cursor: pointer;
+  text-align: start;
+}
+.trd-tk-select.is-open {
+  border-color: var(--trd-buy);
+}
+.trd-tk-select:disabled {
+  cursor: default;
+  color: var(--color-text-secondary);
+}
+.trd-tk-select-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trd-tk-select svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--color-text-secondary);
+}
+/* Extra settings: its fields 16 px apart (reference). */
+.trd-tk-extra {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 4px 0 8px;
+}

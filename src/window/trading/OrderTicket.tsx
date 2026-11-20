@@ -34,8 +34,8 @@ import type { OrderType } from "../../data/trading/types";
 import { fmtPrice, tickerOf } from "./format";
 import { describeTicket } from "./ticket";
 import { createTicketModel } from "./ticket-model";
-import { ExitInput, PriceInput, QtyInput } from "./TicketFields";
-import { ExitsSection, FieldTip, TicketSettingsMenu } from "./TicketSettingsMenu";
+import { BrokerFieldInput, DurationInput, ExitInput, PriceInput, QtyInput } from "./TicketFields";
+import { FieldTip, TicketSection, TicketSettingsMenu } from "./TicketSettingsMenu";
 import { CloseIcon } from "./icons";
 import { FavoritePresets, OrderPresetsButton } from "./OrderPresets";
 import { DomPanel } from "./DomPanel";
@@ -316,7 +316,7 @@ function TicketBody(props: { floating: boolean }) {
             <div class="trd-tk-row">
               <span>Tick value</span>
               <span class="trd-tk-row-value">
-                {((qtyNum() ?? 0) * tick()).toFixed(dec())}
+                {((qtyNum() ?? 0) * tick() * m.inst().pointValue).toFixed(dec())}
                 <small> {ccy()}</small>
               </span>
             </div>
@@ -326,7 +326,7 @@ function TicketBody(props: { floating: boolean }) {
 
           {/* An order's take profit / stop loss need a broker that takes brackets; the position's are Protect position. */}
           <Show when={isPos() || m.caps().brackets}>
-            <ExitsSection>
+            <TicketSection title="Exits">
               <ExitInput m={m} kind="tp" />
               <ExitInput m={m} kind="sl" />
               <Show when={rr()}>
@@ -337,7 +337,17 @@ function TicketBody(props: { floating: boolean }) {
                   </div>
                 )}
               </Show>
-            </ExitsSection>
+            </TicketSection>
+          </Show>
+          {/* The time in force and the broker's own choices (a product type), after the exits as in the reference; an
+              order being modified keeps its own. */}
+          <Show when={!d().editing && (m.durations().length > 0 || m.inst().fields.length > 0)}>
+            <TicketSection title="Extra settings">
+              <div class="trd-tk-extra">
+                <DurationInput m={m} />
+                <For each={m.inst().fields}>{(f) => <BrokerFieldInput m={m} field={f} />}</For>
+              </div>
+            </TicketSection>
           </Show>
           <Show when={editingPos()}>
             {(pos) => (
@@ -352,7 +362,7 @@ function TicketBody(props: { floating: boolean }) {
                 <div class="trd-tk-row">
                   <span>Tick value</span>
                   <span class="trd-tk-row-value">
-                    {(pos().qty * tick()).toFixed(dec())}
+                    {(pos().qty * tick() * m.inst().pointValue).toFixed(dec())}
                     <small> {ccy()}</small>
                   </span>
                 </div>

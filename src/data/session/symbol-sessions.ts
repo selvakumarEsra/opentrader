@@ -14,7 +14,9 @@ import { createSignal } from "solid-js";
 import { commands, type SymbolSession } from "../../bindings";
 import { splitSymbol } from "../symbol-name";
 import { SessionSpec } from "./spec";
+import { localDay, localToUtc } from "./zone";
 import { isLocalSymbol, localSession } from "../local-series";
+import { isUnknownSymbol, noteSymbolError } from "../unknown-symbols";
 
 /** Bottom-bar session choice: regular hours or the extended (whole traded)
  *  day. */
@@ -30,6 +32,8 @@ export interface ScriptSession {
   session: string;
   corrections: string;
   holidays: string;
+  /** The bars' clock grid (SymbolSessions.barOrigin): scripts' intraday periods follow it. */
+  barOrigin: number | null;
 }
 
 /** A symbol's schedules, parsed. */
@@ -51,6 +55,9 @@ export class SymbolSessions {
   /** Tick at the current price (minmov / pricescale): script
    *  `syminfo.mintick`, backtest fill rounding. */
   readonly mintick: number;
+  /** Money one unit of quantity makes per price point (script `syminfo.pointvalue`, backtest and replay P&L, Symbol
+   *  info): a future counted in contracts gives its multiplier; 1 when the source gives none. */
+  readonly pointValue: number;
   /** The two terms of the tick (script `syminfo.minmove` / `syminfo.pricescale`). */
   readonly minmove: number;
   readonly pricescale: number;
@@ -60,6 +67,12 @@ export class SymbolSessions {
   /** Interval ids served by the symbol's data plugin; empty for the provider's
    *  symbols (its capabilities say what it serves). */
   readonly intervals: readonly string[];
+  /** Minutes after local midnight where the source's intraday bars of every size start their clock grid (a data
+   *  plugin whose bars ignore the session opens, like a broker terminal's: 5-minute bars at 01:00 when trading opens
+   *  at 01:01); null when bars start at the session opens. */
+  readonly barOrigin: number | null;
+  /** `barGridStart` when the bars are on the source's clock grid (barOrigin), for the code that steps through bars. */
+  readonly barGrid: ((sec: number, stepSecs: number) => number) | undefined;
 
   constructor(info: SymbolSession) {
     const tz = info.timezone;
@@ -69,14 +82,19 @@ export class SymbolSessions {
     const pre = sub("premarket");
     const post = sub("postmarket");
     this.timeZone = tz;
-    this.regularScript = { session: info.session, corrections: info.corrections, holidays: info.holidays };
-    this.extendedScript = ext ? { session: ext.session, corrections: ext.corrections, holidays: info.holidays } : this.regularScript;
+    this.barOrigin = info.barOrigin ?? null;
+    this.barGrid = this.barOrigin === null ? undefined : (sec, stepSecs) => this.barGridStart(sec, stepSecs);
+    this.regularScript = { session: info.session, corrections: info.corrections, holidays: info.holidays, barOrigin: this.barOrigin };
+    this.extendedScript = ext
+      ? { session: ext.session, corrections: ext.corrections, holidays: info.holidays, barOrigin: this.barOrigin }
+      : this.regularScript;
     this.regular = spec(info.session, info.corrections);
     this.extended = ext ? spec(ext.session, ext.corrections) : this.regular;
     this.premarket = pre ? spec(pre.session, pre.corrections) : null;
     this.postmarket = post ? spec(post.session, post.corrections) : null;
     this.hasExtendedHours = ext !== undefined && ext.session !== info.session;
     this.mintick = info.minmov / info.pricescale;
+    this.pointValue = info.pointValue != null && Number.isFinite(info.pointValue) && info.pointValue > 0 ? info.pointValue : 1;
     this.minmove = info.minmov;
     this.pricescale = info.pricescale;
     const v = info.variableTickSize.trim().split(/\s+/).filter(Boolean).map(Number);
@@ -105,6 +123,16 @@ export class SymbolSessions {
    *  moves (a 0.5 change of a 123.45 US stock is 0.50, not the 0.5000 of a price under 1). */
   decimalsAt(price: number): number {
     return tickDecimals(this.tickAt(price));
+  }
+
+  /** Start of the `stepSecs` bar of the clock grid (`barOrigin`, else midnight) that holds `sec`; each local day
+   *  restarts the grid. */
+  barGridStart(sec: number, stepSecs: number): number {
+    const origin = this.barOrigin ?? 0;
+    const day = localDay(this.timeZone, sec);
+    let anchor = localToUtc(this.timeZone, day, origin);
+    if (anchor > sec) anchor = localToUtc(this.timeZone, day - 1, origin);
+    return anchor + Math.floor((sec - anchor) / stepSecs) * stepSecs;
   }
 
   /** Schedule of the bottom-bar session choice. */
@@ -139,6 +167,8 @@ function tickDecimals(tick: number): number {
 }
 
 const resolved = new Map<string, SymbolSessions>();
+/** What each data plugin symbol's session was read from, to tell when its plugin answers otherwise. */
+const pluginInfos = new Map<string, string>();
 const pending = new Map<string, Promise<SymbolSessions>>();
 const [version, setVersion] = createSignal(0);
 
@@ -166,9 +196,13 @@ export function symbolSessions(symbol: string): Promise<SymbolSessions> {
       ? localSession(key).then((data) => ({ status: "ok" as const, data }))
       : commands.getSymbolSession(`${exchange}:${ticker}`);
     p = info.then((r) => {
-      if (r.status === "error") throw new Error(r.error);
+      if (r.status === "error") {
+        noteSymbolError(key, r.error);
+        throw new Error(r.error);
+      }
       const s = new SymbolSessions(r.data);
       resolved.set(key, s);
+      if (s.intervals.length) pluginInfos.set(key, JSON.stringify(r.data));
       setVersion((v) => v + 1);
       return s;
     });
@@ -181,6 +215,25 @@ export function symbolSessions(symbol: string): Promise<SymbolSessions> {
 /** Resolve `symbol`'s sessions again on next use (a re-imported series). */
 export function forgetSymbolSessions(symbol: string): void {
   resolved.delete(keyOf(symbol).key);
+  pluginInfos.delete(keyOf(symbol).key);
+}
+
+/** Ask the data plugins' symbols already resolved for their sessions again (a plugin connected, maybe as another
+ *  version: #340's bar grid came with an update) and keep the new answers. True when one changed: the charts must
+ *  load their bars again. A plugin that does not answer (disconnected) keeps what it said. */
+export async function refreshPluginSessions(): Promise<boolean> {
+  let changed = false;
+  await Promise.all(
+    [...pluginInfos].map(async ([key, before]) => {
+      const r = await commands.getSymbolSession(key).catch(() => null);
+      if (r?.status !== "ok" || JSON.stringify(r.data) === before) return;
+      resolved.set(key, new SymbolSessions(r.data));
+      pluginInfos.set(key, JSON.stringify(r.data));
+      changed = true;
+    }),
+  );
+  if (changed) setVersion((v) => v + 1);
+  return changed;
 }
 
 /** Sessions of `symbol` when already resolved, else null (and the resolve is
@@ -188,9 +241,11 @@ export function forgetSymbolSessions(symbol: string): void {
 export function cachedSymbolSessions(symbol: string): SymbolSessions | null {
   version();
   if (!symbol) return null;
-  const done = resolved.get(keyOf(symbol).key);
+  const { key } = keyOf(symbol);
+  const done = resolved.get(key);
   if (done) return done;
-  void symbolSessions(symbol).catch(() => undefined);
+  // A symbol that doesn't exist is not asked for at every look.
+  if (!isUnknownSymbol(key)) void symbolSessions(symbol).catch(() => undefined);
   return null;
 }
 

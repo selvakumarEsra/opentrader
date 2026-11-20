@@ -141,6 +141,8 @@ export function AccountManager(props: { onSymbol: (symbol: string) => void; heig
   const [page, setPage] = createSignal<Page>("positions");
   const [exporting, setExporting] = createSignal(false);
   const [filter, setFilter] = createSignal<Filter>("all");
+  // The account as it is now, not as the plugin last sent it.
+  pluginBroker.refresh();
   const st = () => pluginBroker.account();
   const show = (ticker: string) => {
     const s = pluginBroker.chartSymbolFor(ticker);
@@ -431,7 +433,13 @@ const ORDER_COLUMNS: Column<BrokerOrder>[] = [
     ),
     value: (o) => statusTitle(o.status),
   },
-  { id: "duration", hidden: true, title: () => translate("Duration"), cell: (o) => <span data-no-translate>{o.duration ?? ""}</span>, value: (o) => o.duration },
+  {
+    id: "duration",
+    hidden: true,
+    title: () => translate("Duration"),
+    cell: (o) => <span data-no-translate>{pluginBroker.durationLabel(o.ticker, o.duration)}</span>,
+    value: (o) => pluginBroker.durationLabel(o.ticker, o.duration),
+  },
   { id: "updated", title: () => translate("Last update time"), cell: (o) => <Num text={fmtTime(o.updatedMs)} />, value: (o) => timeText(o.updatedMs) },
   { id: "id", num: true, title: () => translate("Order ID"), cell: (o) => <span data-no-translate>{o.id}</span>, value: (o) => o.id },
 ];

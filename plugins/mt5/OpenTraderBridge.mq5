@@ -24,7 +24,7 @@
 input string InpConnectionFile = "OpenTrader\\mt5.json"; // Connection file (terminals' common folder)
 
 #define API_VERSION 1
-#define PLUGIN_VERSION "0.1.0"
+#define PLUGIN_VERSION "0.1.3"
 #define RECONNECT_MS 3000
 #define MAX_BARS 50000
 
@@ -421,7 +421,7 @@ void OnMessage(const string line)
    string error = "";
    string result = Handle(method, params, error);
    if(error != "")
-      ReplyError(id, result == "unknown" ? -32601 : -32000, error);
+      ReplyError(id, result == "unknown" ? -32601 : result == "unknownSymbol" ? -32004 : -32000, error);
    else
       Reply(id, result);
    delete m;
@@ -476,6 +476,10 @@ string Handle(const string method, CJ *p, string &error)
       return DataBars(p, error);
    if(method == "broker.resolveSymbol")
       return BrokerResolve(p);
+   if(method == "broker.getState")
+      return BrokerState();
+   if(method == "broker.instrument")
+      return BrokerInstrument(p, error);
    if(method == "broker.selectAccount")
      {
       error = "MetaTrader 5 trades the account the terminal is logged in to: switch accounts in the terminal";
@@ -628,8 +632,9 @@ string DataSymbolInfo(CJ *p, string &error)
    string t = JStr(p, "ticker");
    if(!SymbolSelect(t, true))
      {
+      // The app stops asking for it (an expired contract in a watchlist).
       error = "Unknown symbol " + t;
-      return "";
+      return "unknownSymbol";
      }
    int digits = (int)SymbolInfoInteger(t, SYMBOL_DIGITS);
    double point = SymbolInfoDouble(t, SYMBOL_POINT);
@@ -639,11 +644,14 @@ string DataSymbolInfo(CJ *p, string &error)
    int shift;
    string zone = Zone(shift);
    string currency = SymbolInfoString(t, SYMBOL_CURRENCY_PROFIT);
+   // MetaTrader's bars start on the server clock, whatever the trading hours (5 minutes at 01:00 when trading opens
+   // at 01:01): their grid starts at the server's midnight, in the zone's time.
    return "{\"description\":" + JQ(SymbolInfoString(t, SYMBOL_DESCRIPTION)) +
           ",\"type\":" + JQ(KindOf(t)) +
           ",\"currency\":" + JQ(currency) +
           ",\"timezone\":" + JQ(zone) +
           ",\"session\":" + JQ(SessionSpec(t, shift)) +
+          ",\"barOrigin\":" + JQ(Hhmm(-shift / 60)) +
           ",\"pricescale\":" + IntegerToString(pricescale) +
           ",\"minmov\":" + IntegerToString(minmov) +
           ",\"intervals\":[\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"10\",\"12\",\"15\",\"20\",\"30\",\"60\",\"120\",\"180\",\"240\",\"360\",\"480\",\"720\",\"1D\"]}";
@@ -807,6 +815,72 @@ double Lots(const string t, const double units, string &error)
       return 0;
      }
    return NormalizeDouble(lots, 8);
+  }
+
+//--- The times in force a symbol takes (its expiration modes): until cancelled (the default) and today, for pending
+//--- orders only. A market order fills at once.
+string Durations(const string t)
+  {
+   long modes = SymbolInfoInteger(t, SYMBOL_EXPIRATION_MODE);
+   string pending = ",\"orderTypes\":[\"limit\",\"stop\",\"stopLimit\"]";
+   string out = "";
+   if((modes & SYMBOL_EXPIRATION_GTC) != 0)
+      out += "{\"id\":\"gtc\",\"label\":\"Good Till Cancel\",\"default\":true" + pending + "}";
+   if((modes & SYMBOL_EXPIRATION_DAY) != 0)
+      out += (out == "" ? "" : ",") + "{\"id\":\"day\",\"label\":\"Day\"" + pending + "}";
+   return out;
+  }
+
+//--- The expiration of a pending order: the duration picked, else until cancelled when the symbol takes it, else today.
+ENUM_ORDER_TYPE_TIME Life(CJ *p, const string t)
+  {
+   string d = JStr(p, "duration");
+   if(d == "day")
+      return ORDER_TIME_DAY;
+   if(d == "gtc")
+      return ORDER_TIME_GTC;
+   return (SymbolInfoInteger(t, SYMBOL_EXPIRATION_MODE) & SYMBOL_EXPIRATION_GTC) != 0 ? ORDER_TIME_GTC : ORDER_TIME_DAY;
+  }
+
+//--- How a symbol trades (broker.instrument): its volumes in units (lots × contract size), so the order ticket steps
+//--- and checks by the volume step, and the money one unit makes per price point (the ticket's risk and tick value).
+string BrokerInstrument(CJ *p, string &error)
+  {
+   string t = JStr(p, "ticker");
+   if(!SymbolSelect(t, true))
+     {
+      error = "Unknown symbol " + t;
+      return "unknownSymbol";
+     }
+   double size = ContractSize(t);
+   double step = SymbolInfoDouble(t, SYMBOL_VOLUME_STEP);
+   double min = SymbolInfoDouble(t, SYMBOL_VOLUME_MIN);
+   double max = SymbolInfoDouble(t, SYMBOL_VOLUME_MAX);
+   // The profit the terminal books for one lot over 100 ticks, in the account currency: the tick value property can
+   // be stale or in another unit for metals and indices.
+   double tickSize = SymbolInfoDouble(t, SYMBOL_TRADE_TICK_SIZE);
+   double price = SymbolInfoDouble(t, SYMBOL_ASK);
+   double pointValue = 0, profit = 0;
+   if(tickSize > 0 && price > 0 && OrderCalcProfit(ORDER_TYPE_BUY, t, 1.0, price, price + 100 * tickSize, profit) && profit > 0)
+      pointValue = profit / (100 * tickSize) / size;
+   else
+      if(tickSize > 0)
+         pointValue = SymbolInfoDouble(t, SYMBOL_TRADE_TICK_VALUE) / tickSize / size;
+   string out = "{";
+   if(step > 0)
+      out += "\"qtyStep\":" + JN(step * size, 8) + ",";
+   if(min > 0)
+      out += "\"qtyMin\":" + JN(min * size, 8) + ",";
+   if(max > 0)
+      out += "\"qtyMax\":" + JN(max * size, 8) + ",";
+   if(pointValue > 0)
+      out += "\"pointValue\":" + JN(pointValue, 10) + ",";
+   string durations = Durations(t);
+   if(durations != "")
+      out += "\"durations\":[" + durations + "],";
+   if(StringLen(out) > 1)
+      out = StringSubstr(out, 0, StringLen(out) - 1);
+   return out + "}";
   }
 
 string Side(const bool buy) { return buy ? "\"buy\"" : "\"sell\""; }
@@ -1029,17 +1103,18 @@ string BrokerPlace(CJ *p, string &error)
    string type = JStr(p, "type");
    double limit = Price(p, "limitPrice"), stop = Price(p, "stopPrice"), tp = Price(p, "takeProfit"), sl = Price(p, "stopLoss");
    bool ok = false;
+   ENUM_ORDER_TYPE_TIME life = Life(p, t);
    if(type == "market")
       ok = buy ? g_trade.Buy(lots, t, 0, sl, tp, "OpenTrader") : g_trade.Sell(lots, t, 0, sl, tp, "OpenTrader");
    else
       if(type == "limit")
-         ok = buy ? g_trade.BuyLimit(lots, limit, t, sl, tp, ORDER_TIME_GTC, 0, "OpenTrader") : g_trade.SellLimit(lots, limit, t, sl, tp, ORDER_TIME_GTC, 0, "OpenTrader");
+         ok = buy ? g_trade.BuyLimit(lots, limit, t, sl, tp, life, 0, "OpenTrader") : g_trade.SellLimit(lots, limit, t, sl, tp, life, 0, "OpenTrader");
       else
          if(type == "stop")
-            ok = buy ? g_trade.BuyStop(lots, stop, t, sl, tp, ORDER_TIME_GTC, 0, "OpenTrader") : g_trade.SellStop(lots, stop, t, sl, tp, ORDER_TIME_GTC, 0, "OpenTrader");
+            ok = buy ? g_trade.BuyStop(lots, stop, t, sl, tp, life, 0, "OpenTrader") : g_trade.SellStop(lots, stop, t, sl, tp, life, 0, "OpenTrader");
          else
             if(type == "stopLimit")
-               ok = g_trade.OrderOpen(t, buy ? ORDER_TYPE_BUY_STOP_LIMIT : ORDER_TYPE_SELL_STOP_LIMIT, lots, limit, stop, sl, tp, ORDER_TIME_GTC, 0, "OpenTrader");
+               ok = g_trade.OrderOpen(t, buy ? ORDER_TYPE_BUY_STOP_LIMIT : ORDER_TYPE_SELL_STOP_LIMIT, lots, limit, stop, sl, tp, life, 0, "OpenTrader");
    error = Outcome();
    if(!ok && error == "")
       error = "The order was not sent (" + IntegerToString(GetLastError()) + ")";
@@ -1071,8 +1146,9 @@ string BrokerModify(CJ *p, string &error)
    string kind = OrderTypeOf((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE));
    double price = kind == "limit" ? Price(p, "limitPrice") : Price(p, "stopPrice");
    double stoplimit = kind == "stopLimit" ? Price(p, "limitPrice") : 0;
-   bool ok = g_trade.OrderModify(ticket, price, Price(p, "stopLoss"), Price(p, "takeProfit"), (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME),
-                                 (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION), stoplimit);
+   // The duration picked; without one the order keeps its own.
+   ENUM_ORDER_TYPE_TIME life = JStr(p, "duration") != "" ? Life(p, t) : (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
+   bool ok = g_trade.OrderModify(ticket, price, Price(p, "stopLoss"), Price(p, "takeProfit"), life, (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION), stoplimit);
    error = Outcome();
    if(!ok && error == "")
       error = "The order was not modified (" + IntegerToString(GetLastError()) + ")";

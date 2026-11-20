@@ -64,7 +64,8 @@ class Source:
     # ── market data ──
     def _info(self, ticker):
         if ticker not in self.SYMBOLS:
-            raise PluginError(f"Unknown symbol {ticker}", -32602)
+            # -32004: the app stops asking for it (an expired contract left in a watchlist) and shows it in red.
+            raise PluginError(f"Unknown symbol {ticker}", -32004)
         return self.SYMBOLS[ticker]
 
     def price(self, ticker, t):
@@ -96,7 +97,11 @@ class Source:
             "session": "24x7",
             "pricescale": scale,
             "minmov": 1,
+            # The money one unit makes per price point; a future counted in contracts gives its multiplier (NSE NIFTY: 65).
+            "pointValue": 1,
             "intervals": list(self.RESOLUTIONS),
+            # Optional: how far back the source serves bars, in calendar days, e.g. {"minute": 30, "day": 365}.
+            # The app then asks for nothing older.
         }
 
     def bars(self, ticker, resolution, frm, to, count_back):
@@ -121,6 +126,14 @@ class Source:
     def resolve_symbol(self, symbol, ticker):
         """The broker ticker of a chart symbol from another exchange (e.g. NASDAQ:AAPL), or None."""
         return ticker if ticker in self.SYMBOLS else None
+
+    def instrument(self, ticker):
+        """`broker.instrument`: the quantities the broker takes (units) and the money a unit makes per point, every
+        field optional. Here forex trades in micro lots of 1,000 units: the ticket steps and checks by 1,000."""
+        kind = self._info(ticker)[1]
+        if kind == "forex":
+            return {"qtyMin": 1000, "qtyStep": 1000, "pointValue": 1}
+        return {"qtyMin": 1, "qtyStep": 1, "pointValue": 1}
 
     def _id(self):
         self.next_id += 1
@@ -167,7 +180,10 @@ class Source:
         order = {"id": order_id, "ticker": ticker, "side": side, "type": kind, "qty": qty, "filledQty": 0,
                  "limitPrice": p.get("limitPrice"), "stopPrice": p.get("stopPrice"),
                  "takeProfit": p.get("takeProfit"), "stopLoss": p.get("stopLoss"), "status": "working",
-                 "duration": "gtc", "updatedMs": int(time.time() * 1000)}
+                 # The time in force picked, one of the capabilities' durations ("gtc" when the app sends none).
+                 "duration": p.get("duration") or "gtc", "updatedMs": int(time.time() * 1000),
+                 # The values of the capabilities' ticketFields (a product type), sent back by broker.modify.
+                 "fields": p.get("fields") or {}}
         self.orders[order_id] = order
         events = [{"kind": "placed", "ticker": ticker, "side": side, "type": kind, "qty": qty}]
         if kind == "market":
@@ -184,7 +200,7 @@ class Source:
         order = self.orders.get(p["orderId"])
         if not order or order["status"] != "working":
             raise PluginError("The order is no longer working")
-        for k in ("qty", "limitPrice", "stopPrice", "takeProfit", "stopLoss"):
+        for k in ("qty", "limitPrice", "stopPrice", "takeProfit", "stopLoss", "duration"):
             if k in p:
                 order[k] = p[k]
         order["updatedMs"] = int(time.time() * 1000)
@@ -252,8 +268,14 @@ class Source:
             "accounts": [{"id": account["id"], "name": account["name"]}],
             "account": account,
             "positionMode": "netting",
+            # ticketFields: the broker's own choices with each order, e.g. a product type:
+            # [{"id": "product", "label": "Product", "options": [{"value": "MIS", "label": "Intraday"},
+            #   {"value": "CNC", "label": "Delivery"}], "default": "MIS"}]
+            # durations: the times in force the order ticket offers; leave it empty to keep your broker's own.
             "capabilities": {"orderTypes": ["market", "limit", "stop"], "brackets": True, "positionBrackets": True,
-                             "partialClose": True, "modifyOrders": True},
+                             "partialClose": True, "modifyOrders": True, "ticketFields": [],
+                             "durations": [{"id": "day", "label": "Day"},
+                                           {"id": "gtc", "label": "Good Till Cancel", "default": True}]},
             "positions": positions,
             "orders": sorted(self.orders.values(), key=lambda o: o["updatedMs"])[-200:],
             "executions": self.executions[-200:],
@@ -331,6 +353,10 @@ class Plugin:
                 return s.symbol_info(p["ticker"])
             if method == "data.bars":
                 return {"bars": s.bars(p["ticker"], p["resolution"], int(p["from"]), int(p["to"]), int(p.get("countBack", 2000)))}
+            if method == "broker.getState":
+                return s.state()
+            if method == "broker.instrument":
+                return s.instrument(p["ticker"])
             if method == "broker.resolveSymbol":
                 return {"ticker": s.resolve_symbol(p.get("symbol"), p.get("ticker"))}
             if method == "broker.selectAccount":

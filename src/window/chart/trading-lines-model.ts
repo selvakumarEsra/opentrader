@@ -55,6 +55,32 @@ export function orderLinePrice(o: TradingOrder): number | null {
   return o.type === "stop" || o.type === "stopLimit" ? o.stopPrice : o.limitPrice;
 }
 
+/** A stop-limit order waiting for its stop shows its limit price on a
+ *  dotted line of its own (reference app). */
+export const hasLimitLine = (o: TradingOrder) => o.kind === "order" && o.type === "stopLimit" && !o.stopTriggered && o.limitPrice !== null;
+
+/** A line of an order: its main line (the stop of a stop-limit until the
+ *  stop is reached) or the limit line of a stop-limit. Key "<id>" or
+ *  "<id>#limit". */
+export type OrderLine = { key: string; id: string; limit: boolean };
+
+/** The lines of `list` in drawing order (reference app: the last placed on
+ *  top): the position's brackets, then each order followed by its own
+ *  brackets. A line already in `prev` (by key) is reused as it is. */
+export function orderLines(list: TradingOrder[], prev: ReadonlyMap<string, OrderLine>): OrderLine[] {
+  const seq = (o: TradingOrder) => Number(o.kind === "order" ? o.id : o.parentId) || 0;
+  const rank = (o: TradingOrder) => (o.parentId === "position" ? -1 : seq(o));
+  const out: OrderLine[] = [];
+  const add = (key: string, id: string, limit: boolean) => out.push(prev.get(key) ?? { key, id, limit });
+  for (const { o } of list
+    .map((o, i) => ({ o, i }))
+    .sort((a, b) => rank(a.o) - rank(b.o) || (a.o.kind === "order" ? -1 : 0) - (b.o.kind === "order" ? -1 : 0) || a.i - b.i)) {
+    add(o.id, o.id, false);
+    if (hasLimitLine(o)) add(`${o.id}#limit`, o.id, true);
+  }
+  return out;
+}
+
 /** Order chip text: "Buy limit", "Sell stop limit"; brackets "Take profit" /
  *  "Stop loss" (reference app). */
 export function orderChipText(o: TradingOrder): string {
@@ -104,6 +130,14 @@ export function fmtPl(v: number, currency: string): string {
   const abs = Math.abs(v).toFixed(2);
   const sign = v > 0 ? "+" : v < 0 ? "−" : "";
   return localNumber(`${sign}${abs} ${currency}`);
+}
+
+/** Colour of a P&L text (the reference app's rule): green in profit, red in
+ *  loss, the line's own colour at zero (null). A money P&L is judged on its
+ *  cents, so a shown "0.00" stays neutral. */
+export function plTone(v: number, cents = false): "profit" | "loss" | null {
+  const x = cents ? Math.round(v * 100) / 100 : v;
+  return x > 0 ? "profit" : x < 0 ? "loss" : null;
 }
 
 /** Take profit / stop loss of a position at the ticket's default distance. */

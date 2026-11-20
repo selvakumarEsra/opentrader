@@ -52,6 +52,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::ticker::search_tickers,
             commands::ticker::search_economic,
             commands::ticker::economic_sources,
+            commands::ticker::economic_countries,
             commands::events::get_dividends,
             commands::events::get_splits,
             commands::events::get_latest_news,
@@ -101,6 +102,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             app_update::app_set_alerts_active,
             app_update::app_update_install,
             app_update::app_build_info,
+            app_update::app_system_info,
             agent::agent_server_status,
             agent::agent_server_set_enabled,
             agent::agent_server_set_port,
@@ -140,6 +142,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             plugins::broker::broker_set_position_brackets,
             plugins::broker::broker_watch_quotes,
             plugins::broker::broker_set_symbol_map,
+            plugins::broker::broker_refresh_state,
+            plugins::broker::broker_instrument,
         ])
         .events(collect_events![
             data::types::ChartAggregate,

@@ -7,13 +7,13 @@ import { Show } from "solid-js";
 import { broker } from "../../data/trading/broker";
 import type { TicketDraft } from "../../data/trading/trading-ui";
 import { Switch } from "../../components/form";
-import { parsePositive } from "./format";
 import { localNumber } from "../../i18n/format";
 import { priceFieldProps } from "../../i18n/price-field";
 import { EXIT_TYPES, exitTypeDisabled, marketHint, priceBase, type ExitKind, type ExitType, type PriceField } from "./ticket";
 import { NO_MONEY_SL, exitInfo, exitLabel, exitTitle, exitUnit, qtyInfo, qtyTitle, qtyUnit } from "./ticket-labels";
 import type { TicketModel } from "./ticket-model";
-import { EquivButton, LabelMenu, SwapButton, type MenuRow } from "./TicketMenus";
+import type { TicketField } from "../../data/trading/capabilities";
+import { EquivButton, LabelMenu, SelectField, SwapButton, type MenuRow } from "./TicketMenus";
 
 /** Order price field: a price (its distance to the base on the right) or
  *  an offset in ticks (placeholder "Ask"; the price on the right). */
@@ -119,11 +119,15 @@ export function ExitInput(props: { m: TicketModel; kind: ExitKind }) {
 }
 
 export function QtyInput(props: { m: TicketModel }) {
-  const { d, ccy, types, qtyTypes, setQtyType, qtyValueText, patch, stepKey, submit, boxes } = props.m;
+  const { d, ccy, types, qtyTypes, setQtyType, qtyValueText, patch, stepKey, stepQty, submit, boxes } = props.m;
   const stock = () => broker.isStock(d().symbol);
   const type = () => types().qtyType;
-  const eq = () => types().qtyEquiv;
-  const risk = () => type() !== "units";
+  // The equivalent picked; one the broker doesn't offer (a risk without brackets) is the reference's default.
+  const eq = () => {
+    const e = types().qtyEquiv;
+    return e !== type() && qtyTypes().includes(e) ? e : type() === "units" ? "money" : "units";
+  };
+  const typed = () => type() !== "units";
   return (
     <div class="trd-tk-field">
       <LabelMenu
@@ -134,37 +138,72 @@ export function QtyInput(props: { m: TicketModel }) {
         <input
           class="trd-tk-input"
           inputmode="decimal"
-          value={risk() ? (d().risk ?? "") : d().qty}
-          onInput={(e) => patch(risk() ? { risk: e.currentTarget.value } : { qty: e.currentTarget.value })}
+          value={typed() ? (d().risk ?? "") : d().qty}
+          onInput={(e) => patch(typed() ? { risk: e.currentTarget.value } : { qty: e.currentTarget.value })}
           onKeyDown={(e) => {
-            if (risk()) stepKey(e, "risk", 0.01);
+            if (typed()) stepKey(e, "risk", 0.01);
             else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
               e.preventDefault();
-              const v = parsePositive(d().qty) ?? 0;
-              patch({ qty: String(Math.max(1, Math.round(v) + (e.key === "ArrowUp" ? 1 : -1))) });
+              stepQty(e.key === "ArrowUp");
             }
             if (e.key === "Enter") submit();
           }}
         />
-        <Show when={qtyTypes().includes(eq())}>
-          <SwapButton onClick={() => setQtyType(eq(), type())} />
-        </Show>
-        {/* The other types are risks, measured to the stop loss: a broker without brackets has none to show. */}
-        <Show when={qtyTypes().length > 1}>
-          <EquivButton
-            value={localNumber(qtyValueText(eq()))}
-            unit={qtyUnit(eq(), ccy(), stock())}
-            rows={qtyTypes().filter((t) => t !== type()).map((t) => ({
-              title: qtyTitle(t, ccy(), stock()),
-              info: qtyInfo(t),
-              value: localNumber(qtyValueText(t)),
-              selected: t === eq(),
-              onSelect: () => patch({ qtyEquiv: t }),
-            }))}
-          />
-        </Show>
+        <SwapButton onClick={() => setQtyType(eq(), type())} />
+        <EquivButton
+          value={localNumber(qtyValueText(eq()))}
+          unit={qtyUnit(eq(), ccy(), stock())}
+          rows={qtyTypes().filter((t) => t !== type()).map((t) => ({
+            title: qtyTitle(t, ccy(), stock()),
+            info: qtyInfo(t),
+            value: localNumber(qtyValueText(t)),
+            selected: t === eq(),
+            onSelect: () => patch({ qtyEquiv: t }),
+          }))}
+        />
       </span>
     </div>
   );
 }
 
+
+/** A choice the broker needs with each order (#341: a product type such as intraday or delivery), in Extra settings as
+ *  in the reference: its label over the option picked, the others in a list. The label and options are the plugin's
+ *  own words. */
+export function BrokerFieldInput(props: { m: TicketModel; field: TicketField }) {
+  const { fieldValue, setField } = props.m;
+  const picked = () => props.field.options.find((o) => o.value === fieldValue(props.field.id));
+  return (
+    <div class="trd-tk-field">
+      <span class="trd-tk-label" data-no-translate>
+        {props.field.label}
+      </span>
+      <SelectField
+        value={picked()?.label ?? ""}
+        ariaLabel={props.field.label}
+        noTranslate
+        rows={props.field.options.map((o) => ({ title: o.label, selected: o.value === picked()?.value, onSelect: () => setField(props.field.id, o.value) }))}
+      />
+    </div>
+  );
+}
+
+/** The time in force (#349): the broker's durations for the order type, without a label as in the reference; a
+ *  single one is shown, not picked. */
+export function DurationInput(props: { m: TicketModel }) {
+  const { durations, durationValue, setDuration } = props.m;
+  const picked = () => durations().find((x) => x.id === durationValue());
+  return (
+    <Show when={durations().length}>
+      <div class="trd-tk-field">
+        <SelectField
+          value={picked()?.label ?? ""}
+          ariaLabel={translate("Time in force")}
+          noTranslate
+          disabled={durations().length < 2}
+          rows={durations().map((x) => ({ title: x.label, selected: x.id === picked()?.id, onSelect: () => setDuration(x.id) }))}
+        />
+      </div>
+    </Show>
+  );
+}

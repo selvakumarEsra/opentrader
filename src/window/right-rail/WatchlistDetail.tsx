@@ -6,8 +6,8 @@
  *   • reference info → get_ticker_info  (gateway tickers/<T>)
  *   • live snapshot  → get_ticker_snapshot (gateway snapshot/<T>), then
  *     moved by the live quotes the watchlist rows read (data/quotes.ts)
- *   • 52w / perf / avg vol → computed client-side from daily candles
- *     (datafeed.getBars(sym, "1D"), the same series the chart uses)
+ *   • 52w / perf / avg vol → computed client-side from the last year of daily
+ *     candles (datafeed.getLastYearDailyBars)
  *
  * No static fallback — each field shows the gateway's value or `—` while the
  * fetch is in flight / failed. A single createResource keyed on the bare
@@ -17,7 +17,7 @@
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js";
 import {
   exchangeName,
-  getBars,
+  getLastYearDailyBars,
   getTickerInfo,
   getTickerSnapshot,
   type Snapshot,
@@ -145,6 +145,8 @@ type QuoteData = {
   sym: string;
   info: TickerInfo | null;
   snap: Snapshot | null;
+  /** When the snapshot was read (UNIX ms): a live quote received after it is newer. */
+  readMs: number;
 };
 
 const PERIODS = ["1W", "1M", "3M", "6M", "YTD", "1Y"] as const;
@@ -245,6 +247,7 @@ export function WatchlistDetail(props: Props) {
       sym,
       info: info.status === "fulfilled" ? info.value : null,
       snap: snap.status === "fulfilled" ? snap.value : null,
+      readMs: Date.now(),
     };
   });
 
@@ -253,8 +256,7 @@ export function WatchlistDetail(props: Props) {
   // the rest of the panel never waits on it; these fields fill in when it lands.
   const [yr] = createResource<YearRange | null, string>(full, async (sym) => {
     try {
-      const { bars } = await getBars(sym, "1D", "ETH", () => untrack(full) === sym);
-      return computeYearRange(bars);
+      return computeYearRange(await getLastYearDailyBars(sym, () => untrack(full) === sym));
     } catch {
       return null;
     }
@@ -286,7 +288,7 @@ export function WatchlistDetail(props: Props) {
   const s = createMemo(() => {
     const q = quote();
     if (!q) return null;
-    return detailQuote(q.snap, econ() ? undefined : quoteFor(q.sym));
+    return detailQuote(q.snap, econ() ? undefined : quoteFor(q.sym), q.readMs);
   });
   const y = () => widenYearRange(yr() ?? null, econ() ? null : s());
 

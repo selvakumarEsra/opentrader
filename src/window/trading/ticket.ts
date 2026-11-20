@@ -3,10 +3,13 @@
  * request, the place-button line, the default exit prices and the hints of
  * the ticket fields (distance to the market in ticks, risk).
  */
-import type { ExitFieldType, OrderPreset, TicketDraft } from "../../data/trading/trading-ui";
+import type { ExitFieldType, OrderPreset, QtyFieldType, TicketDraft } from "../../data/trading/trading-ui";
 import type { OrderRequest, TradingQuote } from "../../data/trading/types";
 import { fmtQty, parsePositive, tickerOf } from "./format";
 import { localNumber } from "../../i18n/format";
+import { translate } from "../../i18n/translator";
+import { ANY_INSTRUMENT, wholeLots, type Instrument } from "../../data/trading/capabilities";
+import { qtyMessage } from "../../data/trading/qty-message";
 
 /** Default exit distances in ticks (take profit / stop loss). */
 export const TP_TICKS = 75;
@@ -68,19 +71,21 @@ export function marketHint(d: TicketDraft, q: Quote | null, price: string, tick:
 export type PriceField = "limitPrice" | "stopPrice";
 /** An order price typed as a price or as an offset in ticks from its base. */
 export type PriceMode = "price" | "offset";
-/** Quantity typed in units, or as the money / balance percentage at risk
- *  down to the stop loss. */
-export type QtyType = "units" | "riskUsd" | "riskPct";
+/** Quantity typed in units, as the order's value in money / % of the balance (#346), or as the money / balance
+ *  percentage at risk down to the stop loss. */
+export type QtyType = QtyFieldType;
 /** Exit typed as a price, ticks from the entry, % of the entry price, money
  *  won / lost, or % of the balance won / lost. */
 export type ExitType = ExitFieldType;
 export type ExitKind = "tp" | "sl";
 
 export const EXIT_TYPES: ExitType[] = ["price", "ticks", "pricePct", "cash", "balancePct"];
-export const QTY_TYPES: QtyType[] = ["units", "riskUsd", "riskPct"];
+export const QTY_TYPES: QtyType[] = ["units", "money", "balancePct", "riskUsd", "riskPct"];
+/** The quantity types a broker without brackets offers: a risk is measured to the stop loss. */
+export const VALUE_QTY_TYPES: QtyType[] = ["units", "money", "balancePct"];
 
-/** Prices, balance and point value the conversions need. */
-export type TicketCtx = { tick: number; decimals: number; balance: number | null; pointValue?: number };
+/** Prices, balance and point value the conversions need; the instrument's lots size a risk. */
+export type TicketCtx = { tick: number; decimals: number; balance: number | null; pointValue?: number; instrument?: Instrument };
 
 /** The field types of a draft (defaults: prices, units). */
 export function fieldTypes(d: TicketDraft) {
@@ -88,7 +93,8 @@ export function fieldTypes(d: TicketDraft) {
     limitMode: d.limitMode ?? "price",
     stopMode: d.stopMode ?? "price",
     qtyType: d.qtyType ?? "units",
-    qtyEquiv: d.qtyEquiv ?? (d.qtyType && d.qtyType !== "units" ? "units" : "riskUsd"),
+    // The reference's equivalent: the order's value for units, units for the rest.
+    qtyEquiv: d.qtyEquiv ?? (d.qtyType && d.qtyType !== "units" ? "units" : "money"),
     tpType: d.tpType ?? "price",
     tpEquiv: d.tpEquiv ?? (d.tpType && d.tpType !== "price" ? "price" : "ticks"),
     slType: d.slType ?? "price",
@@ -104,7 +110,10 @@ export function parseSigned(s: string | undefined): number | null {
 }
 
 const round = (v: number, step: number) => (step > 0 ? Math.round(v / step) * step : v);
-const isRiskQty = (t: QtyType) => t !== "units";
+/** A quantity measured to the stop loss. */
+export const isRiskQty = (t: QtyType) => t === "riskUsd" || t === "riskPct";
+/** A quantity typed as the order's value (money or % of the balance). */
+const isValueQty = (t: QtyType) => t === "money" || t === "balancePct";
 const isMoneyExit = (t: ExitType) => t === "cash" || t === "balancePct";
 
 /** Price distance of an exit typed as `v` in `type` (null when unknown). */
@@ -159,6 +168,16 @@ export function fmtTypeValue(type: ExitType | QtyType, v: number, decimals: numb
   return v.toFixed(2);
 }
 
+/** Units an order of `cash` buys at `entry` (rounded down; whole lots of an instrument sized in lots). */
+export function unitsForValue(cash: number, entry: number, c: TicketCtx): number | null {
+  const per = entry * (c.pointValue ?? 1);
+  if (!(per > 0) || !(cash > 0)) return null;
+  const i = c.instrument;
+  if (i?.qtyStep != null || i?.qtyMin != null) return wholeLots(cash / per, i!);
+  const units = Math.floor(cash / per + 1e-9);
+  return units > 0 ? units : null;
+}
+
 /** Units for the money at risk down to the stop loss (rounded down). */
 export function unitsForRisk(cash: number, entry: number, sl: number, pointValue = 1): number | null {
   const per = Math.abs(entry - sl) * pointValue;
@@ -186,6 +205,13 @@ export function resolveDraft(d: TicketDraft, q: Quote | null, c: TicketCtx): Tic
     r.limitPrice = base != null && n != null ? fx(base + n * c.tick) : "";
   }
   const entry = entryPrice(r, q);
+  // An order's value in money / % balance: the units it buys at the entry.
+  if (isValueQty(t.qtyType)) {
+    const v = parsePositive(d.risk ?? "");
+    const cash = v == null ? null : t.qtyType === "money" ? v : c.balance ? (c.balance * v) / 100 : null;
+    const units = cash != null && entry != null ? unitsForValue(cash, entry, c) : null;
+    r.qty = units != null ? String(units) : "";
+  }
   const exit = (kind: ExitKind, qty: number | null): string => {
     const on = kind === "tp" ? d.tpOn : d.slOn;
     const type = kind === "tp" ? t.tpType : t.slType;
@@ -195,22 +221,33 @@ export function resolveDraft(d: TicketDraft, q: Quote | null, c: TicketCtx): Tic
     return fx(exitFromValue(kind, d.side, type, v, entry, qty, c));
   };
   // The stop loss first: a risk quantity is measured to it.
-  r.stopLoss = exit("sl", isRiskQty(t.qtyType) ? null : parsePositive(d.qty));
+  r.stopLoss = exit("sl", isRiskQty(t.qtyType) ? null : parsePositive(r.qty));
   if (isRiskQty(t.qtyType)) {
     const risk = parsePositive(d.risk ?? "");
     const sl = parsePositive(r.stopLoss);
     const cash = risk == null ? null : t.qtyType === "riskUsd" ? risk : c.balance ? (c.balance * risk) / 100 : null;
-    const units = d.slOn && cash != null && entry != null && sl != null ? unitsForRisk(cash, entry, sl, c.pointValue) : null;
+    const lots = c.instrument?.qtyStep != null || c.instrument?.qtyMin != null;
+    const per = entry != null && sl != null ? Math.abs(entry - sl) * (c.pointValue ?? 1) : 0;
+    // Whole units, or whole lots of an instrument sized in lots.
+    const units =
+      !d.slOn || cash == null || entry == null || sl == null ? null : lots ? (per > 0 && cash > 0 ? wholeLots(cash / per, c.instrument!) : null) : unitsForRisk(cash, entry, sl, c.pointValue);
     r.qty = units != null ? String(units) : "";
   }
   r.takeProfit = exit("tp", parsePositive(r.qty));
   return r;
 }
 
-/** Value of a quantity type for a resolved draft (units, money or % balance
- *  at risk; null without a stop loss). */
+/** Value of a quantity type for a resolved draft (units, the order's value in money / % balance, or the money / %
+ *  balance at risk; null without a stop loss). */
 export function qtyValueIn(type: QtyType, r: TicketDraft, q: Quote | null, c: TicketCtx): number | null {
   if (type === "units") return parsePositive(r.qty);
+  if (isValueQty(type)) {
+    const qty = parsePositive(r.qty);
+    const e = entryPrice(r, q);
+    if (qty == null || e == null) return null;
+    const value = qty * e * (c.pointValue ?? 1);
+    return type === "money" ? value : c.balance ? (value / c.balance) * 100 : null;
+  }
   const cash = riskValue(r, q, c.pointValue);
   if (cash == null) return null;
   if (type === "riskUsd") return cash;
@@ -257,25 +294,27 @@ export function riskReward(d: TicketDraft, q: Quote | null): number | null {
   return Math.abs(tp - e) / Math.abs(e - sl);
 }
 
-/** The order to send, or the message of what is missing / wrong. */
-export function buildTicket(d: TicketDraft, q: Quote | null): OrderRequest | string {
+/** The order to send, or the message of what is missing / wrong (a quantity the instrument doesn't take too). */
+export function buildTicket(d: TicketDraft, q: Quote | null, instrument: Instrument = ANY_INSTRUMENT): OrderRequest | string {
   const qty = parsePositive(d.qty);
-  if (qty == null) return "Enter a quantity";
+  if (qty == null) return translate("Enter a quantity");
+  const lots = qtyMessage(qty, instrument);
+  if (lots) return lots;
   const needsLimit = d.orderType === "limit" || d.orderType === "stopLimit";
   const needsStop = d.orderType === "stop" || d.orderType === "stopLimit";
   const limit = needsLimit ? parsePositive(d.limitPrice) : null;
   const stop = needsStop ? parsePositive(d.stopPrice) : null;
-  if (needsLimit && limit == null) return "Enter a limit price";
-  if (needsStop && stop == null) return "Enter a stop price";
+  if (needsLimit && limit == null) return translate("Enter a limit price");
+  if (needsStop && stop == null) return translate("Enter a stop price");
   const tp = d.tpOn ? parsePositive(d.takeProfit) : null;
   const sl = d.slOn ? parsePositive(d.stopLoss) : null;
-  if (d.tpOn && tp == null) return "Enter a take profit price";
-  if (d.slOn && sl == null) return "Enter a stop loss price";
+  if (d.tpOn && tp == null) return translate("Enter a take profit price");
+  if (d.slOn && sl == null) return translate("Enter a stop loss price");
   const e = entryPrice(d, q);
   if (e != null) {
     const up = d.side === "buy" ? 1 : -1;
-    if (tp != null && (tp - e) * up <= 0) return `Take profit must be ${d.side === "buy" ? "above" : "below"} the entry price`;
-    if (sl != null && (sl - e) * up >= 0) return `Stop loss must be ${d.side === "buy" ? "below" : "above"} the entry price`;
+    if (tp != null && (tp - e) * up <= 0) return d.side === "buy" ? translate("Take profit must be above the entry price") : translate("Take profit must be below the entry price");
+    if (sl != null && (sl - e) * up >= 0) return d.side === "buy" ? translate("Stop loss must be below the entry price") : translate("Stop loss must be above the entry price");
   }
   return {
     symbol: d.symbol,
@@ -286,6 +325,7 @@ export function buildTicket(d: TicketDraft, q: Quote | null): OrderRequest | str
     stopPrice: stop,
     takeProfit: tp,
     stopLoss: sl,
+    ...(d.fields && Object.keys(d.fields).length ? { fields: { ...d.fields } } : {}),
   };
 }
 
@@ -332,6 +372,6 @@ export function presetFields(p: OrderPreset, d: TicketDraft, q: Quote | null, ti
     return kind === "tp" ? { tpOn: true, tpType: ty, tpEquiv: eq, tpValue: String(v) } : { slOn: true, slType: ty, slEquiv: eq, slValue: String(v) };
   };
   Object.assign(f, exit("tp", p.tpPrice, p.tpPriceType), exit("sl", p.slPrice, p.slPriceType));
-  if (!p.slPrice && t.qtyType !== "units") Object.assign(f, { qtyType: "units", qtyEquiv: t.qtyType });
+  if (!p.slPrice && isRiskQty(t.qtyType)) Object.assign(f, { qtyType: "units", qtyEquiv: t.qtyType });
   return f;
 }
