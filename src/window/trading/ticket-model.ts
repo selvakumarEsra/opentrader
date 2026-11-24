@@ -5,13 +5,16 @@
 import { createEffect, createMemo, createSignal, on, onCleanup, untrack } from "solid-js";
 import { broker } from "../../data/trading/broker";
 import { pluginBroker } from "../../data/trading/plugin-broker";
-import { ANY_INSTRUMENT, durationsFor, pickDuration, qtyArrowStep, qtyProblem, wholeLots, type Instrument } from "../../data/trading/capabilities";
+import { ANY_INSTRUMENT, durationsFor, fieldsFor, pickDuration, qtyArrowStep, qtyProblem, wholeLots, type Instrument } from "../../data/trading/capabilities";
+import type { OrderPreview } from "../../bindings";
 import { ticketDurationPref, ticketFieldPrefs } from "../../data/trading/trading-ui";
 import { POSITION_EDIT, tradingUi, type OrderPreset, type TicketDraft } from "../../data/trading/trading-ui";
-import type { OrderType } from "../../data/trading/types";
+import type { ExitLevel, OrderRequest, OrderType } from "../../data/trading/types";
+import { addDraftLevel, levelsOf, type DraftLevel } from "./exit-levels";
 import { replayStartSeq } from "../../data/replay";
 import { parsePositive, tickDecimals } from "./format";
 import {
+  followStop,
   QTY_TYPES,
   VALUE_QTY_TYPES,
   buildTicket,
@@ -35,6 +38,7 @@ import {
   type QtyType,
 } from "./ticket";
 import { TIPS, takeTip } from "./ticket-labels";
+import { translate, translateWith } from "../../i18n/translator";
 
 export type TicketModel = ReturnType<typeof createTicketModel>;
 
@@ -85,7 +89,7 @@ export function createTicketModel() {
       if (!x || x.editing || !sym || sym === x.symbol) return;
       // The stop loss is reset: a risk quantity is in units again; an order's value stays, sized on the new price.
       const units = x.qtyType && isRiskQty(x.qtyType) ? { qtyType: "units" as const, qtyEquiv: x.qtyType } : {};
-      tradingUi.setDraft({ ...x, ...units, symbol: sym, limitPrice: "", stopPrice: "", takeProfit: "", stopLoss: "", tpOn: false, slOn: false });
+      tradingUi.setDraft({ ...x, ...units, symbol: sym, limitPrice: "", stopPrice: "", takeProfit: "", stopLoss: "", tpOn: false, slOn: false, levels: undefined });
       tradingUi.setSent(true);
     }, { defer: false }),
   );
@@ -117,6 +121,8 @@ export function createTicketModel() {
     return ok(d().fields?.[id]) ?? ok(ticketFieldPrefs()[id]) ?? f.default;
   };
   const setField = (id: string, value: string) => patch({ fields: { ...d().fields, [id]: value } });
+  /** The fields the order takes: those of its type, and those of its take profit / stop loss while they are on. */
+  const shownFields = () => fieldsFor(inst().fields, d().orderType, d().tpOn, d().slOn);
 
   // ── Time in force (#349) ────────────────────────────────────────────
   /** The broker's durations for the ticket's order type (none: the broker's own, no selector). */
@@ -132,7 +138,7 @@ export function createTicketModel() {
   });
 
   const patch = (p: Partial<TicketDraft>) => {
-    tradingUi.patchDraft(p);
+    tradingUi.patchDraft({ ...p, ...followStop(d(), p, q(), ctx()) });
     setErrorText(null);
   };
   const fx = (v: number | null | undefined) => (v != null && Number.isFinite(v) ? v.toFixed(dec()) : "");
@@ -150,7 +156,8 @@ export function createTicketModel() {
     const px = ref != null ? ref.toFixed(dec()) : "";
     patch({
       orderType: t,
-      limitPrice: (t === "limit" || t === "stopLimit") && !x.limitPrice ? px : x.limitPrice,
+      // A stop limit's limit is set from its stop (followStop).
+      ...(t === "stopLimit" ? {} : { limitPrice: t === "limit" && !x.limitPrice ? px : x.limitPrice }),
       stopPrice: (t === "stop" || t === "stopLimit") && !x.stopPrice ? px : x.stopPrice,
     });
   };
@@ -331,15 +338,20 @@ export function createTicketModel() {
       tradingUi.setSent(false);
       return;
     }
-    const t = buildTicket(r(), q(), inst());
+    const built = buildTicket(r(), q(), inst(), { tick: tick(), rules: caps() });
+    const lv = levelsOrError();
+    const t = typeof built === "string" ? built : typeof lv === "string" ? lv : { ...built, ...(lv ? { exitLevels: lv, takeProfit: null, stopLoss: null } : {}) };
     if (typeof t === "string") {
       setErrorText(t);
       return;
     }
     const x = d();
     if (isPos()) {
-      broker.setPositionBrackets(t.takeProfit, t.stopLoss, x.paneId ?? undefined);
-      tradingUi.setDraft({ ...x, editing: null, paneId: null });
+      // Levels in place of the take profit / stop loss, or back to them (no levels: none).
+      if (lv && typeof lv !== "string") broker.setPositionExitLevels(lv, x.paneId ?? undefined);
+      else if (editingPos()?.exitLevels?.length && t.takeProfit === null && t.stopLoss === null) broker.setPositionExitLevels([], x.paneId ?? undefined);
+      else broker.setPositionBrackets(t.takeProfit, t.stopLoss, x.paneId ?? undefined);
+      tradingUi.setDraft({ ...x, editing: null, paneId: null, levels: undefined });
       tradingUi.setSent(true);
       return;
     }
@@ -352,26 +364,154 @@ export function createTicketModel() {
       tradingUi.setSent(true);
       return;
     }
-    const fields = Object.fromEntries(inst().fields.map((f) => [f.id, fieldValue(f.id)]));
+    const fields = Object.fromEntries(shownFields().map((f) => [f.id, fieldValue(f.id)]));
     const duration = durationValue() ?? undefined;
-    if (broker.place({ ...t, ...(inst().fields.length ? { fields } : {}), ...(duration ? { duration } : {}) }) === null && !state().ok) return;
-    tradingUi.savePrefs({ ...r(), fields, duration });
+    const req: OrderRequest = { ...t, ...(inst().fields.length ? { fields } : {}), ...(duration ? { duration } : {}) };
+    // A broker that previews orders: the confirmation page first ("Show order confirmation", reference).
+    if (caps().orderPreview && tradingUi.showOrderPreview()) {
+      setPreview({ req, data: null });
+      void broker.preview(req).then((res) => {
+        if (preview()?.req !== req) return;
+        if (typeof res !== "string") return setPreview({ req, data: res });
+        setPreview(null);
+        setErrorText(translateWith("Order preview: {0}", res));
+      });
+      return;
+    }
+    place(req);
+  }
+
+  /** Send a new order; the ticket waits for the next one. */
+  function place(req: OrderRequest) {
+    if (broker.place(req) === null && !state().ok) return;
+    tradingUi.savePrefs({ ...r(), fields: req.fields, duration: req.duration });
     // The order dialog of the DOM closes once the order is sent.
     if (tradingUi.orderDialog()) return tradingUi.closeOrderDialog();
     tradingUi.setSent(true);
   }
+
+  // ── Exit levels (#330) ──────────────────────────────────────────────
+  /** The levels typed, as the order sends them; null without levels, a text when one doesn't read. */
+  const levelsOrError = (): ExitLevel[] | null | string => {
+    const list = d().levels;
+    return list?.length ? levelsOf(list, qtyNum(), entry(), d().side) : null;
+  };
+  /** Levels can be added: a broker that takes them, an exit there already, fewer levels than it takes. */
+  const canAddLevel = () => caps().exitLevels && (!!d().levels?.length || d().tpOn || d().slOn);
+  const levelsFull = () => (d().levels?.length ?? 0) >= caps().maxExitLevels;
+  /** The "Exit levels" page: its levels until Confirm, and the one open. */
+  const [levelPage, setLevelPage] = createSignal<{ list: DraftLevel[]; edit: number } | null>(null);
+  const withLevel = (list: DraftLevel[]): DraftLevel[] | null => {
+    const n = qtyNum();
+    const e = entry();
+    if (n == null || e == null) return null;
+    const ex = (kind: ExitKind) => (exitOn(kind) ? exitPx(kind) : null);
+    return addDraftLevel(list, { tp: ex("tp"), sl: ex("sl") }, n, e, d().side, tick(), inst().qtyStep ?? 1, dec());
+  };
+  /** "Add level": the page on a new level (the exits as the first one, when there are no levels yet). */
+  const addLevel = () => {
+    if (levelsFull()) return;
+    const list = withLevel(levelPage()?.list ?? d().levels ?? []);
+    if (!list) return setErrorText(translate("No part of the quantity is left for another level"));
+    setErrorText(null);
+    setLevelPage({ list, edit: list.length - 1 });
+  };
+  /** A level of the main list opened on the page. */
+  const openLevel = (i: number) => {
+    setErrorText(null);
+    setLevelPage({ list: (d().levels ?? []).map((l) => ({ ...l })), edit: i });
+  };
+  const setPageLevel = (i: number, p: Partial<DraftLevel>) => {
+    const pg = levelPage();
+    if (pg) setLevelPage({ ...pg, list: pg.list.map((l, k) => (k === i ? { ...l, ...p } : l)) });
+  };
+  const setPageEdit = (i: number) => {
+    const pg = levelPage();
+    if (pg) setLevelPage({ ...pg, edit: i });
+  };
+  const removePageLevel = (i: number) => {
+    const pg = levelPage();
+    if (!pg) return;
+    const list = pg.list.filter((_, k) => k !== i);
+    setLevelPage({ list, edit: Math.max(0, Math.min(pg.edit, list.length - 1)) });
+  };
+  /** The levels of the ticket: none gives the plain exits again, off (reference). A risk quantity is in units again:
+   *  risk sizing has one stop loss. */
+  const applyLevels = (list: DraftLevel[]) => {
+    const units = isRiskQty(types().qtyType) ? { qtyType: "units" as const, qtyEquiv: types().qtyType, qty: r().qty || d().qty } : {};
+    patch(list.length ? { levels: list, tpOn: false, slOn: false, takeProfit: "", stopLoss: "", tpValue: "", slValue: "", ...units } : { levels: undefined });
+  };
+  /** Confirm (or Back with changes): the page's levels are the ticket's. */
+  const confirmLevels = () => {
+    const pg = levelPage();
+    if (!pg) return;
+    const ok = pg.list.length ? levelsOf(pg.list, qtyNum(), entry(), d().side) : [];
+    if (typeof ok === "string") return setErrorText(ok);
+    applyLevels(pg.list);
+    setLevelPage(null);
+  };
+  const discardLevels = () => {
+    setLevelPage(null);
+    setErrorText(null);
+  };
+  const removeLevel = (i: number) => applyLevels((d().levels ?? []).filter((_, k) => k !== i));
+
+  // ── Order confirmation (#139) ──────────────────────────────────────────
+  /** The order on the confirmation page and the broker's preview of it (null while asked). */
+  const [preview, setPreview] = createSignal<{ req: OrderRequest; data: OrderPreview | null } | null>(null);
+  /** Send Order: the order previewed, tied to its preview. */
+  const sendPreviewed = () => {
+    const p = preview();
+    if (!p?.data || p.data.errors?.length) return;
+    setPreview(null);
+    place({ ...p.req, ...(p.data.confirmId ? { confirmId: p.data.confirmId } : {}) });
+  };
+  /** Back / Cancel: the form again, as it was. */
+  const closePreview = () => setPreview(null);
+  // A new symbol or chart: the order previewed (or its levels being edited) is not the ticket's any more.
+  createEffect(
+    on(
+      () => tradingUi.draft()?.symbol,
+      () => {
+        setPreview(null);
+        setLevelPage(null);
+      },
+      { defer: true },
+    ),
+  );
 
   /** The modified order differs from the working one. */
   const changed = createMemo(() => {
     const o = editing();
     const t = buildTicket(r(), q(), inst());
     const pos = editingPos();
-    if (pos && typeof t !== "string") return t.takeProfit !== pos.takeProfit || t.stopLoss !== pos.stopLoss;
+    // Exit levels compared by their quantities and prices (#330).
+    const lv = levelsOrError();
+    const key = (list: { qty: number; takeProfit: number | null; stopLoss: number | null }[] | null | undefined) =>
+      JSON.stringify((list ?? []).map((l) => [l.qty, l.takeProfit, l.stopLoss]));
+    const levelsChanged = (had: { qty: number; takeProfit: number | null; stopLoss: number | null }[] | undefined) => typeof lv !== "string" && key(lv) !== key(had);
+    if (pos && typeof t !== "string") return t.takeProfit !== pos.takeProfit || t.stopLoss !== pos.stopLoss || levelsChanged(pos.exitLevels);
     if (!o || typeof t === "string") return false;
-    return t.qty !== o.qty || t.limitPrice !== o.limitPrice || t.stopPrice !== o.stopPrice || t.takeProfit !== o.takeProfit || t.stopLoss !== o.stopLoss;
+    if (levelsChanged(o.exitLevels)) return true;
   });
 
   const rr = () => riskReward(r(), q());
+
+  // ── The quantity's values (#139) ──────────────────────────────────
+  /** The order's value at its entry price, in the account's currency. */
+  const tradeValue = (): number | null => {
+    const n = qtyNum();
+    const e = entry();
+    return n != null && e != null ? n * e * inst().pointValue : null;
+  };
+  /** The leverage of a broker that gives its margin rate ("20x"), null without one or at 1x. */
+  const leverage = (): string | null => {
+    const rate = inst().marginRate;
+    const x = rate != null ? Math.round(1 / rate) : 1;
+    return x !== 1 ? `${x}x` : null;
+  };
+  /** The account's free margin, for a broker that gives its margin rate. */
+  const availableMargin = (): number | null => (inst().marginRate != null ? broker.marginFree() : null);
 
   // ── Order presets ────────────────────────────────────────────────────
   /** What "Save order preset…" saves: the type, the offsets (mirrored for
@@ -448,10 +588,12 @@ export function createTicketModel() {
   onCleanup(() => (document.body.style.cursor = ""));
 
   return {
-    d, q, tick, dec, ccy, state, r, types, caps, inst, fieldValue, setField, durations, durationValue, setDuration, stepQty, qtyTypes, isPos, editing, editingPos, errorText, qtyTip, setQtyTip, slTip, setSlTip, boxes,
+    d, q, tick, dec, ccy, state, r, types, caps, inst, fieldValue, setField, shownFields, durations, durationValue, setDuration, stepQty, qtyTypes, isPos, editing, editingPos, errorText, qtyTip, setQtyTip, slTip, setSlTip, boxes,
     patch, spread, setType,
     exitOn, exitType, exitEquiv, qtyNum, exitValueText, exitInputValue, setExit, setExitType, setExitEquiv, swapExit, exitStep,
     setQtyType, qtyValueText, priceMode, swapPrice, stepKey,
     submit, changed, rr, currentPreset, applyPreset, presetApplied,
+    preview, sendPreviewed, closePreview, tradeValue, leverage, availableMargin,
+    canAddLevel, levelsFull, levelPage, addLevel, openLevel, setPageLevel, setPageEdit, removePageLevel, confirmLevels, discardLevels, removeLevel, entry,
   };
 }

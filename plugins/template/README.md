@@ -51,9 +51,12 @@ Everything the app asks goes through `Source`. Keep the return shapes; change wh
 | Method | Called for | Return |
 |---|---|---|
 | `search(query)` | the symbol search | up to 50 `{ticker, description, type}`; `type` picks the search tab (`stock`, `fund`, `index`, `forex`, `crypto`, `futures`, `cfd`, `bond`) |
-| `symbol_info(ticker)` | opening a symbol | description, type, currency, `timezone` (IANA), `session` (`"0930-1600"`, `"24x7"`…), `pricescale` and `minmov` (one tick = minmov / pricescale), the `intervals` you serve |
+| `symbol_info(ticker)` | opening a symbol | description, type, currency, `timezone` (IANA), `session` (`"0930-1600"`, `"24x7"`…), `pricescale` and `minmov` (one tick = minmov / pricescale), the `intervals` you serve; kept until the plugin connects again, send `data.symbolInfoChanged` when your symbols change |
 | `bars(ticker, resolution, from, to, count_back)` | history | `[time, open, high, low, close, volume]` oldest first, `time` = the bar's start in UNIX seconds; at most the newest `count_back`; an empty list means no more history |
 | `quote(ticker)` | every second, for the symbols on screen | the last price, `prevClose`, and the forming `minute` and `day` bars |
+| `watchlists()` | once connected (optional) | ready-made lists of your symbols, `{id, name, symbols, sections}`; send `data.watchlists` again when they change |
+| `scripts()` | once connected (optional, Plugin API 8) | your OakScript studies and strategies, `{id, name, kind, source}`, listed in the Indicators dialog under the plugin's name; send `data.scripts` again when they change |
+| `events(ticker)` | the chart's dividend, split and earnings markers (optional) | `{type, date, …}` per event, dates `YYYY-MM-DD`; a bonus issue is a split; send `data.eventsChanged` when they change |
 
 Serve the intervals your source has: the app builds the others (5 minutes from 1 minute, weeks from days…). A daily
 bar starts at its trading day's midnight in the symbol's time zone.
@@ -100,7 +103,8 @@ anywhere else install as *not verified*.
 - [ ] Errors reach the user: raise `PluginError("…")` with a message a trader understands, never let a request go
       unanswered.
 - [ ] A slow request (long history) does not block the others: the template answers each request on its own thread.
-- [ ] Losing your source's connection shows: send `"connected": false` in the broker state, and `log` a warning.
+- [ ] Losing your source's connection shows: send `"connected": false` in the broker state, and `log` a warning (or
+  `toast` it, Plugin API 8, for the user to see at once).
       Getting it back shows too: send the state again as soon as you are logged in, not only on the next order.
 - [ ] A symbol you don't know (expired, renamed) answers `PluginError("…", -32004)`.
 - [ ] A broker that only takes whole lots answers `broker.instrument` with its `qtyStep`; a broker that needs a choice

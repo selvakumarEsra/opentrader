@@ -5,8 +5,9 @@
 import { emitAppEvent } from "../data/app-events";
 import { diagnosticsText } from "../data/diagnostics";
 import { chartBars, chartComparesFor } from "../data/chart-state-registry";
-import { isSupportedResolution, supportedResolutions, toFullSymbol } from "../data/datafeed";
+import { isChartableResolution, supportedResolutions, toFullSymbol } from "../data/datafeed";
 import * as scripts from "../data/oakscript-store";
+import { isPluginScriptId, isPluginStrategy, pluginScriptList } from "../data/plugin-scripts";
 import { strategyTester } from "../data/strategy-tester-store";
 import { exportableCharts } from "../window/chart/chart-export";
 import { layoutSnapshot, snapshotTheme } from "../window/chart/layout-snapshot";
@@ -259,11 +260,11 @@ export function createAgentTools(host: AgentHost): AgentTool[] {
     {
       name: "set_interval",
       title: "Set interval",
-      description: 'Change the focused chart\'s interval. Ids: minutes as a number ("1", "5", "60", "240"), "1D", "1W", "1M", seconds as "1S".',
+      description: 'Change the focused chart\'s interval. Ids: minutes as a number ("1", "5", "60", "240"), "1D", "1W", "1M", seconds as "1S", ticks as "10T" (the symbols of a data plugin with ticks).',
       inputSchema: { type: "object", properties: { interval: { type: "string" } }, required: ["interval"] },
       run: async (args) => {
         const interval = str(args, "interval");
-        if (!isSupportedResolution(interval)) throw new AgentError(`Interval "${interval}" is not served. Served: ${supportedResolutions().join(", ")}.`);
+        if (!isChartableResolution(interval)) throw new AgentError(`Interval "${interval}" is not served. Served: ${supportedResolutions().join(", ")}.`);
         host.setInterval(interval);
         return { interval, ...(await loaded()) };
       },
@@ -356,6 +357,10 @@ export function createAgentTools(host: AgentHost): AgentTool[] {
           ...scripts.listScripts().map((s) => {
             const strategy = !!scripts.loadScript(s.id)?.meta?.strategy;
             return { id: strategy ? userStrategyId(s.id) : userIndicatorId(s.id), name: s.name, group: strategy ? "my strategy" : "my script" };
+          }),
+          ...pluginScriptList().map((s) => {
+            const strategy = isPluginStrategy(s.id);
+            return { id: strategy ? userStrategyId(s.id) : userIndicatorId(s.id), name: s.name, group: `${s.pluginName} ${strategy ? "strategy" : "script"}` };
           }),
         ].filter((r) => !r.id.startsWith("tool:"));
         const hits = rows.filter((r) => words.every((w) => r.name.toLowerCase().includes(w) || r.id.toLowerCase().includes(w)));
@@ -491,20 +496,32 @@ export function createAgentTools(host: AgentHost): AgentTool[] {
     {
       name: "list_scripts",
       title: "List scripts",
-      description: "The user's scripts (OakScript editor): id, name, indicator or strategy, and whether the focused chart shows it.",
+      description:
+        "The scripts (OakScript editor): the user's own (group \"mine\") and the data plugins' (group \"plugin: <name>\", read-only: write_script refuses them, copy the source into a new script to change one). Each with id, name, indicator or strategy, and whether the focused chart shows it.",
       inputSchema: { type: "object", properties: {} },
       annotations: { readOnlyHint: true },
       run: async () => {
         const on = new Set(pane().indicators.map(typeIdOf));
-        return scripts.listScripts().map((s) => {
+        const onChart = (id: string) => on.has(userIndicatorId(id)) || on.has(userStrategyId(id));
+        const mine = scripts.listScripts().map((s) => {
           const meta = scripts.loadScript(s.id)?.meta;
           return {
             id: s.id,
             name: s.name,
+            group: "mine",
             kind: meta ? (meta.strategy ? "strategy" : "indicator") : "not compiled",
-            onChart: on.has(userIndicatorId(s.id)) || on.has(userStrategyId(s.id)),
+            onChart: onChart(s.id),
           };
         });
+        const plugins = pluginScriptList().map((s) => ({
+          id: s.id,
+          name: s.name,
+          group: `plugin: ${s.pluginName}`,
+          readOnly: true,
+          kind: isPluginStrategy(s.id) ? "strategy" : "indicator",
+          onChart: onChart(s.id),
+        }));
+        return [...mine, ...plugins];
       },
     },
     {
@@ -539,6 +556,7 @@ export function createAgentTools(host: AgentHost): AgentTool[] {
         const name = str(args, "name", false);
         let id = str(args, "scriptId", false);
         if (id) {
+          if (isPluginScriptId(id)) throw new AgentError(`"${id}" is a plugin's script, read-only. Omit scriptId to save the source as a new script.`);
           if (!scripts.loadScript(id)) throw new AgentError(`No script "${id}". Call list_scripts, or omit scriptId for a new one.`);
           scripts.saveSource(id, source);
           if (name) scripts.renameScript(id, name);

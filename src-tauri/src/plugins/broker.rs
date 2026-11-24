@@ -7,7 +7,7 @@
  * stay possible, so a position can always be got out of.
  */
 use super::{installed_manifest, Plugins};
-use opentrader_core::plugins::broker::{BrokerEvent, BrokerState, Instrument, OrderTicket};
+use opentrader_core::plugins::broker::{BrokerEvent, BrokerState, ExitLevel, Instrument, OrderPreview, OrderTicket};
 use opentrader_core::plugins::hub::{HubEvent, PluginError};
 use opentrader_core::plugins::manifest::Capability;
 use opentrader_core::sync::LockExt;
@@ -82,6 +82,31 @@ pub struct BrokerQuote {
     pub last: Option<f64>,
 }
 
+/// One price level of an order book: the quantity resting at that price, in units.
+#[derive(Clone, Serialize, Deserialize, specta::Type)]
+pub struct DepthLevel {
+    pub price: f64,
+    pub qty: f64,
+}
+
+/// The order book of a ticker the DOM shows (`broker.depth`): the whole book (`snapshot`), or the levels that changed,
+/// a quantity of 0 removing its level.
+#[derive(Clone, Serialize, Deserialize, specta::Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerDepth {
+    pub ticker: String,
+    #[serde(default = "whole_book")]
+    pub snapshot: bool,
+    #[serde(default)]
+    pub bids: Vec<DepthLevel>,
+    #[serde(default)]
+    pub asks: Vec<DepthLevel>,
+}
+
+fn whole_book() -> bool {
+    true
+}
+
 #[derive(Default)]
 pub struct PluginBroker {
     states: Mutex<HashMap<String, BrokerState>>,
@@ -130,7 +155,7 @@ pub fn status(app: &AppHandle) -> BrokerStatus {
     let brokers: Vec<BrokerPlugin> = enabled
         .iter()
         .filter_map(|id| installed_manifest(app, id))
-        .filter(|m| m.provides(Capability::Broker) && m.supported_here())
+        .filter(|m| super::uses(app, m, Capability::Broker) && m.supported_here())
         .map(|m| BrokerPlugin { connected: plugins.hub.connected(&m.id).is_some(), id: m.id, name: m.name })
         .collect();
     let active = active(app).filter(|id| brokers.iter().any(|b| &b.id == id));
@@ -143,13 +168,23 @@ pub fn status(app: &AppHandle) -> BrokerStatus {
         version: s.version.load(Ordering::Relaxed),
         plugin_connected: active.as_deref().is_some_and(|id| plugins.hub.connected(id).is_some()),
         active_name: manifest.as_ref().map(|m| m.name.clone()),
-        data_exchange: manifest.as_ref().filter(|m| m.provides(Capability::Datafeed) && !m.whole_symbols()).and_then(|m| m.exchange.clone()),
-        data_exchanges: manifest.filter(|m| m.provides(Capability::Datafeed) && m.whole_symbols()).map(|m| m.exchanges).unwrap_or_default(),
+        data_exchange: manifest.as_ref().filter(|m| super::uses(app, m, Capability::Datafeed) && !m.whole_symbols()).and_then(|m| m.exchange.clone()),
+        data_exchanges: manifest.filter(|m| super::uses(app, m, Capability::Datafeed) && m.whole_symbols()).map(|m| m.exchanges).unwrap_or_default(),
         trading_enabled,
         state: account,
         notices,
         brokers,
         active,
+    }
+}
+
+/// A plugin connected (`plugins::init`, after its settings went out): the active broker's state is read again.
+pub fn connected(app: &AppHandle, plugin: &str) {
+    forget_symbols(app);
+    changed(app);
+    if active(app).as_deref() == Some(plugin) {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move { refresh_state(&app).await });
     }
 }
 
@@ -159,14 +194,6 @@ pub fn init(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             match events.recv().await {
-                Ok(HubEvent::Connected { plugin, .. }) => {
-                    forget_symbols(&handle);
-                    changed(&handle);
-                    if active(&handle).as_deref() == Some(&plugin) {
-                        let app = handle.clone();
-                        tauri::async_runtime::spawn(async move { refresh_state(&app).await });
-                    }
-                }
                 Ok(HubEvent::Disconnected { plugin }) => {
                     state(&handle).states.locked().remove(&plugin);
                     forget_symbols(&handle);
@@ -175,6 +202,8 @@ pub fn init(app: &AppHandle) {
                     }
                     changed(&handle);
                 }
+                // A connect is handled by `plugins::init`, in order after the settings (`connected`).
+                Ok(HubEvent::Connected { .. }) => {}
                 Ok(HubEvent::Notification { plugin, method, params }) => on_notification(&handle, &plugin, &method, params),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(_) => break,
@@ -224,6 +253,12 @@ fn on_notification(app: &AppHandle, plugin: &str, method: &str, params: Value) {
                 let _ = q.emit(app);
             }
         }
+        "broker.depth" if active(app).as_deref() == Some(plugin) => match serde_json::from_value::<BrokerDepth>(params) {
+            Ok(d) => {
+                let _ = d.emit(app);
+            }
+            Err(e) => super::log(app, plugin, format!("[error] broker.depth: {e}")),
+        },
         _ => {}
     }
 }
@@ -295,8 +330,8 @@ pub fn broker_status(app: AppHandle) -> BrokerStatus {
 pub fn broker_set_active(app: AppHandle, id: Option<String>) -> Result<BrokerStatus, String> {
     if let Some(id) = &id {
         let m = installed_manifest(&app, id).ok_or_else(|| format!("{id} is not installed"))?;
-        if !m.provides(Capability::Broker) {
-            return Err(format!("{} is not a broker plugin", m.name));
+        if !super::uses(&app, &m, Capability::Broker) {
+            return Err(format!("{} is not a broker plugin, or its trading is turned off", m.name));
         }
     }
     let plugins = app.state::<Plugins>();
@@ -395,6 +430,15 @@ pub async fn broker_place(app: AppHandle, ticket: OrderTicket) -> Result<String,
     Ok(v.get("orderId").map(|id| id.as_str().map(str::to_string).unwrap_or_else(|| id.to_string())).unwrap_or_default())
 }
 
+/// What the broker says of an order before it is sent (`broker.previewOrder`, for a broker with `orderPreview`): the
+/// order ticket's confirmation page. Nothing is placed, so trading needn't be on.
+#[tauri::command]
+#[specta::specta]
+pub async fn broker_preview_order(app: AppHandle, ticket: OrderTicket) -> Result<OrderPreview, String> {
+    let v = ask(&app, "broker.previewOrder", serde_json::to_value(&ticket).map_err(|e| e.to_string())?).await.map_err(|e| failed(&app, "Order preview", e))?;
+    serde_json::from_value(v).map_err(|e| failed(&app, "Order preview", e.to_string()))
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn broker_modify(app: AppHandle, order_id: String, ticket: OrderTicket) -> Result<(), String> {
@@ -419,9 +463,20 @@ pub async fn broker_close_position(app: AppHandle, position_id: String, qty: Opt
 
 #[tauri::command]
 #[specta::specta]
-pub async fn broker_set_position_brackets(app: AppHandle, position_id: String, take_profit: Option<f64>, stop_loss: Option<f64>) -> Result<(), String> {
+pub async fn broker_set_position_brackets(
+    app: AppHandle,
+    position_id: String,
+    take_profit: Option<f64>,
+    stop_loss: Option<f64>,
+    exit_levels: Option<Vec<ExitLevel>>,
+) -> Result<(), String> {
     require_trading(&app).map_err(|e| failed(&app, "Protect", e))?;
-    ask(&app, "broker.setPositionBrackets", json!({ "positionId": position_id, "takeProfit": take_profit, "stopLoss": stop_loss }))
+    let mut params = json!({ "positionId": position_id, "takeProfit": take_profit, "stopLoss": stop_loss });
+    // Exit levels in place of the take profit / stop loss (#330); left out without any.
+    if let Some(levels) = exit_levels.filter(|l| !l.is_empty()) {
+        params["exitLevels"] = serde_json::to_value(levels).map_err(|e| e.to_string())?;
+    }
+    ask(&app, "broker.setPositionBrackets", params)
         .await
         .map(|_| ())
         .map_err(|e| failed(&app, "Protect", e))
@@ -433,6 +488,14 @@ pub async fn broker_set_position_brackets(app: AppHandle, position_id: String, t
 pub fn broker_watch_quotes(app: AppHandle, tickers: Vec<String>) -> Result<(), String> {
     let id = connected_broker(&app)?;
     app.state::<Plugins>().hub.notify(&id, "broker.watchQuote", json!({ "tickers": tickers })).map_err(|e| e.to_string())
+}
+
+/// The tickers whose order book the DOM shows (the whole set; empty: none).
+#[tauri::command]
+#[specta::specta]
+pub fn broker_watch_depth(app: AppHandle, tickers: Vec<String>) -> Result<(), String> {
+    let id = connected_broker(&app)?;
+    app.state::<Plugins>().hub.notify(&id, "broker.watchDepth", json!({ "tickers": tickers })).map_err(|e| e.to_string())
 }
 
 /// The user's chart symbol → broker ticker mapping of a broker plugin (Settings > Plugins).

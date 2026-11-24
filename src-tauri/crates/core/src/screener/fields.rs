@@ -2,7 +2,8 @@
  * Screener field catalog. Field ids are the reference app scanner names so the
  * frontend can map the reference app columns and filters 1:1.
  *
- *   live       from the full-market snapshot (every 10 s)
+ *   live       from the full-market snapshot (every 10 s), and the extended
+ *              hours the live feed keeps (pre-/post-market, 1h / 4h bases)
  *   reference  from the reference ticker list (once a day)
  *   state      history-derived: the daily state file (`state.rs`) joined with
  *              the live bar. State key `<id>` is the value at the close of D;
@@ -44,6 +45,31 @@ pub enum Live {
     /// UNIX seconds, the stamp of the daily bars): where the row's open /
     /// high / low / close / volume go in a daily series.
     SessionDay,
+    /// The pre-market (04:00-09:30 New York) of the latest session that traded, held all day: its open, high,
+    /// low, last price and volume; its last price against the previous close (% and amount) and against its open;
+    /// its gap (open against the previous close, %).
+    PreOpen,
+    PreHigh,
+    PreLow,
+    PreClose,
+    PreVolume,
+    PreChange,
+    PreChangeAbs,
+    PreChangeFromOpen,
+    PreChangeFromOpenAbs,
+    PreGap,
+    /// The post-market (the close to 20:00), held overnight: its open, high, low, last price and volume, and its
+    /// last price against the day's close (% and amount).
+    PostOpen,
+    PostHigh,
+    PostLow,
+    PostClose,
+    PostVolume,
+    PostChange,
+    PostChangeAbs,
+    /// The price against the close of the previous 1h / 4h bar of the regular session (bars from 09:30).
+    Change1h,
+    Change4h,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +115,10 @@ pub enum Step {
     AvgVolIncl(u32),
     /// Today's volume / `|next` (= average_volume_10d_calc at D).
     RelVol,
+    /// 100 * (today's volume / the previous session's - 1); `volume_change|next` = D's volume.
+    VolChange,
+    /// Today's volume - the previous session's (`volume_change|next`).
+    VolChangeAbs,
     /// Price * `shares` (weighted shares outstanding).
     MarketCap,
     /// Text column (sector, industry): the same value all day.
@@ -156,6 +186,25 @@ const LIVE: &[(&str, Live)] = &[
     ("Value.Traded", Live::ValueTraded),
     ("Volatility.D", Live::VolatilityD),
     ("session_day", Live::SessionDay),
+    ("premarket_open", Live::PreOpen),
+    ("premarket_high", Live::PreHigh),
+    ("premarket_low", Live::PreLow),
+    ("premarket_close", Live::PreClose),
+    ("premarket_volume", Live::PreVolume),
+    ("premarket_change", Live::PreChange),
+    ("premarket_change_abs", Live::PreChangeAbs),
+    ("premarket_change_from_open", Live::PreChangeFromOpen),
+    ("premarket_change_from_open_abs", Live::PreChangeFromOpenAbs),
+    ("premarket_gap", Live::PreGap),
+    ("postmarket_open", Live::PostOpen),
+    ("postmarket_high", Live::PostHigh),
+    ("postmarket_low", Live::PostLow),
+    ("postmarket_close", Live::PostClose),
+    ("postmarket_volume", Live::PostVolume),
+    ("postmarket_change", Live::PostChange),
+    ("postmarket_change_abs", Live::PostChangeAbs),
+    ("change|60", Live::Change1h),
+    ("change|240", Live::Change4h),
 ];
 
 const REFERENCE: &[(&str, Reference)] = &[
@@ -209,12 +258,15 @@ const STATE: &[(&str, Step)] = &[
     ("Perf.Y", Step::Perf),
     ("Perf.5Y", Step::Perf),
     ("Perf.10Y", Step::Perf),
+    ("Perf.All", Step::Perf),
     ("Perf.YTD", Step::PerfYtd),
     ("average_volume_10d_calc", Step::AvgVolIncl(10)),
     ("average_volume_30d_calc", Step::AvgVolIncl(30)),
     ("average_volume_60d_calc", Step::AvgVolIncl(60)),
     ("average_volume_90d_calc", Step::AvgVolIncl(90)),
     ("relative_volume_10d_calc", Step::RelVol),
+    ("volume_change", Step::VolChange),
+    ("volume_change_abs", Step::VolChangeAbs),
     ("market_cap_basic", Step::MarketCap),
     ("sector", Step::Text),
     ("industry", Step::Text),
@@ -264,7 +316,19 @@ const RATIO: &[(&str, Ratio)] = &[
 ];
 
 /// Text fundamentals (every other `f.` key is a number).
-const FUND_TEXT: &[&str] = &["f.fiscal_period", "f.asset_class", "f.leveraged", "f.leverage_ratio", "f.dividends_frequency"];
+const FUND_TEXT: &[&str] = &[
+    "f.fiscal_period",
+    "f.asset_class",
+    "f.leveraged",
+    "f.leverage_ratio",
+    "f.leverage",
+    "f.dividends_frequency",
+    "f.brand",
+    "f.issuer",
+    "f.index_tracked",
+    "f.management",
+    "f.dividend_treatment",
+];
 
 /// State keys a ratio reads (its field is offered when they are all in the state).
 fn ratio_inputs(r: Ratio) -> Vec<&'static str> {
@@ -280,9 +344,10 @@ fn ratio_inputs(r: Ratio) -> Vec<&'static str> {
 
 /// State fields offered only once the served state holds their key (added after the first state version).
 const STATE_OPTIONAL: &[&str] = &[
-    "Perf.5Y", "Perf.10Y", "Recommend.All", "Recommend.MA", "Recommend.Other", "TechRating_1D", "MARating_1D", "OsRating_1D", "Mom",
+    "Perf.5Y", "Perf.10Y", "Perf.All", "Recommend.All", "Recommend.MA", "Recommend.Other", "TechRating_1D", "MARating_1D", "OsRating_1D", "Mom",
     "Mom_14", "AO", "CCI20", "Stoch.K", "Stoch.D", "Stoch.K_14_1_3", "Stoch.D_14_1_3", "Volatility.W", "Volatility.M",
-    "volume|1W", "volume|1M", "Value.Traded|1W", "Value.Traded|1M", "candlestick_patterns",
+    "volume|1W", "volume|1M", "Value.Traded|1W", "Value.Traded|1M", "candlestick_patterns", "volume_change",
+    "volume_change_abs",
 ];
 
 /// The state key whose presence offers an optional field.
@@ -403,7 +468,33 @@ fn ratio(t: &Table, row: &Row, r: Ratio) -> Option<f64> {
 fn live(f: Live, row: &Row) -> Option<f64> {
     let m = &row.m;
     let pos = |v: f64| (v > 0.0).then_some(v);
+    let x = &m.ext;
+    let some_pos = |v: Option<f64>| v.filter(|v| *v > 0.0);
+    // 100 * (a / b - 1), and a - b, when both are prices.
+    let pct = |a: Option<f64>, b: Option<f64>| Some((some_pos(a)? / some_pos(b)? - 1.0) * 100.0);
+    let diff = |a: Option<f64>, b: Option<f64>| Some(some_pos(a)? - some_pos(b)?);
     Some(match f {
+        Live::PreOpen => some_pos(x.pre_open)?,
+        Live::PreHigh => some_pos(x.pre_high)?,
+        Live::PreLow => some_pos(x.pre_low)?,
+        Live::PreClose => some_pos(x.pre_close)?,
+        Live::PreVolume => x.pre_volume?,
+        Live::PreChange => pct(x.pre_close, x.pre_base)?,
+        Live::PreChangeAbs => diff(x.pre_close, x.pre_base)?,
+        Live::PreChangeFromOpen => pct(x.pre_close, x.pre_open)?,
+        Live::PreChangeFromOpenAbs => diff(x.pre_close, x.pre_open)?,
+        Live::PreGap => pct(x.pre_open, x.pre_base)?,
+        Live::PostOpen => some_pos(x.post_open)?,
+        Live::PostHigh => some_pos(x.post_high)?,
+        Live::PostLow => some_pos(x.post_low)?,
+        Live::PostClose => some_pos(x.post_close)?,
+        Live::PostVolume => x.post_volume?,
+        Live::PostChange => pct(x.post_close, x.post_base)?,
+        Live::PostChangeAbs => diff(x.post_close, x.post_base)?,
+        // The bar's close is the last regular-session trade, kept after the close (not the official close, which
+        // the bars leave out); the row's price without it (an older gateway).
+        Live::Change1h => pct(x.reg_close.or(Some(m.last)), x.hour_base)?,
+        Live::Change4h => pct(x.reg_close.or(Some(m.last)), x.h4_base)?,
         Live::Close => pos(m.last)?,
         Live::Open => pos(m.open)?,
         Live::High => pos(m.high)?,
@@ -474,6 +565,11 @@ fn state_num(t: &Table, row: &Row, key: &str, step: Step) -> Option<f64> {
                 let avg = next()?;
                 (avg > 0.0).then(|| m.volume / avg)
             }
+            Step::VolChange => {
+                let prev = s.num("volume_change|next", i)?;
+                (prev > 0.0).then(|| 100.0 * (m.volume / prev - 1.0))
+            }
+            Step::VolChangeAbs => Some(m.volume - s.num("volume_change|next", i)?),
             Step::MarketCap => Some(price? * s.num("shares", i)?),
             Step::Daily => s.num(key, i),
             Step::Tech(tech) => technicals::step(s, i, m, tech),

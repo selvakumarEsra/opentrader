@@ -20,6 +20,7 @@ import {
 } from "./watchlist";
 import * as symbolFlags from "./symbol-flags";
 import * as kv from "./kv";
+import { MAX_LIST_ITEMS, listFull, listItemCount } from "./watchlist-limit";
 import { isFullSymbol, tickerOf, toFullSymbol } from "./datafeed";
 
 export type WatchList = {
@@ -42,7 +43,12 @@ export type WatchList = {
    *  arrow and the back-to-own-order button. Not saved: any change of the
    *  list's content, a list switch or a restart sets it back to "default". */
   sort: SortKey;
+  /** A data plugin's list (#381): the plugin's id and its id of the list. The
+   *  plugin keeps it up to date, so it takes no change by hand. */
+  source?: PluginListSource;
 };
+
+export type PluginListSource = { plugin: string; list: string };
 
 /** Per-list price-move alert: notify when any symbol's |change%| ≥ threshold.
  *  Keyed by list id; absent = no alert. A local list alert. */
@@ -161,15 +167,21 @@ if (symbolFlags.needsMigration()) {
   symbolFlags.seedFlags(pairs);
 }
 
+/** The shown list another window saved, while this one shows `mine` (#387): written back as read, so the two
+ *  windows don't save their own lists over each other's in turn. Dropped when this window shows another list. */
+let external: { mine: string; theirs: string } | null = null;
+
 // Autosave: a root-scoped effect serialises the store on every change.
 createRoot(() => {
   createEffect(() => {
+    const shown = state.activeId;
+    if (external && external.mine !== shown) external = null;
     try {
       kv.setItem(
         STORAGE_KEY,
         JSON.stringify({
           lists: state.lists.map((l) => ({ ...l, sort: "default" })),
-          activeId: state.activeId,
+          activeId: external?.theirs ?? shown,
           alerts: state.alerts,
           alertMeta: state.alertMeta,
           v: SHAPE_VERSION,
@@ -209,33 +221,107 @@ createRoot(() => {
 
 // Rows holding a bare ticker (lists saved before full names, imported files)
 // get their primary listing: quotes, sessions and the chart key on the full
-// name. Runs again whenever such a row appears.
-createRoot(() => {
-  createEffect(() => {
-    const bare = new Set<string>();
-    for (const l of state.lists) {
-      for (const r of [...l.groups.flatMap((g) => g.rows), ...l.extras]) if (!isFullSymbol(r.ticker)) bare.add(r.ticker);
+// name. Runs again whenever such a row appears. Each name is asked once, a few
+// at a time, and the answers are written together, to the rows that hold
+// them: asking every bare name again on each answer, and rewriting every list
+// for each, froze the window on an uploaded list of a few dozen bare tickers
+// (#358). The web server takes about ten calls a second from one visitor: there
+// the names are asked one by one, spaced out.
+{
+  const web = typeof window !== "undefined" && !("__TAURI_INTERNALS__" in window);
+  const AT_ONCE = web ? 1 : 4;
+  const GAP_MS = web ? 120 : 0;
+  /** A failed lookup (offline, busy server) is asked again a minute later, twice at most; then on the next start. */
+  const RETRY_MS = 60_000;
+  const RETRIES = 2;
+  const asked = new Set<string>();
+  const known = new Map<string, string>();
+  const tries = new Map<string, number>();
+  const queue: string[] = [];
+  let running = 0;
+  const found = new Map<string, string>();
+  let writing = false;
+  const write = () => {
+    writing = false;
+    if (!found.size) return;
+    const names = new Map(found);
+    found.clear();
+    const fix = (rows: Row[]) => {
+      rows.forEach((r, i) => {
+        const full = names.get(r.ticker);
+        if (full) rows[i] = { ...r, ticker: full, short: tickerOf(full) };
+      });
+    };
+    setState("lists", (l) => [...l.extras, ...l.groups.flatMap((g) => g.rows)].some((r) => names.has(r.ticker)), produce((l: WatchList) => {
+      fix(l.extras);
+      for (const g of l.groups) fix(g.rows);
+    }));
+  };
+  const later = (bare: string, full: string) => {
+    found.set(bare, full);
+    if (!writing) {
+      writing = true;
+      queueMicrotask(write);
     }
-    for (const b of bare) {
-      void toFullSymbol(b).then(
-        (full) => {
-          const fix = (r: Row) => (r.ticker === b ? { ...r, ticker: full, short: tickerOf(full) } : r);
-          setState("lists", (ls) =>
-            ls.map((l) => ({ ...l, groups: l.groups.map((g) => ({ ...g, rows: g.rows.map(fix) })), extras: l.extras.map(fix) })),
-          );
-        },
-        () => undefined, // lookup failed (offline): kept as typed, retried on the next start
-      );
+  };
+  const pump = () => {
+    while (running < AT_ONCE && queue.length) {
+      const b = queue.shift()!;
+      running++;
+      void toFullSymbol(b)
+        .then(
+          (full) => {
+            // A name that resolves to no exchange stays as typed.
+            if (!isFullSymbol(full)) return;
+            known.set(b, full);
+            later(b, full);
+          },
+          () => {
+            const n = (tries.get(b) ?? 0) + 1;
+            tries.set(b, n);
+            if (n <= RETRIES) {
+              setTimeout(() => {
+                queue.push(b);
+                pump();
+              }, RETRY_MS);
+            }
+          },
+        )
+        .finally(() => {
+          running--;
+          setTimeout(pump, GAP_MS);
+        });
     }
+  };
+  createRoot(() => {
+    createEffect(() => {
+      for (const l of state.lists) {
+        for (const r of [...l.groups.flatMap((g) => g.rows), ...l.extras]) {
+          const b = r.ticker;
+          if (isFullSymbol(b)) continue;
+          const full = known.get(b);
+          if (full) later(b, full);
+          else if (!asked.has(b)) {
+            asked.add(b);
+            queue.push(b);
+          }
+        }
+      }
+      pump();
+    });
   });
-});
+}
 
 // Live cross-window sync: when another window edits any list, re-load the whole
-// shape (setState merges lists/activeId/alerts; the autosave effect above then
+// shape (setState merges lists/alerts; the autosave effect above then
 // re-serialises to an identical string, which kv.setItem dedups to a no-op).
 kv.onExternalChange(STORAGE_KEY, () => {
   beforeSort.clear();
-  setState(load());
+  const next = load();
+  // The shown list is the tab's (#387): another window showing another list keeps this one's, unless it was deleted.
+  const mine = next.lists.some((l) => l.id === state.activeId) ? state.activeId : next.activeId;
+  external = { mine, theirs: next.activeId };
+  setState({ ...next, activeId: mine });
 });
 
 // ── Colour lists ("Red list", "Blue list", …) ────────────────────────────
@@ -318,6 +404,12 @@ createRoot(() => {
 export const DELETED_LIST_ID = "deleted_symbols";
 export const isDeletedList = (id: string | undefined): boolean => id === DELETED_LIST_ID;
 const DELETED_MAX = 100;
+
+/** A data plugin's list: read-only, the plugin keeps it up to date. */
+export const isPluginList = (l: WatchList | undefined): boolean => !!l?.source;
+const isPluginListId = (id: string): boolean => isPluginList(state.lists.find((l) => l.id === id));
+/** A list whose symbols and sections are not changed by hand: a plugin's. */
+export const isLockedList = (id: string | undefined): boolean => id != null && isPluginListId(id);
 
 /** Rows that left the list `fromId` join "Deleted symbols". */
 function keepDeleted(fromId: string, rows: readonly Row[]): void {
@@ -495,6 +587,8 @@ function dropSort(id: string): void {
  *  touch the rows). A section that left the list leaves the collapsed ones. */
 function mutateActive(fn: (l: WatchList) => void, keepSort = false): void {
   const i = activeIndex();
+  // A plugin's list only takes a sort or a collapsed section.
+  if (i >= 0 && !keepSort && state.lists[i].source) return;
   if (i >= 0) {
     setState("lists", i, produce((l: WatchList) => {
       fn(l);
@@ -580,6 +674,10 @@ export const watchlistStore = {
   copyActive(name?: string): string {
     const a = state.lists[activeIndex()];
     if (!a) return state.activeId;
+    if (listItemCount(a) > MAX_LIST_ITEMS) {
+      listFull();
+      return state.activeId;
+    }
     const nm = uniqueName(name ?? `${a.name} copy`);
     const id = uniqueId(nm);
     setState("lists", (ls) => [
@@ -595,6 +693,10 @@ export const watchlistStore = {
   copyList(id: string, name?: string): string | undefined {
     const src = state.lists.find((l) => l.id === id);
     if (!src) return undefined;
+    if (listItemCount(src) > MAX_LIST_ITEMS) {
+      listFull();
+      return undefined;
+    }
     const nm = uniqueName(name ?? `${src.name} copy`);
     const cid = uniqueId(nm);
     setState("lists", (ls) => [
@@ -632,7 +734,7 @@ export const watchlistStore = {
   /** Rename a list by id. */
   renameList(id: string, name: string): void {
     const i = state.lists.findIndex((l) => l.id === id);
-    if (i >= 0 && !isDeletedList(id)) setState("lists", i, "name", (cur) => name.trim() || cur);
+    if (i >= 0 && !isDeletedList(id) && !state.lists[i].source) setState("lists", i, "name", (cur) => name.trim() || cur);
   },
 
   /** Toggle a list's flagged/favourite state (the list-manager star). */
@@ -643,16 +745,21 @@ export const watchlistStore = {
 
   /** Create a list from imported sections (and any ungrouped symbols). A flat
    *  symbol list (no `###` headers) lands as a single "IMPORTED" section so it
-   *  renders under a header like the rest. */
-  importList(name: string, groups: Group[], extras: Row[] = []): string {
-    const nm = uniqueName(name || "Imported list");
-    const id = uniqueId(nm);
+   *  renders under a header like the rest. Returns its id, null when it
+   *  would hold more than MAX_LIST_ITEMS items (no list is made). */
+  importList(name: string, groups: Group[], extras: Row[] = []): string | null {
     let finalGroups = dedupeSections(groups);
     let finalExtras = extras;
     if (!groups.length && extras.length) {
       finalGroups = [{ name: "IMPORTED", rows: extras }];
       finalExtras = [];
     }
+    if (listItemCount({ groups: finalGroups, extras: finalExtras }) > MAX_LIST_ITEMS) {
+      listFull();
+      return null;
+    }
+    const nm = uniqueName(name || "Imported list");
+    const id = uniqueId(nm);
     setState("lists", (ls) => [...ls, { id, name: nm, flag: null, emoji: null, groups: finalGroups, extras: finalExtras, favorite: false, sort: "default" }]);
     setState("activeId", id);
     return id;
@@ -696,7 +803,7 @@ export const watchlistStore = {
   },
 
   renameActive(name: string): void {
-    if (isDeletedList(state.activeId)) return;
+    if (isDeletedList(state.activeId) || isPluginListId(state.activeId)) return;
     mutateActive((l) => {
       l.name = name.trim() || l.name;
     }, true);
@@ -704,7 +811,7 @@ export const watchlistStore = {
   /** Remove every row and section of the active list. */
   clearActive(): void {
     const cur = state.lists[activeIndex()];
-    if (!cur) return;
+    if (!cur || cur.source) return;
     const gone = rowsOf(unwrap(cur));
     mutateActive((l) => {
       l.groups = [];
@@ -715,10 +822,15 @@ export const watchlistStore = {
   /** Add a section named "SECTION 1", "SECTION 2", … Its header goes before
    *  the row `before`, so the section starts at that row and takes the rows
    *  under it up to the next header; with no such row it goes to the end of
-   *  the list. Returns its name. */
+   *  the list. Returns its name ("" when none was added). */
   addSection(before: string | null): string {
     let name = "";
-    if (isDeletedList(state.activeId)) return name;
+    const cur = state.lists[activeIndex()];
+    if (!cur || isDeletedList(cur.id) || cur.source) return name;
+    if (listItemCount(cur) + 1 > MAX_LIST_ITEMS) {
+      listFull();
+      return name;
+    }
     mutateActive((l) => {
       name = freeName(l.groups.map((g) => g.name), "SECTION", true);
       const g: Group = { name, rows: [] };
@@ -772,20 +884,26 @@ export const watchlistStore = {
    *  Rows already in the list are skipped: same full name, or a row stored
    *  under the new row's short name (both are checked). A missing anchor falls
    *  back to the end of the list, so an appended symbol joins the last
-   *  section. Returns the added tickers. */
-  addSymbols(rows: Row[], anchor: AddAnchor): string[] {
-    const added: string[] = [];
+   *  section. Returns the added tickers; null when they would take the list
+   *  past MAX_LIST_ITEMS items: then none is added. */
+  addSymbols(rows: Row[], anchor: AddAnchor): string[] | null {
+    const cur = state.lists[activeIndex()];
+    if (!cur || cur.source) return [];
+    const raw = unwrap(cur);
+    const has = (t: string) =>
+      raw.groups.some((g) => g.rows.some((r) => r.ticker === t || r.ticker === shortOf(t))) ||
+      raw.extras.some((r) => r.ticker === t || r.ticker === shortOf(t));
+    const fresh: Row[] = [];
+    for (const r of rows) {
+      if (has(r.ticker) || fresh.some((f) => f.ticker === r.ticker)) continue;
+      fresh.push(r);
+    }
+    if (!fresh.length) return [];
+    if (listItemCount(raw) + fresh.length > MAX_LIST_ITEMS) {
+      listFull();
+      return null;
+    }
     openGrown(activeIndex(), () => mutateActive((l) => {
-      const has = (t: string) =>
-        l.groups.some((g) => g.rows.some((r) => r.ticker === t || r.ticker === shortOf(t))) ||
-        l.extras.some((r) => r.ticker === t || r.ticker === shortOf(t));
-      const fresh: Row[] = [];
-      for (const r of rows) {
-        if (has(r.ticker) || fresh.some((f) => f.ticker === r.ticker)) continue;
-        fresh.push(r);
-      }
-      if (!fresh.length) return;
-      added.push(...fresh.map((r) => r.ticker));
       const bucket = (s: string | null) => (s == null ? l.extras : l.groups.find((g) => g.name === s)?.rows);
       if (anchor) {
         const dst = bucket(anchor.section);
@@ -801,12 +919,12 @@ export const watchlistStore = {
       }
       endOf(l).push(...fresh);
     }));
-    return added;
+    return fresh.map((r) => r.ticker);
   },
   /** Remove a symbol from the active list wherever it sits (section or extras). */
   removeSymbol(ticker: string): void {
     const cur = state.lists[activeIndex()];
-    if (!cur) return;
+    if (!cur || cur.source) return;
     const gone = rowsOf(unwrap(cur)).filter((r) => r.ticker === ticker);
     mutateActive((l) => {
       for (const g of l.groups) g.rows = g.rows.filter((r) => r.ticker !== ticker);
@@ -858,7 +976,7 @@ export const watchlistStore = {
    *  join "Deleted symbols". */
   removeItems(ids: readonly string[]): void {
     const cur = state.lists[activeIndex()];
-    if (!cur) return;
+    if (!cur || cur.source) return;
     const picked = new Set(ids);
     const raw = unwrap(cur);
     const extras: Row[] = raw.extras.filter((r) => !picked.has(r.ticker));
@@ -879,10 +997,11 @@ export const watchlistStore = {
     }));
     keepDeleted(cur.id, gone);
   },
-  /** Set (or clear, with `null`) a symbol's colour flag. Flags belong to
-   *  the symbol (symbol-flags.ts): it shows in every list holding it. */
-  setRowFlag(ticker: string, flag: FlagColor | null): void {
-    symbolFlags.setFlag(ticker, flag);
+  /** Set (or clear, with `null`) the colour flag of symbols, all or none
+   *  (false when the colour's list would pass MAX_LIST_ITEMS symbols). Flags
+   *  belong to the symbol (symbol-flags.ts): it shows in every list holding it. */
+  setRowsFlag(tickers: readonly string[], flag: FlagColor | null): boolean {
+    return symbolFlags.flagSymbols(tickers, flag);
   },
   /** Unflag every symbol, in all lists ("Unflag all symbols"). */
   clearAllFlags(): void {
@@ -890,16 +1009,20 @@ export const watchlistStore = {
   },
   /** Append a row to ANOTHER list ("Add X to watchlist" submenu).
    *  Deduped by full ticker across the target's sections and extras. Returns
-   *  true when the row was added, false when it already existed (a no-op) so the
-   *  caller can word its toast truthfully. */
+   *  true when the row was added, false when it already existed or the list
+   *  is full (a no-op) so the caller can word its toast truthfully. */
   addRowTo(listId: string, row: Row): boolean {
     const i = state.lists.findIndex((l) => l.id === listId);
-    if (i < 0) return false;
+    if (i < 0 || state.lists[i].source) return false;
     const l = state.lists[i];
     const exists =
       l.groups.some((g) => g.rows.some((r) => r.ticker === row.ticker)) ||
       l.extras.some((r) => r.ticker === row.ticker);
     if (exists) return false;
+    if (listItemCount(l) + 1 > MAX_LIST_ITEMS) {
+      listFull();
+      return false;
+    }
     openGrown(i, () => setState("lists", i, produce((wl: WatchList) => {
       endOf(wl).push({ ...row, flag: null });
     })));
@@ -920,7 +1043,7 @@ export const watchlistStore = {
    *  watchlist" submenu: a checked list row removes the symbol). */
   removeRowFrom(listId: string, ticker: string): void {
     const i = state.lists.findIndex((l) => l.id === listId);
-    if (i < 0) return;
+    if (i < 0 || state.lists[i].source) return;
     const keep = (r: Row) => r.ticker !== ticker && r.ticker !== shortOf(ticker);
     const gone = rowsOf(unwrap(state.lists[i])).filter((r) => !keep(r));
     setState("lists", i, produce((wl: WatchList) => {
@@ -936,18 +1059,43 @@ export const watchlistStore = {
    *  a section of that name. */
   addSectionTo(listId: string, name: string): boolean {
     const i = state.lists.findIndex((l) => l.id === listId);
-    if (i < 0 || isDeletedList(listId) || state.lists[i].groups.some((g) => g.name === name)) return false;
+    if (i < 0 || isDeletedList(listId) || state.lists[i].source || state.lists[i].groups.some((g) => g.name === name)) return false;
+    if (listItemCount(state.lists[i]) + 1 > MAX_LIST_ITEMS) {
+      listFull();
+      return false;
+    }
     setState("lists", i, produce((wl: WatchList) => {
       wl.groups.push({ name, rows: [] });
     }));
     dropSort(listId);
     return true;
   },
+  /** Append the items a list misses to it, all or none ("Add … to" a list
+   *  for a selection): rows (by full ticker, the same match as addRowTo) and
+   *  section names (empty sections at its end). Returns false when they would
+   *  take it past MAX_LIST_ITEMS items: then none is added. */
+  addItemsTo(listId: string, items: readonly (Row | string)[]): boolean {
+    const l = state.lists.find((x) => x.id === listId);
+    if (!l || l.source) return false;
+    const rows = new Set(rowsOf(l).map((r) => r.ticker));
+    const sections = new Set(l.groups.map((g) => g.name));
+    const missing = items.filter((it) => (typeof it === "string" ? !isDeletedList(listId) && !sections.has(it) : !rows.has(it.ticker)));
+    const fresh = new Set(missing.map((it) => (typeof it === "string" ? sectionId(it) : it.ticker)));
+    if (listItemCount(l) + fresh.size > MAX_LIST_ITEMS) {
+      listFull();
+      return false;
+    }
+    for (const it of missing) {
+      if (typeof it === "string") watchlistStore.addSectionTo(listId, it);
+      else watchlistStore.addRowTo(listId, it);
+    }
+    return true;
+  },
   /** Remove a section header from any list: its rows stay and join the
    *  section above (the rows with no section for the first one). */
   removeSectionFrom(listId: string, name: string): void {
     const i = state.lists.findIndex((l) => l.id === listId);
-    if (i < 0) return;
+    if (i < 0 || state.lists[i].source) return;
     setState("lists", i, produce((wl: WatchList) => {
       const gi = wl.groups.findIndex((g) => g.name === name);
       if (gi < 0) return;
@@ -959,21 +1107,62 @@ export const watchlistStore = {
   },
   /** Create a new list seeded with rows WITHOUT switching the active list
    *  ("Add X to watchlist → Create new list…"). A string among the items is
-   *  a section header: the rows after it are its rows. Returns the new name. */
-  createListWith(row: Row | (Row | string)[], name = "New list"): string {
-    const nm = uniqueName(name);
-    const id = uniqueId(nm);
+   *  a section header: the rows after it are its rows. Returns the new name,
+   *  null when it would hold more than MAX_LIST_ITEMS items (no list is made). */
+  createListWith(row: Row | (Row | string)[], name = "New list"): string | null {
     const extras: Row[] = [];
     const groups: Group[] = [];
     for (const it of Array.isArray(row) ? row : [row]) {
       if (typeof it !== "string") (groups.length ? groups[groups.length - 1].rows : extras).push({ ...it, flag: null });
       else if (!groups.some((g) => g.name === it)) groups.push({ name: it, rows: [] });
     }
+    if (listItemCount({ groups, extras }) > MAX_LIST_ITEMS) {
+      listFull();
+      return null;
+    }
+    const nm = uniqueName(name);
+    const id = uniqueId(nm);
     setState("lists", (ls) => [
       ...ls,
       { id, name: nm, flag: null, emoji: null, groups, extras, favorite: false, sort: "default" },
     ]);
     return nm;
+  },
+
+  /** The store list of a plugin's list (#381), if it was opened once. */
+  pluginList(source: PluginListSource): WatchList | undefined {
+    return state.lists.find((l) => l.source?.plugin === source.plugin && l.source.list === source.list);
+  },
+  /** Make the store list of a plugin's list, or bring it up to date: the
+   *  plugin's name, sections and symbols (a collapsed section stays
+   *  collapsed). Does not switch lists. Returns its id. */
+  setPluginList(source: PluginListSource, name: string, groups: Group[], extras: Row[]): string {
+    const i = state.lists.findIndex((l) => l.source?.plugin === source.plugin && l.source.list === source.list);
+    const finalGroups = dedupeSections(groups);
+    if (i < 0) {
+      const nm = uniqueName(name);
+      const id = uniqueId(nm);
+      setState("lists", (ls) => [...ls, { id, name: nm, flag: null, emoji: null, groups: finalGroups, extras, favorite: false, sort: "default", source: { ...source } }]);
+      return id;
+    }
+    const cur = state.lists[i];
+    const same =
+      JSON.stringify([cur.groups.map((g) => [g.name, g.rows.map((r) => r.ticker)]), cur.extras.map((r) => r.ticker)]) ===
+      JSON.stringify([finalGroups.map((g) => [g.name, g.rows.map((r) => r.ticker)]), extras.map((r) => r.ticker)]);
+    const nm = cur.name === name || state.lists.every((l) => l.name !== name) ? name : cur.name;
+    if (same && nm === cur.name) return cur.id;
+    // Rows already shown keep their last quote.
+    const kept = new Map(rowsOf(unwrap(cur)).map((r) => [r.ticker, r]));
+    const keep = (r: Row): Row => kept.get(r.ticker) ?? r;
+    setState("lists", i, produce((wl: WatchList) => {
+      wl.name = nm;
+      if (same) return;
+      wl.groups = finalGroups.map((g) => ({ name: g.name, rows: g.rows.map(keep) }));
+      wl.extras = extras.map(keep);
+      if (wl.collapsed?.length) wl.collapsed = wl.collapsed.filter((n) => wl.groups.some((g) => g.name === n));
+    }));
+    if (!same) dropSort(cur.id);
+    return cur.id;
   },
 
   // ── List alerts (local price-move alert per list) ──

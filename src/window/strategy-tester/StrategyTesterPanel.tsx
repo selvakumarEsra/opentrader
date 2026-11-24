@@ -12,12 +12,21 @@
  * The report is the one computed for the active chart (strategy-tester-store,
  * written by the strategy registry entries when the backtest worker answers).
  */
-import { Show, For, createEffect, createMemo, createSignal, on } from "solid-js";
+import { Show, For, createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
 import { Icon } from "../../components/Icon";
 import { Tooltip } from "../../components/Tooltip";
 import { Popover, PopItem, PopDivider } from "../screener/Popover";
 import { strategyTester } from "../../data/strategy-tester-store";
-import { getStrategyEntry, hasHistoryTickOption, strategyDefKeyOf, strategyDefaults, strategyKeyOf } from "../chart/indicators/strategy-entries";
+import {
+  STRATEGY_UPDATED_EVENT,
+  getStrategyEntry,
+  hasHistoryTickOption,
+  strategyDefKeyOf,
+  strategyDefaults,
+  strategyKeyOf,
+} from "../chart/indicators/strategy-entries";
+import { onPluginScriptsChanged } from "../../data/plugin-scripts";
+import { onAppEvent } from "../../data/app-events";
 import { STRATEGIES } from "../../backtester/strategies";
 import { ReportToolbar } from "./ReportToolbar";
 import { KeyStatsInline, MetricsView } from "./MetricsView";
@@ -36,6 +45,7 @@ import { cachedSymbolSessions, symbolSessions } from "../../data/session";
 import { DEFAULT_SYMBOL, type BacktestReport } from "../../backtester/types";
 import { REPLAY_TABS, STRATEGY_TABS, reportSheets, reportXlsxFileName, type ReportTab } from "./xlsx-report";
 import { buildXlsx } from "./xlsx-writer";
+import { saveFile } from "../../data/save-file";
 
 /** Tab id of the Replay Trading tab (strategy tabs use their study ids). */
 const REPLAY_TAB = "replay-trading";
@@ -87,11 +97,27 @@ export function StrategyTesterPanel(props: Props) {
   const accountShown = () => !!pluginBroker.status()?.active;
   const [selected, setSelected] = createSignal<string | null>(null);
   const [menuFor, setMenuFor] = createSignal<{ id: string; anchor: HTMLElement } | null>(null);
+  // The strategies' entries change outside Solid: a script compiled (its declared title), a plugin's script sent
+  // again or taken back (#402). Their tabs read them again then.
+  const [entriesRev, setEntriesRev] = createSignal(0);
+  const entriesChanged = () => setEntriesRev((n) => n + 1);
+  onCleanup(onPluginScriptsChanged(entriesChanged));
+  onCleanup(onAppEvent(STRATEGY_UPDATED_EVENT, entriesChanged));
+  /** The chart's strategies that can run: a strategy whose script is gone (a plugin no longer sends it) has no tab,
+   *  as its study draws nothing; it stays in the layout. */
+  const strategyIds = createMemo(
+    () => {
+      entriesRev();
+      return props.strategyIds.filter((id) => getStrategyEntry(id) !== undefined);
+    },
+    undefined,
+    { equals: (a, b) => a.length === b.length && a.every((id, i) => id === b[i]) },
+  );
 
   // Keep a valid selection: the last strategy added when the current one left
   // (the Replay Trading tab while it exists and no strategy is left).
   createEffect(() => {
-    const ids = props.strategyIds;
+    const ids = strategyIds();
     const cur = selected();
     if (cur === REPLAY_TAB && props.replayTab) return;
     if (cur === JOURNAL_TAB && tradeJournal.open()) return;
@@ -150,6 +176,7 @@ export function StrategyTesterPanel(props: Props) {
   );
 
   const title = (id: string) => {
+    entriesRev();
     const def = STRATEGIES.find((s) => s.key === strategyDefKeyOf(id));
     const entry = getStrategyEntry(id) as { name?: string; shortName?: string } | undefined;
     return def?.shortTitle ?? entry?.shortName ?? entry?.name ?? id;
@@ -182,11 +209,7 @@ export function StrategyTesterPanel(props: Props) {
       tabs,
     );
     const blob = new Blob([buildXlsx(sheets)], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = reportXlsxFileName(id === REPLAY_TAB ? "Replay Trading" : title(id), sym);
-    a.click();
-    URL.revokeObjectURL(a.href);
+    void saveFile(reportXlsxFileName(id === REPLAY_TAB ? "Replay Trading" : title(id), sym), blob);
   }
 
   const contentHeight = () => strategyTester.height() || DEFAULT_HEIGHT;
@@ -228,7 +251,7 @@ export function StrategyTesterPanel(props: Props) {
   };
 
   return (
-    <Show when={props.strategyIds.length > 0 || props.replayTab || tradeJournal.open() || accountShown()}>
+    <Show when={strategyIds().length > 0 || props.replayTab || tradeJournal.open() || accountShown()}>
       <section
         ref={rootRef}
         class="st-panel"
@@ -327,7 +350,7 @@ export function StrategyTesterPanel(props: Props) {
                   );
                 })()}
               </Show>
-              <For each={props.strategyIds}>
+              <For each={strategyIds()}>
                 {(id) => {
                   const active = () => id === selected() && !strategyTester.collapsed();
                   let caretRef: HTMLButtonElement | undefined;

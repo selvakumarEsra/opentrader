@@ -1,7 +1,7 @@
 /*
  * Live bars of a chart view: the symbol's live slot, the merge of live bars
  * into the loaded series, the repaint (deferred while the tab is hidden), the
- * footprint sub-bars and the seconds REST refresh.
+ * footprint sub-bars, the seconds REST refresh and the ticks of tick charts.
  */
 import { createEffect, onCleanup, onMount } from "solid-js";
 import { type UTCTimestamp } from "lightweight-charts";
@@ -14,8 +14,11 @@ import {
   isSecondResolution,
   setLiveSymbol,
   subscribeBars,
+  tickCount,
   type LiveBar,
 } from "../../../data/datafeed";
+import { onPluginTicks, setTickSubscription } from "../../../data/datafeed-live";
+import { nextTickBarTime } from "../../../data/tick-bars";
 import { cachedSymbolSessions } from "../../../data/session";
 import { setDataForType, type OHLC } from "../chart-types";
 import { toOHLC } from "./helpers";
@@ -26,12 +29,18 @@ import { type ChartCx } from "./context";
 const LIVE_PAINT_MS = 33;
 
 /** The bar a live paint gives the series' incremental update, or null to set the whole series again. The paint
- *  waits for a frame and the studies' results (up to LIVE_WAIT_MS): the series may have been given other bars
+ *  waits for the studies' results (up to LIVE_WAIT_MS): the series may have been given other bars
  *  meanwhile (another interval or symbol, a reload), whose newest bar can be later than the queued one, which the
  *  chart library refuses (#361). The bars' own newest bar is painted, the queued one only told which bar moved. */
 export function liveUpdateBar(queued: OHLC | null, bars: readonly OHLC[]): OHLC | null {
   const last = bars[bars.length - 1];
   return queued && last && last.time === queued.time ? last : null;
+}
+
+/** A live bar is left out while the series has no bars and its history is loading: the history has that bar. Once a
+ *  load gave no bars (a symbol listed today), live bars start the series. */
+export function liveBarWaitsForHistory(historyLoading: boolean, bars: readonly OHLC[]): boolean {
+  return historyLoading && bars.length === 0;
 }
 
 /** What createLive adds to the chart context. */
@@ -94,11 +103,12 @@ export function createLive(cx: ChartCx): LiveApi {
     }
     paintWhenCalculated(next, appended);
   }
-  /** The live bar to paint: a tick merges into it, and it is painted at most once per animation frame, after its
+  /** The live bar to paint: a tick merges into it, and it is painted at most every LIVE_PAINT_MS, after its
    *  studies' worker results (#259, #262). A newer tick of the same bar takes its place; another bar's sets the
-   *  whole series again (next = null). Ticks that come while the studies calculate wait for the next frame. */
+   *  whole series again (next = null). Ticks that come while the studies calculate wait for the next paint. */
   let waiting: { next: OHLC | null; appended: boolean } | null = null;
-  let frame = 0;
+  /** Waiting for the page to be shown again. */
+  let waitingShown = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let calculating = false;
   let paintedAt = -Infinity;
@@ -108,20 +118,33 @@ export function createLive(cx: ChartCx): LiveApi {
       : { next, appended };
     schedulePaint();
   }
-  /** The next live paint: on an animation frame, at least LIVE_PAINT_MS after the one before. The chart library draws
-   *  every series of the pane again on each paint, which at 60 per second takes cores on charts with many plots
-   *  (#264). */
+  /** The next live paint: at least LIVE_PAINT_MS after the one before, and not while the page is hidden (a minimised
+   *  window, a browser tab in the background): it paints once shown. The chart library draws every series of the
+   *  pane again on each paint, which at 60 per second takes cores on charts with many plots (#264). Not on an
+   *  animation frame of its own: the chart library draws on the next one, a frame of ours before it was a second frame
+   *  per live update with nothing drawn (#249). */
   function schedulePaint() {
-    if (frame || timer || calculating) return;
-    const wait = paintedAt + LIVE_PAINT_MS - performance.now();
-    if (wait <= 0) frame = requestAnimationFrame(paintFrame);
-    else timer = setTimeout(() => {
+    if (waitingShown || timer || calculating) return;
+    const wait = Math.max(0, paintedAt + LIVE_PAINT_MS - performance.now());
+    timer = setTimeout(() => {
       timer = null;
-      frame = requestAnimationFrame(paintFrame);
+      if (!document.hidden) {
+        paintNow();
+        return;
+      }
+      waitingShown = true;
+      const shown = () => {
+        if (document.hidden) return;
+        document.removeEventListener("visibilitychange", shown);
+        waitingShown = false;
+        paintNow();
+      };
+      document.addEventListener("visibilitychange", shown);
+      stopWaitingShown = () => document.removeEventListener("visibilitychange", shown);
     }, wait);
   }
-  function paintFrame() {
-    frame = 0;
+  let stopWaitingShown = () => {};
+  function paintNow() {
     paintedAt = performance.now();
     const w = waiting;
     waiting = null;
@@ -142,7 +165,7 @@ export function createLive(cx: ChartCx): LiveApi {
     });
   }
   onCleanup(() => {
-    if (frame) cancelAnimationFrame(frame);
+    stopWaitingShown();
     if (timer) clearTimeout(timer);
   });
   /** Run `fn` (several series data changes) with the crosshair parked. While a
@@ -215,6 +238,9 @@ export function createLive(cx: ChartCx): LiveApi {
     // A window of past bars: live bars come again once it reaches now.
     if (cx.pastWindowEnd !== null) return null;
     const all = cx.allBars;
+    // The first history load is still under way (the app opens on an empty chart): the history brings this bar. A
+    // live bar taken now made a one-bar chart that the studies were drawn on for the time the history took (#360).
+    if (liveBarWaitsForHistory(history.loading, all)) return null;
     const lastTime = all.length > 0 ? (all[all.length - 1].time as number) : -1;
     let next: OHLC;
     let appended = false;
@@ -302,6 +328,57 @@ export function createLive(cx: ChartCx): LiveApi {
     subscribeBars(() => props.symbol, () => props.interval ?? "1D", applyLiveBar, () => props.session ?? "RTH").then((u) => {
       if (aggregateDisposed) { u(); return; }
       unlistenAggregate = u;
+    });
+  });
+
+  // ── Tick charts (#376) ─────────────────────────────────────────────
+  // The pane's data plugin streams the symbol's ticks while it shows a tick
+  // interval. A tick goes into the last bar until that bar holds N ticks, then
+  // starts the next bar. A bar loaded with the history is a whole one: the
+  // next tick starts a new bar.
+  createEffect(() => {
+    const sym = props.symbol ?? null;
+    const ticks = tickCount(props.interval ?? "1D") !== null;
+    setTickSubscription(ticks ? sym : null, String(paneId)).catch((e) => console.warn("[chart] setTickSubscription failed:", e));
+  });
+  /** The live bar this pane is filling with ticks, and how many it holds. */
+  let tickBar: { time: number; count: number } | null = null;
+  let unlistenTicks: UnlistenFn | null = null;
+  onMount(() => {
+    onPluginTicks((e) => {
+      const n = tickCount(props.interval ?? "1D");
+      const sym = props.symbol;
+      if (n === null || !sym || e.symbol.toUpperCase() !== sym.toUpperCase()) return;
+      let painted: { next: OHLC; appended: boolean } | null = null;
+      let appended = false;
+      for (const t of e.ticks) {
+        const all = cx.allBars;
+        const last = all[all.length - 1];
+        // No bars yet (loading): the history has these ticks.
+        if (!last || t.timeMs === null || t.price === null) continue;
+        const lastTime = last.time as number;
+        const volume = t.volume ?? 0;
+        const one = { open: t.price, high: t.price, low: t.price, close: t.price };
+        let r: { next: OHLC; appended: boolean } | null;
+        if (tickBar && tickBar.time === lastTime && tickBar.count < n) {
+          r = applyLiveBar({ time: lastTime, ...one, volume, volumeIsIncrement: true }, false);
+          if (r) tickBar.count++;
+        } else {
+          // A tick older than the last bar is in the history already.
+          if (t.timeMs / 1000 < lastTime) continue;
+          const time = nextTickBarTime(t.timeMs, lastTime);
+          r = applyLiveBar({ time, ...one, volume }, false);
+          if (r) tickBar = { time, count: 1 };
+        }
+        if (r) {
+          painted = r;
+          appended ||= r.appended;
+        }
+      }
+      if (painted) paintLiveOrDefer(painted.next, appended);
+    }).then((u) => {
+      if (aggregateDisposed) { u(); return; }
+      unlistenTicks = u;
     });
   });
 
@@ -435,8 +512,10 @@ export function createLive(cx: ChartCx): LiveApi {
   onCleanup(() => {
     aggregateDisposed = true;
     unlistenAggregate?.();
+    unlistenTicks?.();
     // Clear only THIS pane's slot — sibling panes keep their live symbols.
     setLiveSymbol(null, String(paneId)).catch(() => {});
+    setTickSubscription(null, String(paneId)).catch(() => {});
   });
 
   return {

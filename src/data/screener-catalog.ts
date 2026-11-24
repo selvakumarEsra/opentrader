@@ -28,7 +28,9 @@ export type Fmt =
   | "change" //      +6.47%, colored
   | "percent" //     5.22%
   | "volume" //      9.07 M
+  | "signedVolume" // +39.66 M, colored
   | "money" //       4.8 B USD
+  | "signedMoney" // +4.56 B USD, colored
   | "number" //      1.79
   | "integer" //     25
   | "date" //        27/09/2026 (UNIX seconds)
@@ -102,7 +104,13 @@ export type ColumnDef = {
      *  `codes`: the value is a short code shown before the label ("SPX • S&P 500").
      *  `adaptive`: a single checked value is the pill text (the reference app
      *  `adaptiveFilterTitle`). */
-    | { type: "CheckboxGroup"; options: [value: string, label: string][] | "data"; codes?: boolean; adaptive?: boolean };
+    | { type: "CheckboxGroup"; options: [value: string, label: string][] | "data"; codes?: boolean; adaptive?: boolean;
+        /** One value at a time (the reference app RadioGroup filter): a plain list, a click picks the value, the
+         *  active pill shows it. */
+        single?: boolean;
+        /** The values are day ranges relative to today (the reference app Date filter, see RELATIVE_DATES): the
+         *  column holds days as UNIX seconds. */
+        relativeDate?: boolean };
   /** Text shown for a raw cell value (a list of codes shown as names). */
   cellText?: (raw: string) => string;
   /** Kept out of the Column setup list (the reference app `isExcludedFromColumnsList`). */
@@ -188,6 +196,25 @@ const MA_PRESETS = (id: "Ema" | "Ma"): Preset[] => [
   { operation: "below", target: id, leftParams: { length: "50" }, right: { column: { id, params: { length: "100", resolution: "TimeResolution1D" } } }, ...d("Bearish alignment") },
 ];
 
+/** Extended-hours columns (the reference column kinds: a price, a coloured percent change with the Change presets, a
+ *  coloured amount, a volume). */
+const extPrice = (id: string, title: string, short: string, field: string): ColumnDef => ({
+  id, title, short, category: "marketData", align: "right", fmt: "price", width: 99, field,
+  filter: { type: "Condition", operations: ALL_OPS, defaultOperation: "aboveOrEqual", targets: PRICE_TARGETS(id) },
+});
+const extChange = (id: string, title: string, short: string, field: string): ColumnDef => ({
+  id, title, short, category: "marketData", align: "right", fmt: "change", width: 90, field,
+  filter: { type: "Condition", operations: CHANGE_OPS, defaultOperation: "above", targets: CHANGE_TARGETS, presets: BANDS },
+});
+const extChangeAbs = (id: string, title: string, short: string, field: string): ColumnDef => ({
+  id, title, short, category: "marketData", align: "right", fmt: "signedPrice", width: 90, field,
+  filter: { type: "Condition", operations: CHANGE_OPS, defaultOperation: "above", targets: [["value"]] },
+});
+const extVolume = (id: string, title: string, short: string, field: string): ColumnDef => ({
+  id, title, short, category: "marketData", align: "right", fmt: "volume", width: 90, field,
+  filter: { type: "Condition", operations: ["above", "below", "between", "outside", "equal"], defaultOperation: "above", targets: [["value"]] },
+});
+
 /** An ETF's weight of its largest holdings, % of net assets. */
 const topWeight = (id: string, title: string, short: string, field: string): ColumnDef => ({
   id, title, short, category: "securityInfo", align: "right", fmt: "percent", width: 90, field,
@@ -204,8 +231,12 @@ const oscillator = (id: string, title: string, short: string, params: ParamDef[]
   filter: { type: "Condition", operations: ALL_OPS, defaultOperation: "aboveOrEqual", targets: [["value", id]] },
 });
 
-// Price-like right-hand targets (the reference app groups: Value | Open High Low Price | EMA SMA).
-const PRICE_TARGETS = (self: string) => [["value"], ["Open", "High", "Low", "Price"].filter((x) => x !== self), ["Ema", "Ma"]];
+// Price-like right-hand targets (the reference app groups: Value | Open High Low Price | EMA SMA | the extended-hours
+// prices).
+const EXT_PRICES = ["PostMarketHigh", "PostMarketLow", "PostMarketOpen", "PostMarketClose", "PreMarketHigh", "PreMarketLow", "PreMarketOpen", "PreMarketClose"];
+const PRICE_TARGETS = (self: string) => [["value"], ["Open", "High", "Low", "Price"].filter((x) => x !== self), ["Ema", "Ma"], EXT_PRICES.filter((x) => x !== self)];
+/** The right-hand targets of the percent changes (the reference Change filter's list). */
+const CHANGE_TARGETS = [["value", "ChangeFromOpen", "Gap", "PostMarketChange", "PreMarketChange", "PreMarketChangeFromOpen", "PreMarketGap", "Change"]];
 const ALL_OPS: Operation[] = ["above", "aboveOrEqual", "below", "belowOrEqual", "between", "outside", "equal"];
 const CHANGE_OPS: Operation[] = ["above", "below", "between", "outside", "equal"];
 
@@ -250,8 +281,22 @@ const fund = (id: string, title: string, short: string, category: Category, fmt:
   ...(typeof source === "string" ? { field: source } : { params: source }),
   ...(fmt === "text" || fmt === "date" ? {} : { filter: NUM_FILTER }),
 });
+/** The reference app Date filter of the recent earnings date: day ranges relative to today in New York, calendar
+ *  days, weeks from Monday (its scanner's in_day_range / in_week_range / in_month_range, measured 23/11/2026). */
+export const RELATIVE_DATES: Record<string, { unit: "day" | "week" | "month"; from: number; to: number }> = {
+  Today: { unit: "day", from: 0, to: 0 },
+  Yesterday: { unit: "day", from: -1, to: -1 },
+  Previous5Days: { unit: "day", from: -5, to: -1 },
+  ThisWeek: { unit: "week", from: 0, to: 0 },
+  PreviousWeek: { unit: "week", from: -1, to: -1 },
+  ThisMonth: { unit: "month", from: 0, to: 0 },
+};
 const FUNDAMENTALS: ColumnDef[] = [
   // Security info
+  { id: "EarningsRecent", title: "Recent earnings date", short: "Recent earnings date", category: "securityInfo", align: "right", fmt: "date",
+    width: 90, field: "f.earnings_recent", filter: { type: "CheckboxGroup", single: true, relativeDate: true, options: [
+      ["Today", "Current trading day"], ["Yesterday", "Previous day"], ["Previous5Days", "Previous 5 days"], ["ThisWeek", "This week"],
+      ["PreviousWeek", "Previous week"], ["ThisMonth", "This month"]] } },
   fund("RecentFiscalPeriod", "Recent fiscal period", "Fiscal period", "securityInfo", "text", FP(["current", "f.fiscal_period"])),
   fund("FiscalPeriodEndDate", "Fiscal period end date", "Fiscal period end", "securityInfo", "date", FP(["current", "f.fiscal_period_end"])),
   // Financials: income statement, balance sheet, cash flow
@@ -359,8 +404,14 @@ export const COLUMNS: ColumnDef[] = [
       { operation: "above", target: "value", right: { value: 0 }, ...d("Positive sensitivity") },
       { operation: "below", target: "value", right: { value: 0 }, ...d("Inverse sensitivity") },
     ] } },
-  { id: "Change", title: "Price change %", short: "Chg %", category: "marketData", align: "right", fmt: "change", width: 80, params: RES_1D("change"),
-    filter: { type: "Condition", operations: CHANGE_OPS, defaultOperation: "above", targets: [["value", "ChangeFromOpen", "Gap", "Change"]], presets: BANDS } },
+  // 1h and 4h: the price against the close of the regular session's previous 1h / 4h bar (bars from 09:30).
+  { id: "Change", title: "Price change %", short: "Chg %", category: "marketData", align: "right", fmt: "change", width: 80,
+    params: [{ key: "resolution", title: "Interval", default: "TimeResolution1D", options: [
+      { value: "TimeResolution60", label: "1 hour", short: "1h", field: "change|60" },
+      { value: "TimeResolution240", label: "4 hours", short: "4h", field: "change|240" },
+      { value: "TimeResolution1D", label: "1 day", short: "1D", field: "change" },
+    ] }],
+    filter: { type: "Condition", operations: CHANGE_OPS, defaultOperation: "above", targets: CHANGE_TARGETS, presets: BANDS } },
   { id: "ChangeAbs", title: "Price change", short: "Chg", category: "marketData", align: "right", fmt: "signedPrice", width: 86, params: RES_1D("change_abs"),
     filter: { type: "Condition", operations: CHANGE_OPS, defaultOperation: "above", targets: [["value"]], presets: [
       { operation: "below", target: "value", right: { value: 1 } },
@@ -399,6 +450,7 @@ export const COLUMNS: ColumnDef[] = [
       { value: "Interval1Y", label: "1 year", short: "1Y", field: "Perf.Y" },
       { value: "Interval5Y", label: "5 years", short: "5Y", field: "Perf.5Y" },
       { value: "Interval10Y", label: "10 years", short: "10Y", field: "Perf.10Y" },
+      { value: "IntervalAll", label: "All Time", short: "All Time", field: "Perf.All" },
     ] }],
     filter: { type: "Condition", operations: CHANGE_OPS, defaultOperation: "above", targets: [["value"]], presets: BANDS } },
   { id: "Price", title: "Price", short: "Price", category: "marketData", align: "right", fmt: "price", width: 99, field: "close",
@@ -436,6 +488,31 @@ export const COLUMNS: ColumnDef[] = [
     filter: { type: "Condition", operations: ["above", "below", "between", "outside", "equal"], defaultOperation: "above", targets: [["value"]] } },
   { id: "Volume", title: "Volume", short: "Vol", category: "marketData", align: "right", fmt: "volume", width: 90, params: RES_DWM("volume", "volume|1W", "volume|1M"),
     filter: { type: "Condition", operations: ["above", "below", "between", "outside", "equal"], defaultOperation: "above", targets: [["value", "AverageVolume", "Volume"]] } },
+  // The session's volume against the previous session's (colored like the price change).
+  { id: "VolumeChange", title: "Volume change %", short: "Vol chg %", category: "marketData", align: "right", fmt: "change", width: 86, params: RES_1D("volume_change"),
+    filter: { type: "Condition", operations: ["above", "below", "between", "outside", "equal"], defaultOperation: "above", targets: [["value"]] } },
+  { id: "VolumeChangeAbs", title: "Volume change", short: "Vol chg", category: "marketData", align: "right", fmt: "signedVolume", width: 90, params: RES_1D("volume_change_abs"),
+    filter: { type: "Condition", operations: ["above", "below", "between", "outside", "equal"], defaultOperation: "above", targets: [["value"]] } },
+  // Market data (extended hours): the pre-market (04:00-09:30 New York) of the latest session that traded, shown all
+  // day, and its post-market (to 20:00), shown overnight; the changes against the previous close (pre-market) and
+  // the day's close (post-market), the gap = the pre-market open against the previous close.
+  extPrice("PreMarketOpen", "Pre-market open", "Pre-mkt open", "premarket_open"),
+  extPrice("PreMarketHigh", "Pre-market high", "Pre-mkt high", "premarket_high"),
+  extPrice("PreMarketLow", "Pre-market low", "Pre-mkt low", "premarket_low"),
+  extPrice("PreMarketClose", "Pre-market price", "Pre-mkt price", "premarket_close"),
+  extChange("PreMarketChange", "Pre-market change %", "Pre-mkt chg %", "premarket_change"),
+  extChangeAbs("PreMarketChangeAbs", "Pre-market change", "Pre-mkt chg", "premarket_change_abs"),
+  extChange("PreMarketChangeFromOpen", "Pre-market change from open %", "Pre-mkt chg from open %", "premarket_change_from_open"),
+  extChangeAbs("PreMarketChangeFromOpenAbs", "Pre-market change from open", "Pre-mkt chg from open", "premarket_change_from_open_abs"),
+  extChange("PreMarketGap", "Pre-market gap %", "Pre-mkt gap %", "premarket_gap"),
+  extVolume("PreMarketVolume", "Pre-market volume", "Pre-mkt vol", "premarket_volume"),
+  extPrice("PostMarketOpen", "Post-market open", "Post-mkt open", "postmarket_open"),
+  extPrice("PostMarketHigh", "Post-market high", "Post-mkt high", "postmarket_high"),
+  extPrice("PostMarketLow", "Post-market low", "Post-mkt low", "postmarket_low"),
+  extPrice("PostMarketClose", "Post-market price", "Post-mkt price", "postmarket_close"),
+  extChange("PostMarketChange", "Post-market change %", "Post-mkt chg %", "postmarket_change"),
+  extChangeAbs("PostMarketChangeAbs", "Post-market change", "Post-mkt chg", "postmarket_change_abs"),
+  extVolume("PostMarketVolume", "Post-market volume", "Post-mkt vol", "postmarket_volume"),
   // Technicals
   { id: "AverageDailyRange", title: "Average daily range", short: "ADR", category: "technicals", align: "right", fmt: "price", width: 86, field: "ADR",
     filter: { type: "Condition", operations: ["between"], defaultOperation: "between", targets: [["value"]] } },
@@ -545,12 +622,38 @@ export const COLUMNS: ColumnDef[] = [
     filter: { type: "CheckboxGroup", options: "data" } },
   { id: "Leveraged", title: "Leveraged", short: "Leveraged", category: "securityInfo", align: "left", fmt: "text", width: 110, field: "f.leveraged", noColumn: true,
     filter: { type: "CheckboxGroup", options: "data" } },
+  // The reference: a filter only, the Leverage column shows the ratio with the flag.
   { id: "LeverageRatio", title: "Leverage ratio", short: "Leverage ratio", category: "securityInfo", align: "left", fmt: "text", width: 100, field: "f.leverage_ratio",
+    noColumn: true, filter: { type: "CheckboxGroup", options: "data" } },
+  { id: "Leverage", title: "Leverage", short: "Leverage", category: "securityInfo", align: "left", fmt: "text", width: 120, field: "f.leverage" },
+  // The fund family (the start of the funds' names), the adviser's parent company, the index a passive fund tracks
+  // (the annual fund census, the prospectus summaries, the legal entity records).
+  { id: "Brand", title: "Brand", short: "Brand", category: "securityInfo", align: "left", fmt: "text", width: 130, field: "f.brand",
     filter: { type: "CheckboxGroup", options: "data" } },
+  { id: "Issuer", title: "Issuer", short: "Issuer", category: "securityInfo", align: "left", fmt: "text", width: 220, field: "f.issuer",
+    filter: { type: "CheckboxGroup", options: "data" } },
+  { id: "IndexTracked", title: "Index tracked", short: "Index", category: "securityInfo", align: "left", fmt: "text", width: 220, field: "f.index_tracked",
+    filter: { type: "CheckboxGroup", options: "data" } },
+  { id: "Management", title: "Management style", short: "Management style", category: "securityInfo", align: "left", fmt: "text", width: 130,
+    field: "f.management", filter: { type: "CheckboxGroup", options: "data", single: true } },
+  { id: "DividendTreatment", title: "Dividend treatment", short: "Div treat", category: "dividends", align: "left", fmt: "text", width: 110,
+    field: "f.dividend_treatment", filter: { type: "CheckboxGroup", options: "data", single: true } },
+  // Money into the fund over the period (its weekly share count changes x the price), a column once the gateway's
+  // share count history covers the period.
+  { id: "FundFlows", title: "Fund flows", short: "Fund flows", category: "valuation", align: "right", fmt: "signedMoney", width: 110, financial: true,
+    params: [{ key: "interval", title: "Date Range", default: "Interval1M", options: [
+      { value: "Interval1M", label: "1 month", short: "1M", field: "f.fund_flows_1m" },
+      { value: "Interval3M", label: "3 months", short: "3M", field: "f.fund_flows_3m" },
+      { value: "IntervalYTD", label: "Year to date", short: "YTD", field: "f.fund_flows_ytd" },
+      { value: "Interval1Y", label: "1 year", short: "1Y", field: "f.fund_flows_1y" },
+      { value: "Interval3Y", label: "3 years", short: "3Y", field: "f.fund_flows_3y" },
+      { value: "Interval5Y", label: "5 years", short: "5Y", field: "f.fund_flows_5y" },
+    ] }],
+    filter: { type: "Condition", operations: ["above", "below", "between", "outside", "equal"], defaultOperation: "above", targets: [["value"]] } },
 ];
 /** Columns of the ETF Screener only (fund data). */
 const ETF_ONLY = new Set(["AssetsUnderManagement", "AssetClass", "ExpenseRatio", "TotalHoldings", "PercentInTop10", "PercentInTop25", "PercentInTop50",
-  "DividendsFrequency", "Leveraged", "LeverageRatio"]);
+  "DividendsFrequency", "Leveraged", "LeverageRatio", "Leverage", "Brand", "Issuer", "IndexTracked", "Management", "DividendTreatment", "FundFlows"]);
 
 /** Columns of the ETF Screener (the reference ETF catalog restricted to ours): market data, technicals, exchange,
  *  indicated dividend yield and the fund data. The Stock Screener has every other column. */
@@ -715,7 +818,7 @@ const TECHNICALS = [C("TechnicalRating", R1D), C("RatingMa", R1D), C("RatingOsci
   C("AwesomeOscillator", R1D), C("CommodityChannelIndex", { resolution: "TimeResolution1D", length: "20" }), STOCH_3_3("Stochastic:K"), STOCH_3_3("Stochastic:D"),
   C("Pattern", R1D)];
 /** The reference app column-set presets, in the reference app menu order (03/11/2026). Columns without a data
- *  source are left out (analyst rating, estimates, extended hours, all-time performance...); a preset with no column the backend has is not listed. */
+ *  source are left out (analyst rating, estimates...); a preset with no column the backend has is not listed. */
 export const COLUMN_SETS: { id: string; title: string; columns: ColumnRef[] }[] = [
   { id: "overview", title: "Overview", columns: [C("Price"), C("Change", R1D), C("Volume", R1D), C("RelativeVolume", R1D), C("MarketCap"), C("PriceToEarnings"),
     C("EpsDiluted", TTM), C("EpsDilutedGrowth", YOY_TTM), C("DividendsYield", TTM), C("Sector")] },
@@ -723,7 +826,8 @@ export const COLUMN_SETS: { id: string; title: string; columns: ColumnRef[] }[] 
     ...["Interval1W", "Interval1M", "Interval3M", "Interval6M", "IntervalYTD", "Interval1Y", "Interval5Y", "Interval10Y"].map((i) => C("Performance", { interval: i })),
     C("Volatility", { interval: "Interval1W" }), C("Volatility", { interval: "Interval1M" })] },
   { id: "technicals", title: "Technicals", columns: TECHNICALS },
-  { id: "extendedHours", title: "Extended hours", columns: [C("Price"), C("Change", R1D), C("Gap", R1D), C("Volume", R1D)] },
+  { id: "extendedHours", title: "Extended hours", columns: [C("PreMarketClose"), C("PreMarketChange"), C("PreMarketGap"), C("PreMarketVolume"), C("Price"), C("Change", R1D),
+    C("Gap", R1D), C("Volume", R1D), C("VolumeChange", R1D), C("PostMarketClose"), C("PostMarketChange"), C("PostMarketVolume")] },
   { id: "forecasts", title: "Forecasts", columns: [C("MarketCap"), C("Price")] },
   { id: "valuation", title: "Valuation", columns: [C("MarketCap"), C("MarketCapPerf", { interval: "Interval1Y" }), C("PriceToEarnings"), C("PriceToEarningsToGrowth", TTM),
     C("PriceToSales"), C("PriceToBook"), C("PriceToCashFlow"), C("PriceToFreeCashFlow"), C("PriceToCashRatio"), C("Ev"), C("EvToRevenue", TTM), C("EvToEbit", TTM), C("EvToEbitda", TTM)] },
@@ -740,16 +844,20 @@ export const COLUMN_SETS: { id: string; title: string; columns: ColumnRef[] }[] 
   { id: "perShare", title: "Per share", columns: [C("RevenuePerShare", TTM), C("BasicEps", TTM), C("EpsDiluted", TTM), C("OperatingCashFlowPerShare", TTM), C("FreeCashFlowPerShare", TTM),
     C("EBITPerShare", TTM), C("EBITDAPerShare", TTM), C("BookPerShare", FQ), C("TotalDebtPerShare", FQ), C("CashPerShare", FQ)] },
 ];
-/** The reference ETF column sets restricted to ours (Fund flows and NAV performance have no data source). */
+/** The reference ETF column sets restricted to ours (NAV performance has no data source; a fund flows period shows
+ *  once the share count history covers it). */
 export const ETF_COLUMN_SETS: { id: string; title: string; columns: ColumnRef[] }[] = [
   { id: "overview", title: "Overview", columns: [C("Price"), C("Change", R1D), C("VolumePrice", R1D), C("RelativeVolume", R1D), C("AssetsUnderManagement"),
     C("TotalHoldings"), C("ExpenseRatio"), C("AssetClass")] },
   { id: "performance", title: "Performance", columns: [C("Price"), C("Change", R1D),
     ...["Interval1W", "Interval1M", "Interval3M", "Interval6M", "IntervalYTD", "Interval1Y", "Interval5Y", "Interval10Y"].map((i) => C("Performance", { interval: i }))] },
   { id: "technicals", title: "Technicals", columns: TECHNICALS },
-  { id: "extendedHours", title: "Extended hours", columns: [C("Price"), C("Change", R1D), C("Gap", R1D), C("Volume", R1D)] },
-  { id: "dividends", title: "Dividends", columns: [C("Price"), C("DividendsYieldForward"), C("DividendsFrequency")] },
-  { id: "holdings", title: "Holdings", columns: [C("TotalHoldings"), C("PercentInTop10"), C("PercentInTop25"), C("PercentInTop50")] },
+  { id: "extendedHours", title: "Extended hours", columns: [C("PreMarketClose"), C("PreMarketChange"), C("PreMarketGap"), C("PreMarketVolume"), C("Price"), C("Change", R1D),
+    C("Gap", R1D), C("Volume", R1D), C("VolumeChange", R1D), C("PostMarketClose"), C("PostMarketChange"), C("PostMarketVolume")] },
+  { id: "fundFlows", title: "Fund flows", columns: ["Interval1M", "Interval3M", "Interval1Y", "Interval3Y", "IntervalYTD"].map((i) => C("FundFlows", { interval: i })) },
+  { id: "dividends", title: "Dividends", columns: [C("Price"), C("DividendsYieldForward"), C("DividendsFrequency"), C("DividendTreatment")] },
+  { id: "holdings", title: "Holdings", columns: [C("Issuer"), C("TotalHoldings"), C("PercentInTop10"), C("PercentInTop25"), C("PercentInTop50"),
+    C("Management"), C("IndexTracked"), C("Leverage")] },
   { id: "risk", title: "Risk", columns: [C("Beta", { interval: "Interval1Y" }), C("Beta", { interval: "Interval3Y" }), C("Beta", { interval: "Interval5Y" }),
     ...["Interval1D", "Interval1W", "Interval1M"].map((i) => C("Volatility", { interval: i }))] },
 ];
@@ -821,7 +929,7 @@ export function emptyFilter(col: ColumnRef): Filter | null {
 
 /** Pills of a new screen: the reference app default pills, in its order, that have a
  *  data source (a pill whose column the backend does not hold is not shown). Left out:
- *  Analyst rating, Recent and Upcoming earnings date. */
+ *  Analyst rating and Upcoming earnings date. */
 const DEFAULT_PILLS: ColumnRef[] = [
   C("Index"),
   C("Price"),
@@ -836,14 +944,16 @@ const DEFAULT_PILLS: ColumnRef[] = [
   C("PriceToEarningsToGrowth", TTM),
   C("ReturnOnEquity", TTM),
   C("Beta", { interval: "Interval5Y" }),
+  C("EarningsRecent"),
 ];
 /** Default pills of earlier versions (before dividend yield and beta, then
- *  before Index, then before the fundamentals). A stored screen still equal to
- *  one of those defaults moves to the current one. */
+ *  before Index, then before the fundamentals, then before the recent earnings date). A stored screen still equal
+ *  to one of those defaults moves to the current one. */
 export const LEGACY_DEFAULT_PILLS: ColumnRef[][] = [
   [C("Price"), C("Change", R1D), C("MarketCap"), C("Sector"), C("Performance", { interval: "IntervalYTD" })],
   [C("Price"), C("Change", R1D), C("MarketCap"), C("DividendsYield", TTM), C("Sector"), C("Performance", { interval: "IntervalYTD" }), C("Beta", { interval: "Interval5Y" })],
   [C("Index"), C("Price"), C("Change", R1D), C("MarketCap"), C("DividendsYield", TTM), C("Sector"), C("Performance", { interval: "IntervalYTD" }), C("Beta", { interval: "Interval5Y" })],
+  DEFAULT_PILLS.slice(0, -1),
 ];
 
 /** The reference app default screen ("Untitled screen") restricted to the catalog:
@@ -859,10 +969,10 @@ export function defaultScreen(title = DEFAULT_SCREEN_TITLE, pills: ColumnRef[] =
   };
 }
 
-/** The reference ETF default pills that have a data source (Focus, Niche, Holdings region, Brand, NAV total return,
- *  Management style, Strategy, Div treat and UCITS have none). */
-const ETF_DEFAULT_PILLS: ColumnRef[] = [C("AssetClass"), C("Performance", { interval: "IntervalYTD" }), C("AssetsUnderManagement"), C("DividendsYieldForward"),
-  C("DividendsFrequency"), C("Leveraged"), C("ExpenseRatio")];
+/** The reference ETF default pills that have a data source (Focus, Niche, Holdings region, NAV total return, Strategy
+ *  and UCITS have none). */
+const ETF_DEFAULT_PILLS: ColumnRef[] = [C("AssetClass"), C("Brand"), C("Performance", { interval: "IntervalYTD" }), C("AssetsUnderManagement"),
+  C("Management"), C("DividendTreatment"), C("DividendsYieldForward"), C("DividendsFrequency"), C("Leveraged"), C("ExpenseRatio")];
 
 /** The reference ETF Screener's "Untitled screen": its default pills, Overview, sorted by AUM; primary listing off. */
 export function defaultEtfScreen(title = DEFAULT_SCREEN_TITLE): Screen {
@@ -881,7 +991,7 @@ export const newScreen = (type: ScreenerType, title?: string): Screen => (type =
 /** The reference app "Popular screens" (03/11/2026, in its order) whose filters, columns and sort the backend can
  *  serve. Left out: "Healthy growth technology stocks" (the reference sector names; ours are the industry
  *  classification's divisions), "Dividend princes" and "Dividend kings" (25 to 40+ years of dividends; the dividend
- *  history starts in 2003). Each one = the default pills with the screen's own values, its extra filters after them,
+ *  history starts in 2003, the reference's about 1980). Each one = the default pills with the screen's own values, its extra filters after them,
  *  its column set and its sort (descending). */
 export type PopularScreen = { id: string; title: string; description: string; screen: (pills?: ColumnRef[]) => Screen };
 

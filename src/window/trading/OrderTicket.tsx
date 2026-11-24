@@ -31,7 +31,7 @@ import { broker, brokerOf } from "../../data/trading/broker";
 import { pluginBroker } from "../../data/trading/plugin-broker";
 import { tradingUi } from "../../data/trading/trading-ui";
 import type { OrderType } from "../../data/trading/types";
-import { fmtPrice, tickerOf } from "./format";
+import { fmtMoney, fmtPrice, tickerOf } from "./format";
 import { describeTicket } from "./ticket";
 import { createTicketModel } from "./ticket-model";
 import { BrokerFieldInput, DurationInput, ExitInput, PriceInput, QtyInput } from "./TicketFields";
@@ -40,7 +40,9 @@ import { CloseIcon } from "./icons";
 import { FavoritePresets, OrderPresetsButton } from "./OrderPresets";
 import { DomPanel } from "./DomPanel";
 import { orderSummary, positionSummary } from "../chart/trading-lines-model";
-import { translateAs, translateWith } from "../../i18n/translator";
+import { translate, translateAs, translateWith } from "../../i18n/translator";
+import { OrderConfirmation } from "./OrderConfirmation";
+import { AddLevelButton, ExitLevelsPage, LevelList } from "./ExitLevels";
 
 /** Order / DOM switch: tab, title, tooltip and its Shift hotkey. */
 const TABS: ["order" | "dom", string, string, string][] = [
@@ -76,7 +78,7 @@ export function OrderTicket() {
 
 /** Ticket header: broker mark, `title`, `extra` buttons, ⋯ and close. A
  *  floating ticket is dragged by it. */
-function TicketHead(p: { title: JSX.Element; extra?: JSX.Element; onClose: () => void; onDrag?: (e: MouseEvent) => void }) {
+function TicketHead(p: { title: JSX.Element; extra?: JSX.Element; onClose: () => void; onDrag?: (e: MouseEvent) => void; onBack?: () => void }) {
   return (
     <div
       class="trd-tk-header"
@@ -85,25 +87,28 @@ function TicketHead(p: { title: JSX.Element; extra?: JSX.Element; onClose: () =>
         if (p.onDrag && !(e.target as HTMLElement).closest("button")) p.onDrag(e);
       }}
     >
-      <Show
-        when={brokerOf() === pluginBroker && pluginBroker.status()?.activeName}
-        fallback={
-          <Tooltip text="Replay Broker" side="bottom">
-            <span class="trd-tk-mark">
-              <Icon name="replay-status" size={18} />
+      {/* The confirmation page: Back in place of the broker's mark (reference). */}
+      <Show when={!p.onBack} fallback={<BackButton onClick={() => p.onBack?.()} />}>
+        <Show
+          when={brokerOf() === pluginBroker && pluginBroker.status()?.activeName}
+          fallback={
+            <Tooltip text="Replay Broker" side="bottom">
+              <span class="trd-tk-mark">
+                <Icon name="replay-status" size={18} />
+              </span>
+            </Tooltip>
+          }
+        >
+          {(name) => (
+            <span class="trd-tk-mark trd-broker-mark" title={name()} data-no-translate>
+              {name()
+                .split(/\s+/)
+                .slice(0, 2)
+                .map((w) => w[0]?.toUpperCase() ?? "")
+                .join("")}
             </span>
-          </Tooltip>
-        }
-      >
-        {(name) => (
-          <span class="trd-tk-mark trd-broker-mark" title={name()} data-no-translate>
-            {name()
-              .split(/\s+/)
-              .slice(0, 2)
-              .map((w) => w[0]?.toUpperCase() ?? "")
-              .join("")}
-          </span>
-        )}
+          )}
+        </Show>
       </Show>
       <span class="trd-tk-title">{p.title}</span>
       <span class="trd-tk-spacer" />
@@ -117,6 +122,18 @@ function TicketHead(p: { title: JSX.Element; extra?: JSX.Element; onClose: () =>
         </Tooltip>
       </span>
     </div>
+  );
+}
+
+function BackButton(p: { onClick: () => void }) {
+  return (
+    <Tooltip text="Back" side="bottom">
+      <button type="button" class="trd-icon-btn trd-tk-back" aria-label="Back" onClick={() => p.onClick()}>
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" class="ot-flip-rtl">
+          <path d="M11 4 6 9l5 5" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </button>
+    </Tooltip>
   );
 }
 
@@ -225,28 +242,38 @@ function TicketBody(props: { floating: boolean }) {
     <>
       <TicketHead
         title={
-          <>
+          <Show when={!m.preview() && !m.levelPage()} fallback={translate(m.levelPage() ? "Exit levels" : "Order confirmation")}>
             {tickerOf(d().symbol)}
             {d().editing && !isPos() ? translateWith(", order {0}", d().editing ?? "") : ""}
-          </>
+          </Show>
         }
         extra={
-          <Show when={state().ok && !d().editing}>
+          <Show when={state().ok && !d().editing && !m.preview() && !m.levelPage()}>
             <OrderPresetsButton current={currentPreset} apply={applyPreset} />
           </Show>
         }
         onClose={close}
         onDrag={props.floating ? beginDrag : undefined}
+        // Back on the levels page keeps the changes (reference).
+        onBack={m.preview() ? m.closePreview : m.levelPage() ? m.confirmLevels : undefined}
       />
-      <Show when={editing()}>{(o) => <div class="trd-tk-sub">{orderSummary(o(), tick())}</div>}</Show>
-      <Show when={editingPos()}>{(pos) => <div class="trd-tk-sub">{positionSummary(pos(), tick())}</div>}</Show>
+      <Show when={!m.levelPage()}>
+        <Show when={editing()}>{(o) => <div class="trd-tk-sub">{orderSummary(o(), tick())}</div>}</Show>
+        <Show when={editingPos()}>{(pos) => <div class="trd-tk-sub">{positionSummary(pos(), tick())}</div>}</Show>
+      </Show>
 
-      <Show when={!d().editing && !props.floating}>
+      <Show when={!d().editing && !props.floating && !m.preview() && !m.levelPage()}>
         <TicketTabs />
       </Show>
 
+      <Show when={m.preview() && state().ok}>
+        <OrderConfirmation m={m} />
+      </Show>
+      <Show when={m.levelPage() && state().ok}>
+        <ExitLevelsPage m={m} />
+      </Show>
       <Show
-        when={state().ok || state().reason === "loading"}
+        when={!m.preview() && !m.levelPage() && (state().ok || state().reason === "loading")}
         fallback={
           <div class="trd-tk-empty">
             <Show when={state().title}>
@@ -313,6 +340,30 @@ function TicketBody(props: { floating: boolean }) {
               <PriceInput m={m} f="limitPrice" />
             </Show>
             <QtyInput m={m} />
+            {/* The quantity's values (reference): its trade value with the leverage and the free margin, for a broker that
+                gives its margin, then the tick value. */}
+            <Show when={m.leverage()}>
+              {(x) => (
+                <div class="trd-tk-row">
+                  <span>{translateWith("Trade value ({0})", x())}</span>
+                  <span class="trd-tk-row-value">
+                    {fmtMoney(m.tradeValue())}
+                    <small> {ccy()}</small>
+                  </span>
+                </div>
+              )}
+            </Show>
+            <Show when={m.availableMargin()}>
+              {(v) => (
+                <div class="trd-tk-row">
+                  <span>Available margin</span>
+                  <span class="trd-tk-row-value">
+                    {fmtMoney(v())}
+                    <small> {ccy()}</small>
+                  </span>
+                </div>
+              )}
+            </Show>
             <div class="trd-tk-row">
               <span>Tick value</span>
               <span class="trd-tk-row-value">
@@ -327,25 +378,38 @@ function TicketBody(props: { floating: boolean }) {
           {/* An order's take profit / stop loss need a broker that takes brackets; the position's are Protect position. */}
           <Show when={isPos() || m.caps().brackets}>
             <TicketSection title="Exits">
-              <ExitInput m={m} kind="tp" />
-              <ExitInput m={m} kind="sl" />
-              <Show when={rr()}>
-                {(v) => (
-                  <div class="trd-tk-row">
-                    <span>Risk / Reward</span>
-                    <span class="trd-tk-row-value">{Number(v().toFixed(2))}</span>
-                  </div>
-                )}
+              {/* Exit levels (#330) in place of the take profit / stop loss. */}
+              <Show
+                when={d().levels?.length}
+                fallback={
+                  <>
+                    <ExitInput m={m} kind="tp" />
+                    <ExitInput m={m} kind="sl" />
+                    <Show when={rr()}>
+                      {(v) => (
+                        <div class="trd-tk-row">
+                          <span>Risk / Reward</span>
+                          <span class="trd-tk-row-value">{Number(v().toFixed(2))}</span>
+                        </div>
+                      )}
+                    </Show>
+                  </>
+                }
+              >
+                <LevelList m={m} list={d().levels!} />
+              </Show>
+              <Show when={m.canAddLevel()}>
+                <AddLevelButton m={m} />
               </Show>
             </TicketSection>
           </Show>
           {/* The time in force and the broker's own choices (a product type), after the exits as in the reference; an
               order being modified keeps its own. */}
-          <Show when={!d().editing && (m.durations().length > 0 || m.inst().fields.length > 0)}>
+          <Show when={!d().editing && (m.durations().length > 0 || m.shownFields().length > 0)}>
             <TicketSection title="Extra settings">
               <div class="trd-tk-extra">
                 <DurationInput m={m} />
-                <For each={m.inst().fields}>{(f) => <BrokerFieldInput m={m} field={f} />}</For>
+                <For each={m.shownFields()}>{(f) => <BrokerFieldInput m={m} field={f} />}</For>
               </div>
             </TicketSection>
           </Show>

@@ -47,9 +47,13 @@ export interface WatchlistCore {
   active: () => WatchList | undefined;
   addAnchor: Accessor<AddAnchor>;
   allRows: () => Row[];
+  /** Close the Add symbol dialog. */
+  closeAdd: () => void;
   extras: () => Row[];
   groups: () => Group[];
   inDeleted: () => boolean;
+  /** The open list is a data plugin's (#381): no change by hand. */
+  locked: () => boolean;
   listDraft: Accessor<string>;
   listName: () => string;
   setAddAnchor: Setter<AddAnchor>;

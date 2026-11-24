@@ -24,7 +24,7 @@
 input string InpConnectionFile = "OpenTrader\\mt5.json"; // Connection file (terminals' common folder)
 
 #define API_VERSION 1
-#define PLUGIN_VERSION "0.1.3"
+#define PLUGIN_VERSION "0.3.0"
 #define RECONNECT_MS 3000
 #define MAX_BARS 50000
 
@@ -40,10 +40,18 @@ string   g_serverTime = "auto";
 string   g_tickers[];              // data.subscribe
 long     g_lastTick[];             // their last tick time (ms)
 string   g_watch[];                // broker.watchQuote
+string   g_tickWatch[];            // data.watchTicks: the tickers a tick chart shows
+long     g_tickFrom[];             // their last tick sent (server ms)
+int      g_tickSame[];             // how many ticks of that millisecond were sent
+string   g_depth[];                // broker.watchDepth: the order books subscribed (MarketBookAdd)
+bool     g_depthDirty[];           // their book changed since it was sent
+ulong    g_lastDepth = 0;
 bool     g_stateDirty = true;
 ulong    g_placed[];               // pending orders already announced (their next update is a modification)
 ulong    g_lastState = 0;
 CTrade   g_trade;
+
+#include "OpenTraderLevels.mqh"
 
 //--- A long text built in parts: appending to one string copies it whole each time.
 class CText
@@ -237,6 +245,13 @@ void Disconnect(void)
    ArrayResize(g_tickers, 0);
    ArrayResize(g_lastTick, 0);
    ArrayResize(g_watch, 0);
+   ArrayResize(g_tickWatch, 0);
+   ArrayResize(g_tickFrom, 0);
+   ArrayResize(g_tickSame, 0);
+   for(int i = 0; i < ArraySize(g_depth); i++)
+      MarketBookRelease(g_depth[i]);
+   ArrayResize(g_depth, 0);
+   ArrayResize(g_depthDirty, 0);
   }
 
 bool SendLine(const string line)
@@ -440,6 +455,28 @@ void OnNotification(const string method, CJ *params)
         }
       return;
      }
+   if(method == "data.watchTicks")
+     {
+      CJ *list = params != NULL ? params.Get("tickers") : NULL;
+      string tickers[];
+      int n = list != NULL ? list.Size() : 0;
+      ArrayResize(tickers, n);
+      for(int i = 0; i < n; i++)
+         tickers[i] = list.At(i).str;
+      WatchTicks(tickers);
+      return;
+     }
+   if(method == "broker.watchDepth")
+     {
+      CJ *list = params != NULL ? params.Get("tickers") : NULL;
+      string tickers[];
+      int n = list != NULL ? list.Size() : 0;
+      ArrayResize(tickers, n);
+      for(int i = 0; i < n; i++)
+         tickers[i] = list.At(i).str;
+      WatchDepth(tickers);
+      return;
+     }
    if(method == "data.subscribe" || method == "broker.watchQuote")
      {
       CJ *list = params != NULL ? params.Get("tickers") : NULL;
@@ -474,6 +511,8 @@ string Handle(const string method, CJ *p, string &error)
       return DataSymbolInfo(p, error);
    if(method == "data.bars")
       return DataBars(p, error);
+   if(method == "data.ticks")
+      return DataTicks(p, error);
    if(method == "broker.resolveSymbol")
       return BrokerResolve(p);
    if(method == "broker.getState")
@@ -487,6 +526,8 @@ string Handle(const string method, CJ *p, string &error)
      }
    if(method == "broker.place")
       return BrokerPlace(p, error);
+   if(method == "broker.previewOrder")
+      return BrokerPreview(p, error);
    if(method == "broker.modify")
       return BrokerModify(p, error);
    if(method == "broker.cancel")
@@ -515,6 +556,9 @@ string KindOf(const string symbol)
    string path = Upper(SymbolInfoString(symbol, SYMBOL_PATH));
    if(StringFind(path, "CRYPTO") >= 0)
       return "crypto";
+   // Funds trade as exchange stocks: their folder tells them apart (MetaQuotes-Demo: "NASDAQ\ETF\XAUG").
+   if(StringFind(path, "ETF") >= 0 || StringFind(path, "FUND") >= 0)
+      return "fund";
    ENUM_SYMBOL_CALC_MODE mode = (ENUM_SYMBOL_CALC_MODE)SymbolInfoInteger(symbol, SYMBOL_TRADE_CALC_MODE);
    switch(mode)
      {
@@ -654,7 +698,7 @@ string DataSymbolInfo(CJ *p, string &error)
           ",\"barOrigin\":" + JQ(Hhmm(-shift / 60)) +
           ",\"pricescale\":" + IntegerToString(pricescale) +
           ",\"minmov\":" + IntegerToString(minmov) +
-          ",\"intervals\":[\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"10\",\"12\",\"15\",\"20\",\"30\",\"60\",\"120\",\"180\",\"240\",\"360\",\"480\",\"720\",\"1D\"]}";
+          ",\"intervals\":[\"1T\",\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"10\",\"12\",\"15\",\"20\",\"30\",\"60\",\"120\",\"180\",\"240\",\"360\",\"480\",\"720\",\"1D\"]}";
   }
 
 ENUM_TIMEFRAMES Timeframe(const string res)
@@ -749,6 +793,212 @@ string DataBars(CJ *p, string &error)
    return out.Text();
   }
 
+//+------------------------------------------------------------------+
+//| Ticks (tick charts)                                               |
+//+------------------------------------------------------------------+
+#define MAX_TICKS 100000
+
+//--- Charted on trades (exchange symbols) or on the bid: the ticks of the same kind.
+bool TradeTicks(const string t)
+  {
+   return (ENUM_SYMBOL_CHART_MODE)SymbolInfoInteger(t, SYMBOL_CHART_MODE) == SYMBOL_CHART_MODE_LAST;
+  }
+
+//--- A tick as data.ticks / data.tick send it ("" when it is not one of the chart's: an ask-only change, no trade).
+string TickJson(const MqlTick &k, const bool trades, const int digits)
+  {
+   double price = trades ? k.last : k.bid;
+   if(price <= 0 || (trades ? (k.flags & TICK_FLAG_LAST) == 0 : (k.flags & TICK_FLAG_BID) == 0))
+      return "";
+   double volume = trades ? (k.volume_real > 0 ? k.volume_real : (double)k.volume) : 1;
+   long utc = ToUtc((datetime)(k.time_msc / 1000)) * 1000 + k.time_msc % 1000;
+   return "[" + IntegerToString(utc) + "," + JN(price, digits) + "," + JN(volume, 4) + "]";
+  }
+
+//--- data.ticks: the newest `countBack` ticks before `to` (UTC ms), oldest first. The window back from `to` widens
+//--- until it holds enough of them or reaches 30 days.
+string DataTicks(CJ *p, string &error)
+  {
+   string t = JStr(p, "ticker");
+   if(!SymbolSelect(t, true))
+     {
+      error = "Unknown symbol " + t;
+      return "";
+     }
+   long to = (long)JNum(p, "to");
+   int count = (int)MathMin(MAX_TICKS, MathMax(1, JNum(p, "countBack", 1000)));
+   long toSrv = (long)ToServer(to / 1000) * 1000 + to % 1000;
+   bool trades = TradeTicks(t);
+   uint flags = trades ? COPY_TICKS_TRADE : COPY_TICKS_INFO;
+   int digits = (int)SymbolInfoInteger(t, SYMBOL_DIGITS);
+   MqlTick ticks[];
+   string rows[];
+   // With `from`: the first ticks from then on (Bar Replay reads forward).
+   if(p != NULL && p.Get("from") != NULL)
+     {
+      long from = (long)JNum(p, "from");
+      long cur = (long)ToServer(from / 1000) * 1000 + from % 1000;
+      // The ticks of the chart's kind only (an ask-only change is left out): pages are read until `count` of them,
+      // or the end of the ticks. A short answer means there are no more yet.
+      int skip = 0;
+      int n = 0;
+      CText fwd;
+      fwd.Add("{\"ticks\":[");
+      while(n < count)
+        {
+         int want = (int)MathMin(MAX_TICKS, 2 * (count - n) + 16);
+         int got = -1;
+         for(int attempt = 0; attempt < 25; attempt++)
+           {
+            got = CopyTicks(t, ticks, flags, (ulong)MathMax(1, cur), want);
+            if(got >= 0)
+               break;
+            Sleep(200);
+           }
+         if(got < 0)
+           {
+            error = "Ticks not available yet for " + t + " (error " + IntegerToString(GetLastError()) + ")";
+            return "";
+           }
+         int k = 0;
+         while(k < got && k < skip && ticks[k].time_msc == cur)
+            k++;
+         bool end = got < want;
+         for(; k < got && n < count; k++)
+           {
+            if(ticks[k].time_msc >= toSrv)
+              {
+               end = true;
+               break;
+              }
+            string row = TickJson(ticks[k], trades, digits);
+            if(row == "")
+               continue;
+            fwd.Add((n > 0 ? "," : "") + row);
+            n++;
+           }
+         if(end || got == 0)
+            break;
+         // The next page from the last tick read, the ticks of its millisecond read already skipped.
+         long last = ticks[got - 1].time_msc;
+         int same = 0;
+         for(int j = got - 1; j >= 0 && ticks[j].time_msc == last; j--)
+            same++;
+         skip = last == cur ? got : same;
+         cur = last;
+        }
+      fwd.Add("]}");
+      return fwd.Text();
+     }
+   long span = 600000;
+   while(true)
+     {
+      int got = -1;
+      // The terminal may still be loading the history: asked again for a few seconds.
+      for(int attempt = 0; attempt < 25; attempt++)
+        {
+         got = CopyTicksRange(t, ticks, flags, (ulong)MathMax(1, toSrv - span), (ulong)(toSrv - 1));
+         if(got >= 0)
+            break;
+         Sleep(200);
+        }
+      if(got < 0)
+        {
+         error = "Ticks not available yet for " + t + " (error " + IntegerToString(GetLastError()) + ")";
+         return "";
+        }
+      ArrayResize(rows, 0);
+      for(int i = 0; i < got; i++)
+        {
+         string row = TickJson(ticks[i], trades, digits);
+         if(row == "")
+            continue;
+         int n = ArraySize(rows);
+         ArrayResize(rows, n + 1);
+         rows[n] = row;
+        }
+      if(ArraySize(rows) >= count || span >= (long)30 * 86400000)
+         break;
+      span *= 4;
+     }
+   CText out;
+   out.Add("{\"ticks\":[");
+   int first = MathMax(0, ArraySize(rows) - count);
+   for(int i = first; i < ArraySize(rows); i++)
+      out.Add((i > first ? "," : "") + rows[i]);
+   out.Add("]}");
+   return out.Text();
+  }
+
+//--- data.watchTicks: the tickers whose new ticks go out as data.tick, from now on.
+void WatchTicks(const string &tickers[])
+  {
+   string next[];
+   long from[];
+   int same[];
+   int n = ArraySize(tickers);
+   ArrayResize(next, n);
+   ArrayResize(from, n);
+   ArrayResize(same, n);
+   for(int i = 0; i < n; i++)
+     {
+      next[i] = tickers[i];
+      int k = IndexOf(g_tickWatch, tickers[i]);
+      if(k >= 0)
+        {
+         from[i] = g_tickFrom[k];
+         same[i] = g_tickSame[k];
+         continue;
+        }
+      SymbolSelect(tickers[i], true);
+      MqlTick last;
+      from[i] = SymbolInfoTick(tickers[i], last) ? last.time_msc + 1 : (long)TimeTradeServer() * 1000;
+      same[i] = 0;
+     }
+   ArrayCopy(g_tickWatch, next);
+   ArrayResize(g_tickWatch, n);
+   ArrayCopy(g_tickFrom, from);
+   ArrayResize(g_tickFrom, n);
+   ArrayCopy(g_tickSame, same);
+   ArrayResize(g_tickSame, n);
+  }
+
+//--- The new ticks of the watched tickers: the ones after the last sent (the ticks of its millisecond already sent
+//--- are skipped).
+void StreamTicks(void)
+  {
+   for(int i = 0; i < ArraySize(g_tickWatch); i++)
+     {
+      string t = g_tickWatch[i];
+      bool trades = TradeTicks(t);
+      MqlTick ticks[];
+      int got = CopyTicks(t, ticks, trades ? COPY_TICKS_TRADE : COPY_TICKS_INFO, (ulong)g_tickFrom[i], 5000);
+      if(got <= 0)
+         continue;
+      int digits = (int)SymbolInfoInteger(t, SYMBOL_DIGITS);
+      int skip = 0;
+      while(skip < got && skip < g_tickSame[i] && ticks[skip].time_msc == g_tickFrom[i])
+         skip++;
+      if(skip >= got)
+         continue;
+      string rows = "";
+      for(int k = skip; k < got; k++)
+        {
+         string row = TickJson(ticks[k], trades, digits);
+         if(row != "")
+            rows += (rows == "" ? "" : ",") + row;
+        }
+      long lastMsc = ticks[got - 1].time_msc;
+      int sameNow = 0;
+      for(int k = got - 1; k >= 0 && ticks[k].time_msc == lastMsc; k--)
+         sameNow++;
+      g_tickSame[i] = lastMsc == g_tickFrom[i] ? g_tickSame[i] + got - skip : sameNow;
+      g_tickFrom[i] = lastMsc;
+      if(rows != "")
+         Notify("data.tick", "{\"ticker\":" + JQ(t) + ",\"ticks\":[" + rows + "]}");
+     }
+  }
+
 string BarJson(const MqlRates &r, const bool daily, const int digits)
   {
    return "[" + IntegerToString(BarTime(r.time, daily)) + "," + JN(r.open, digits) + "," + JN(r.high, digits) + "," + JN(r.low, digits) + "," + JN(r.close, digits) +
@@ -784,6 +1034,113 @@ void StreamQuotes(void)
       Notify("broker.quote", "{\"ticker\":" + JQ(g_watch[i]) + ",\"bid\":" + JP(tick.bid, digits) + ",\"ask\":" + JP(tick.ask, digits) +
              ",\"last\":" + JP(tick.last, digits) + "}");
      }
+  }
+
+//+------------------------------------------------------------------+
+//| Order books (the DOM tab)                                         |
+//+------------------------------------------------------------------+
+int IndexOf(const string &list[], const string s)
+  {
+   for(int i = 0; i < ArraySize(list); i++)
+      if(list[i] == s)
+         return i;
+   return -1;
+  }
+
+//--- broker.watchDepth: the whole set of tickers whose book the app wants. A server without a book for a symbol sends no
+//--- book event: nothing goes out and the DOM shows no sizes.
+void WatchDepth(const string &tickers[])
+  {
+   for(int i = 0; i < ArraySize(g_depth); i++)
+      if(IndexOf(tickers, g_depth[i]) < 0)
+         MarketBookRelease(g_depth[i]);
+   string kept[];
+   for(int i = 0; i < ArraySize(tickers); i++)
+     {
+      string t = tickers[i];
+      if(IndexOf(g_depth, t) < 0)
+        {
+         SymbolSelect(t, true);
+         if(!MarketBookAdd(t))
+           {
+            Log("warn", "No order book for " + t + " (error " + IntegerToString(GetLastError()) + ")");
+            continue;
+           }
+        }
+      int n = ArraySize(kept);
+      ArrayResize(kept, n + 1);
+      kept[n] = t;
+     }
+   ArrayCopy(g_depth, kept);
+   ArrayResize(g_depth, ArraySize(kept));
+   // Each book goes out whole once, then on its changes.
+   ArrayResize(g_depthDirty, ArraySize(g_depth));
+   ArrayInitialize(g_depthDirty, true);
+  }
+
+//--- What one unit of a book volume is in the plugin's units. Exchange instruments count their book in lots (contracts);
+//--- the others (forex, CFDs) already in units: the terminal shows them either way, and MetaQuotes-Demo's EURUSD book
+//--- reads 100 000 to 5 000 000, which are units (as lots they would be up to 5 million lots a level).
+double BookUnit(const string t)
+  {
+   switch((ENUM_SYMBOL_CALC_MODE)SymbolInfoInteger(t, SYMBOL_TRADE_CALC_MODE))
+     {
+      case SYMBOL_CALC_MODE_EXCH_STOCKS:
+      case SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX:
+      case SYMBOL_CALC_MODE_EXCH_FUTURES:
+      case SYMBOL_CALC_MODE_EXCH_FUTURES_FORTS:
+      case SYMBOL_CALC_MODE_EXCH_BONDS:
+      case SYMBOL_CALC_MODE_EXCH_BONDS_MOEX:
+         return ContractSize(t);
+      default:
+         return 1;
+     }
+  }
+
+//--- The whole book of a ticker as broker.depth: levels in units, market-price rows left out.
+string BookJson(const string t)
+  {
+   MqlBookInfo book[];
+   string bids = "", asks = "";
+   if(MarketBookGet(t, book))
+     {
+      int digits = (int)SymbolInfoInteger(t, SYMBOL_DIGITS);
+      double contract = BookUnit(t);
+      for(int i = 0; i < ArraySize(book); i++)
+        {
+         double lots = book[i].volume_real > 0 ? book[i].volume_real : (double)book[i].volume;
+         if(book[i].price <= 0 || lots <= 0)
+            continue;
+         string level = "{\"price\":" + JN(book[i].price, digits) + ",\"qty\":" + JN(lots * contract, 4) + "}";
+         if(book[i].type == BOOK_TYPE_BUY || book[i].type == BOOK_TYPE_BUY_MARKET)
+            bids += (bids == "" ? "" : ",") + level;
+         else
+            asks += (asks == "" ? "" : ",") + level;
+        }
+     }
+   return "{\"ticker\":" + JQ(t) + ",\"snapshot\":true,\"bids\":[" + bids + "],\"asks\":[" + asks + "]}";
+  }
+
+//--- The books that changed, at most 4 times a second.
+void StreamDepth(void)
+  {
+   ulong now = GetTickCount64();
+   if(now - g_lastDepth < 250)
+      return;
+   g_lastDepth = now;
+   for(int i = 0; i < ArraySize(g_depth); i++)
+      if(g_depthDirty[i])
+        {
+         g_depthDirty[i] = false;
+         Notify("broker.depth", BookJson(g_depth[i]));
+        }
+  }
+
+void OnBookEvent(const string &symbol)
+  {
+   int i = IndexOf(g_depth, symbol);
+   if(i >= 0)
+      g_depthDirty[i] = true;
   }
 
 //+------------------------------------------------------------------+
@@ -875,6 +1232,10 @@ string BrokerInstrument(CJ *p, string &error)
       out += "\"qtyMax\":" + JN(max * size, 8) + ",";
    if(pointValue > 0)
       out += "\"pointValue\":" + JN(pointValue, 10) + ",";
+   // The margin of one lot over its value, both in the account currency: the ticket's leverage and free margin.
+   double margin = 0;
+   if(pointValue > 0 && price > 0 && OrderCalcMargin(ORDER_TYPE_BUY, t, 1.0, price, margin) && margin > 0)
+      out += "\"marginRate\":" + JN(margin / (size * price * pointValue), 10) + ",";
    string durations = Durations(t);
    if(durations != "")
       out += "\"durations\":[" + durations + "],";
@@ -933,7 +1294,7 @@ string BrokerState(void)
    string login = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
    string name = AccountInfoString(ACCOUNT_COMPANY) + " " + login;
    string ccy = AccountInfoString(ACCOUNT_CURRENCY);
-   bool hedging = (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING;
+   bool hedging = Hedging();
    string account = "{\"id\":" + JQ(login) + ",\"name\":" + JQ(name) + ",\"currency\":" + JQ(ccy) + ",\"isDemo\":" + (mode == ACCOUNT_TRADE_MODE_REAL ? "false" : "true") +
                     ",\"balance\":" + JN(AccountInfoDouble(ACCOUNT_BALANCE), 2) + ",\"equity\":" + JN(AccountInfoDouble(ACCOUNT_EQUITY), 2) +
                     ",\"unrealizedPnl\":" + JN(AccountInfoDouble(ACCOUNT_PROFIT), 2) + ",\"marginUsed\":" + JN(AccountInfoDouble(ACCOUNT_MARGIN), 2) +
@@ -942,29 +1303,60 @@ string BrokerState(void)
                     JQ("1:" + IntegerToString(AccountInfoInteger(ACCOUNT_LEVERAGE))) + "},{\"label\":\"Margin level\",\"value\":" +
                     JQ(JN(AccountInfoDouble(ACCOUNT_MARGIN_LEVEL), 2) + "%") + "},{\"label\":\"Credit\",\"value\":" + JQ(JN(AccountInfoDouble(ACCOUNT_CREDIT), 2)) + "}]}";
    //--- Positions
+   // A hedging account's parts of one order with exit levels (one magic number) are one position, and one order.
    string positions = "";
+   long groups[];
    for(int i = 0; i < PositionsTotal(); i++)
      {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0)
          continue;
+      long magic = PositionGetInteger(POSITION_MAGIC);
+      if(hedging && IsOt(magic))
+        {
+         if(Listed(groups, magic))
+            continue;
+         positions += (positions == "" ? "" : ",") + GroupPositionJson(magic);
+         continue;
+        }
       string t = PositionGetString(POSITION_SYMBOL);
       int digits = (int)SymbolInfoInteger(t, SYMBOL_DIGITS);
       bool buy = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
-      positions += (positions == "" ? "" : ",") + "{\"id\":" + JQ(IntegerToString(ticket)) + ",\"ticker\":" + JQ(t) + ",\"side\":" + Side(buy) +
-                   ",\"qty\":" + JN(PositionGetDouble(POSITION_VOLUME) * ContractSize(t), 4) + ",\"avgPrice\":" + JN(PositionGetDouble(POSITION_PRICE_OPEN), digits) +
-                   ",\"last\":" + JN(PositionGetDouble(POSITION_PRICE_CURRENT), digits) + ",\"unrealizedPnl\":" + JN(PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP), 2) +
-                   ",\"takeProfit\":" + JP(PositionGetDouble(POSITION_TP), digits) + ",\"stopLoss\":" + JP(PositionGetDouble(POSITION_SL), digits) + "}";
+      double tp = PositionGetDouble(POSITION_TP), sl = PositionGetDouble(POSITION_SL);
+      string head = "{\"id\":" + JQ(IntegerToString(ticket)) + ",\"ticker\":" + JQ(t) + ",\"side\":" + Side(buy) +
+                    ",\"qty\":" + JN(PositionGetDouble(POSITION_VOLUME) * ContractSize(t), 4) + ",\"avgPrice\":" + JN(PositionGetDouble(POSITION_PRICE_OPEN), digits) +
+                    ",\"last\":" + JN(PositionGetDouble(POSITION_PRICE_CURRENT), digits) + ",\"unrealizedPnl\":" + JN(PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP), 2) +
+                    ",\"takeProfit\":" + JP(tp, digits) + ",\"stopLoss\":" + JP(sl, digits);
+      // A netting position's levels are the EA's pending order pairs on its symbol.
+      string levels = hedging ? "" : NetExits(t, buy);
+      positions += (positions == "" ? "" : ",") + head + (levels != "" ? ",\"exitLevels\":[" + levels + "]" : "") + "}";
      }
    //--- Working orders, then the last week's finished ones
    CText orders, deals;
    bool firstOrder = true, firstDeal = true;
+   ArrayResize(groups, 0);
    for(int i = 0; i < OrdersTotal(); i++)
      {
       ulong ticket = OrderGetTicket(i);
       if(ticket == 0)
          continue;
-      orders.Add((firstOrder ? "" : ",") + OrderJson(ticket, false));
+      long magic = OrderGetInteger(ORDER_MAGIC);
+      string one;
+      if(IsOt(magic))
+        {
+         // Netting: a level's leg, listed with its position.
+         if(!hedging || Listed(groups, magic))
+            continue;
+         one = GroupOrderJson(magic);
+        }
+      else
+        {
+         int plan = hedging ? -1 : PlanOf(ticket);
+         one = OrderJson(ticket, false, -1, plan >= 0 ? PlanExits(plan) : "");
+        }
+      if(one == "")
+         continue;
+      orders.Add((firstOrder ? "" : ",") + one);
       firstOrder = false;
      }
    if(HistorySelect(TimeCurrent() - 7 * 86400, TimeCurrent() + 86400))
@@ -973,6 +1365,10 @@ string BrokerState(void)
       for(int i = MathMax(0, n - 100); i < n; i++)
         {
          ulong ticket = HistoryOrderGetTicket(i);
+         // A netting level's leg cancelled by the EA (its other leg filled, or sent again) is not an order the user
+         // placed.
+         if(ticket > 0 && !hedging && IsOt(HistoryOrderGetInteger(ticket, ORDER_MAGIC)) && HistoryOrderGetInteger(ticket, ORDER_STATE) == ORDER_STATE_CANCELED)
+            continue;
          if(ticket > 0)
            {
             orders.Add((firstOrder ? "" : ",") + OrderJson(ticket, true));
@@ -999,12 +1395,13 @@ string BrokerState(void)
      }
    return "{\"connected\":" + (TerminalInfoInteger(TERMINAL_CONNECTED) ? "true" : "false") + ",\"accounts\":[{\"id\":" + JQ(login) + ",\"name\":" + JQ(name) + "}]" +
           ",\"account\":" + account + ",\"positionMode\":" + (hedging ? "\"hedging\"" : "\"netting\"") +
-          ",\"capabilities\":{\"orderTypes\":[\"market\",\"limit\",\"stop\",\"stopLimit\"],\"brackets\":true,\"positionBrackets\":true,\"partialClose\":true,\"modifyOrders\":true}" +
+          ",\"capabilities\":{\"orderTypes\":[\"market\",\"limit\",\"stop\",\"stopLimit\"],\"brackets\":true,\"positionBrackets\":true,\"partialClose\":true,\"modifyOrders\":true,\"orderPreview\":true,\"exitLevels\":true,\"maxExitLevels\":" + IntegerToString(MAX_LEVELS) + "}" +
           ",\"positions\":[" + positions + "],\"orders\":[" + orders.Text() + "],\"executions\":[" + deals.Text() + "]}";
   }
 
-//--- One order (working: OrderGet…, history: HistoryOrderGet…).
-string OrderJson(const ulong ticket, const bool history)
+//--- One order (working: OrderGet…, history: HistoryOrderGet…). A group's order gives its parts' quantity (`lots`) and
+//--- exits (`exits`, the takeProfit / stopLoss / exitLevels fields).
+string OrderJson(const ulong ticket, const bool history, const double lots = -1, const string exits = "")
   {
    string t = history ? HistoryOrderGetString(ticket, ORDER_SYMBOL) : OrderGetString(ORDER_SYMBOL);
    ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)(history ? HistoryOrderGetInteger(ticket, ORDER_TYPE) : OrderGetInteger(ORDER_TYPE));
@@ -1024,9 +1421,14 @@ string OrderJson(const ulong ticket, const bool history)
    double size = ContractSize(t);
    string limit = kind == "limit" ? JP(open, digits) : kind == "stopLimit" ? JP(stoplimit, digits) : "null";
    string stop = (kind == "stop" || kind == "stopLimit") ? JP(open, digits) : "null";
+   if(lots >= 0)
+     {
+      initial = lots;
+      current = lots;
+     }
    return "{\"id\":" + JQ(IntegerToString(ticket)) + ",\"ticker\":" + JQ(t) + ",\"side\":" + Side(IsBuy(type)) + ",\"type\":" + JQ(kind) +
           ",\"qty\":" + JN(initial * size, 4) + ",\"filledQty\":" + JN((initial - current) * size, 4) + ",\"limitPrice\":" + limit + ",\"stopPrice\":" + stop +
-          ",\"takeProfit\":" + JP(tp, digits) + ",\"stopLoss\":" + JP(sl, digits) + ",\"status\":" + JQ(StatusOf(state)) +
+          "," + (exits != "" ? exits : "\"takeProfit\":" + JP(tp, digits) + ",\"stopLoss\":" + JP(sl, digits)) + ",\"status\":" + JQ(StatusOf(state)) +
           ",\"duration\":" + JQ(life == ORDER_TIME_DAY ? "day" : "gtc") + ",\"updatedMs\":" + IntegerToString(ToUtc((datetime)(when / 1000)) * 1000 + when % 1000) + "}";
   }
 
@@ -1102,27 +1504,101 @@ string BrokerPlace(CJ *p, string &error)
    bool buy = JStr(p, "side") == "buy";
    string type = JStr(p, "type");
    double limit = Price(p, "limitPrice"), stop = Price(p, "stopPrice"), tp = Price(p, "takeProfit"), sl = Price(p, "stopLoss");
-   bool ok = false;
-   ENUM_ORDER_TYPE_TIME life = Life(p, t);
-   if(type == "market")
-      ok = buy ? g_trade.Buy(lots, t, 0, sl, tp, "OpenTrader") : g_trade.Sell(lots, t, 0, sl, tp, "OpenTrader");
-   else
-      if(type == "limit")
-         ok = buy ? g_trade.BuyLimit(lots, limit, t, sl, tp, life, 0, "OpenTrader") : g_trade.SellLimit(lots, limit, t, sl, tp, life, 0, "OpenTrader");
-      else
-         if(type == "stop")
-            ok = buy ? g_trade.BuyStop(lots, stop, t, sl, tp, life, 0, "OpenTrader") : g_trade.SellStop(lots, stop, t, sl, tp, life, 0, "OpenTrader");
-         else
-            if(type == "stopLimit")
-               ok = g_trade.OrderOpen(t, buy ? ORDER_TYPE_BUY_STOP_LIMIT : ORDER_TYPE_SELL_STOP_LIMIT, lots, limit, stop, sl, tp, life, 0, "OpenTrader");
-   error = Outcome();
-   if(!ok && error == "")
-      error = "The order was not sent (" + IntegerToString(GetLastError()) + ")";
+   CLevels lv;
+   bool levels = ReadLevels(p, t, lv, error);
    if(error != "")
       return "";
+   if(levels && Hedging())
+      return PlaceGroup(p, t, lots, lv, error);
+   if(levels)
+     {
+      // Netting: the order goes without exits; its levels are placed on the position as it fills.
+      long protect = 0;
+      double from = EntryOf(t, buy, type, limit, stop);
+      for(int j = 0; j < lv.Size() && error == ""; j++)
+        {
+         protect += Steps(t, lv.lots[j]);
+         error = ExitError(t, buy, from, lv.tp[j], lv.sl[j]);
+        }
+      if(error == "" && protect > Steps(t, lots))
+         error = "The exit levels protect more than the order's quantity";
+      if(error != "")
+         return "";
+      tp = 0;
+      sl = 0;
+     }
+   ulong id = 0;
+   if(!SendOrder(t, buy, type, lots, limit, stop, sl, tp, Life(p, t), 0, id, error))
+      return "";
+   if(levels && lv.Size() > 0)
+     {
+      SetPlan(id, t, buy, lv);
+      ProcessPlans();
+     }
    g_stateDirty = true;
-   ulong id = g_trade.ResultOrder();
    return "{\"orderId\":" + JQ(IntegerToString(id)) + "}";
+  }
+
+//--- What an order would do (broker.previewOrder): the terminal's check of it (OrderCheck), nothing sent. The margin
+//--- it takes and the account's free margin and margin level after it; the broker's refusal as an error.
+string BrokerPreview(CJ *p, string &error)
+  {
+   string t = JStr(p, "ticker");
+   if(!SymbolSelect(t, true))
+     {
+      error = "Unknown symbol " + t;
+      return "";
+     }
+   string lotError = "";
+   double lots = Lots(t, JNum(p, "qty"), lotError);
+   if(lots <= 0)
+      return "{\"sections\":[],\"errors\":[" + JQ(lotError) + "]}";
+   bool buy = JStr(p, "side") == "buy";
+   string type = JStr(p, "type");
+   MqlTradeRequest r;
+   ZeroMemory(r);
+   r.symbol = t;
+   r.volume = lots;
+   r.sl = Price(p, "stopLoss");
+   r.tp = Price(p, "takeProfit");
+   r.type_time = Life(p, t);
+   r.type_filling = (ENUM_ORDER_TYPE_FILLING)g_trade.RequestTypeFilling();
+   if(type == "market")
+     {
+      r.action = TRADE_ACTION_DEAL;
+      r.type = buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      r.price = SymbolInfoDouble(t, buy ? SYMBOL_ASK : SYMBOL_BID);
+     }
+   else
+     {
+      r.action = TRADE_ACTION_PENDING;
+      if(type == "limit")
+        {
+         r.type = buy ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
+         r.price = Price(p, "limitPrice");
+        }
+      else
+         if(type == "stop")
+           {
+            r.type = buy ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
+            r.price = Price(p, "stopPrice");
+           }
+         else
+           {
+            r.type = buy ? ORDER_TYPE_BUY_STOP_LIMIT : ORDER_TYPE_SELL_STOP_LIMIT;
+            r.price = Price(p, "stopPrice");
+            r.stoplimit = Price(p, "limitPrice");
+           }
+     }
+   MqlTradeCheckResult c;
+   ZeroMemory(c);
+   bool ok = OrderCheck(r, c);
+   string ccy = JQ(AccountInfoString(ACCOUNT_CURRENCY));
+   string row = "{\"label\":\"%s\",\"value\":\"%s\",\"currency\":" + ccy + "}";
+   string rows = StringFormat(row, "Margin", DoubleToString(c.margin, 2)) + "," + StringFormat(row, "Free margin after", DoubleToString(c.margin_free, 2));
+   string level = c.margin_level > 0 ? ",{\"label\":\"Margin level after\",\"value\":" + JQ(DoubleToString(c.margin_level, 2) + "%") + "}" : "";
+   string errors = ok || c.retcode == 0 ? "" : JQ(c.comment + " (" + IntegerToString(c.retcode) + ")");
+   return "{\"sections\":[{\"rows\":[" + rows + level + "]}],\"errors\":[" + errors + "]}";
   }
 
 string BrokerModify(CJ *p, string &error)
@@ -1136,6 +1612,25 @@ string BrokerModify(CJ *p, string &error)
       return "";
      }
    string t = OrderGetString(ORDER_SYMBOL);
+   bool levels = p != NULL && p.Get("exitLevels") != NULL && p.Get("exitLevels").type == J_ARR;
+   if(Hedging() && (levels || IsOt(OrderGetInteger(ORDER_MAGIC))))
+      return ModifyGroup(p, ticket, error);
+   // Netting: the order's levels wait for its fill (they replace its take profit / stop loss).
+   CLevels lv;
+   if(levels)
+     {
+      ReadLevels(p, t, lv, error);
+      if(error != "")
+         return "";
+      long protect = 0;
+      for(int j = 0; j < lv.Size(); j++)
+         protect += Steps(t, lv.lots[j]);
+      if(protect > Steps(t, OrderGetDouble(ORDER_VOLUME_CURRENT)))
+        {
+         error = "The exit levels protect more than the order's quantity";
+         return "";
+        }
+     }
    double size = ContractSize(t);
    double now = OrderGetDouble(ORDER_VOLUME_CURRENT) * size;
    if(JHasNum(p, "qty") && MathAbs(JNum(p, "qty") - now) > size * SymbolInfoDouble(t, SYMBOL_VOLUME_STEP) / 2)
@@ -1148,10 +1643,19 @@ string BrokerModify(CJ *p, string &error)
    double stoplimit = kind == "stopLimit" ? Price(p, "limitPrice") : 0;
    // The duration picked; without one the order keeps its own.
    ENUM_ORDER_TYPE_TIME life = JStr(p, "duration") != "" ? Life(p, t) : (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
-   bool ok = g_trade.OrderModify(ticket, price, Price(p, "stopLoss"), Price(p, "takeProfit"), life, (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION), stoplimit);
+   bool plain = !levels || lv.Size() == 0;
+   bool ok = g_trade.OrderModify(ticket, price, plain ? Price(p, "stopLoss") : 0, plain ? Price(p, "takeProfit") : 0, life, (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION), stoplimit);
    error = Outcome();
    if(!ok && error == "")
       error = "The order was not modified (" + IntegerToString(GetLastError()) + ")";
+   if(error == "" && !plain)
+      SetPlan(ticket, t, IsBuy((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE)), lv);
+   else
+      if(error == "" && PlanOf(ticket) >= 0)
+        {
+         DropPlan(PlanOf(ticket));
+         SavePlans();
+        }
    g_stateDirty = true;
    return error == "" ? "{}" : "";
   }
@@ -1159,6 +1663,9 @@ string BrokerModify(CJ *p, string &error)
 string BrokerCancel(CJ *p, string &error)
   {
    ulong ticket = (ulong)StringToInteger(JStr(p, "orderId"));
+   // A hedging order with levels: all its parts.
+   if(CancelGroup(ticket, error))
+      return error == "" ? "{}" : "";
    bool ok = g_trade.OrderDelete(ticket);
    error = Outcome();
    if(!ok && error == "")
@@ -1178,6 +1685,19 @@ string BrokerClose(CJ *p, string &error)
       return "";
      }
    string t = PositionGetString(POSITION_SYMBOL);
+   if(Hedging() && IsOt(PositionGetInteger(POSITION_MAGIC)))
+     {
+      double part = 0;
+      if(JHasNum(p, "qty"))
+        {
+         part = Lots(t, JNum(p, "qty"), error);
+         if(part <= 0)
+            return "";
+        }
+      return CloseGroup(ticket, !JHasNum(p, "qty"), part, error);
+     }
+   // Netting: the levels left over follow the position at once (gone with it, or no more than what is left).
+   g_levelsDirty = true;
    bool ok;
    if(JHasNum(p, "qty"))
      {
@@ -1205,6 +1725,10 @@ string BrokerBrackets(CJ *p, string &error)
       error = "No position " + JStr(p, "positionId");
       return "";
      }
+   if(!Hedging())
+      return NetBrackets(p, ticket, error);
+   if(IsOt(PositionGetInteger(POSITION_MAGIC)) || (p != NULL && p.Get("exitLevels") != NULL))
+      return GroupBrackets(p, ticket, error);
    bool ok = g_trade.PositionModify(ticket, Price(p, "stopLoss"), Price(p, "takeProfit"));
    error = Outcome();
    if(!ok && error == "")
@@ -1235,6 +1759,7 @@ void Forget(const ulong order)
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
   {
    g_stateDirty = true;
+   g_levelsDirty = true;
    if(!g_ready)
       return;
    string kind = "";
@@ -1268,6 +1793,16 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
       Forget(trans.order);
    if(kind == "")
       return;
+   // The EA's own exit orders of a netting position are not the user's orders; the other parts of a hedging order with
+   // levels are told by its first part.
+   long magic = 0;
+   if(OrderSelect(trans.order))
+      magic = OrderGetInteger(ORDER_MAGIC);
+   else
+      if(HistoryOrderSelect(trans.order))
+         magic = HistoryOrderGetInteger(trans.order, ORDER_MAGIC);
+   if((IsOt(magic) && !Hedging()) || IsQuiet(trans.order))
+      return;
    int digits = (int)SymbolInfoInteger(trans.symbol, SYMBOL_DIGITS);
    double price = trans.price > 0 ? trans.price : trans.price_trigger;
    Notify("broker.event", "{\"kind\":" + JQ(kind) + ",\"ticker\":" + JQ(trans.symbol) + ",\"side\":" + Side(IsBuy(trans.order_type)) + ",\"type\":" +
@@ -1290,10 +1825,13 @@ void OnDeinit(const int reason)
   {
    EventKillTimer();
    Disconnect();
+   ClearPlans();
   }
 
 void OnTimer(void)
   {
+   // Before the connection: the netting levels are kept while OpenTrader is closed too.
+   KeepLevels();
    if(g_sock == INVALID_HANDLE)
      {
       TryConnect();
@@ -1303,6 +1841,8 @@ void OnTimer(void)
    if(!g_ready)
       return;
    StreamQuotes();
+   StreamTicks();
+   StreamDepth();
    // The account: at once after a trade, else every second (P&L).
    ulong now = GetTickCount64();
    if(g_stateDirty || now - g_lastState >= 1000)

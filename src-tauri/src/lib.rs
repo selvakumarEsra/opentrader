@@ -76,6 +76,10 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::local_series::local_folder_pick,
             commands::local_series::local_folder_scan,
             commands::local_series::local_folder_read,
+            commands::files::downloads_default_folder,
+            commands::files::downloads_folder_pick,
+            commands::files::export_file_save,
+            commands::files::open_folder,
             commands::alerts::post_webhook,
             alerts::alert_engine_claim,
             alerts::alert_engine_info,
@@ -130,17 +134,28 @@ fn specta_builder() -> Builder<tauri::Wry> {
             plugins::plugin_pick_folder,
             plugins::plugin_copy_files,
             plugins::plugin_logs,
+            plugins::plugin_forget_secret,
+            plugins::plugin_set_capability,
+            plugins::plugin_prompt_answer,
             plugins::broker::broker_status,
             plugins::broker::broker_set_active,
             plugins::broker::broker_set_trading_enabled,
             plugins::broker::broker_select_account,
             plugins::broker::broker_resolve_symbol,
             plugins::broker::broker_place,
+            plugins::broker::broker_preview_order,
             plugins::broker::broker_modify,
             plugins::broker::broker_cancel,
             plugins::broker::broker_close_position,
             plugins::broker::broker_set_position_brackets,
             plugins::broker::broker_watch_quotes,
+            plugins::broker::broker_watch_depth,
+            plugins::data::plugin_ticks,
+            plugins::data::plugin_watch_ticks,
+            plugins::data::plugin_watchlists,
+            plugins::data::plugin_scripts,
+            plugins::events::plugin_events,
+            plugins::fields::plugin_symbol_fields,
             plugins::broker::broker_set_symbol_map,
             plugins::broker::broker_refresh_state,
             plugins::broker::broker_instrument,
@@ -160,9 +175,19 @@ fn specta_builder() -> Builder<tauri::Wry> {
             app_menu::AppZoomChanged,
             agent::AgentRequest,
             plugins::PluginsChanged,
+            plugins::PluginPrompt,
+            plugins::PluginPromptDone,
+            plugins::PluginToast,
             plugins::broker::BrokerStatus,
             plugins::broker::BrokerOrderEvent,
             plugins::broker::BrokerQuote,
+            plugins::broker::BrokerDepth,
+            plugins::data::PluginTicks,
+            plugins::data::PluginWatchlistsChanged,
+            plugins::data::PluginScriptsChanged,
+            plugins::data::PluginSymbolInfoChanged,
+            plugins::events::PluginEventsChanged,
+            plugins::fields::PluginFieldsChanged,
         ])
 }
 
@@ -207,6 +232,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             // Window bounds / maximized / focus for the restart (window_session).
             window_session::on_window_event(window, event);
+            window_session::follow_minimized(window, event);
             if let tauri::WindowEvent::Destroyed = event {
                 use tauri::Manager;
                 let owner = window.label().to_string();

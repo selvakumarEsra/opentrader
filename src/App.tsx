@@ -24,6 +24,9 @@ import { TabPanel } from "./window/shell/TabPanel";
 import { TabPanelActions } from "./window/shell/TabPanelActions";
 import { KeyboardShortcutsPanel } from "./window/shell/KeyboardShortcutsPanel";
 import { ZoomToast } from "./window/shell/ZoomToast";
+import { startPluginPrompts } from "./window/shell/plugin-prompts";
+import { startPluginListSync } from "./data/plugin-watchlists";
+import { watchlistStore } from "./data/watchlist-store";
 import { WindowControls } from "./window/shell/WindowControls";
 import { DEFAULT_PANELS, reconcilePanes } from "./window/shell/tabs";
 import { recordRecentSymbol } from "./data/recent-symbols";
@@ -42,6 +45,7 @@ import { currentWindowLabel, initWindowStorageCleanup, isTauri, openScreenerWind
 import { RightRail } from "./window/right-rail/RightRail";
 import { BottomBar } from "./window/bottom-bar/BottomBar";
 import { OakScriptPanel } from "./window/oakscript/OakScriptPanel";
+import { createEditorPlacements } from "./window/oakscript/editor-placements";
 import { StrategyTesterPanel } from "./window/strategy-tester/StrategyTesterPanel";
 import { intervalSeconds } from "./window/strategy-tester/equity-data";
 import { PROPERTIES_INPUT, isStrategyId } from "./window/chart/indicators/strategy-entries";
@@ -52,13 +56,15 @@ import { screenerPanel, type ScreenerPlacement } from "./data/screener-store";
 import { SCREENER_PLACE_EVENT } from "./window/screener/ScreenerPanel";
 import { SCREENER_PICK_EVENT } from "./window/screener/ScreenerWindow";
 import { listen } from "@tauri-apps/api/event";
-import { CHART_TYPE_IDS, SINGLE_VALUE_TYPES, rememberSingleValueType, type ChartTypeId } from "./window/chart/chart-types";
-import { isAdjusted, setAdjusted, isEconomicSymbol, isFullSymbol, isIntradayInterval, isIntradayResolution, isSupportedResolution, symbolServesResolution, tickerOf, toFullSymbol, type SessionId } from "./data/datafeed";
+import { CHART_TYPE_IDS, chartTypeAllowed, rememberSingleValueType, type ChartTypeId } from "./window/chart/chart-types";
+import { forgetTickerInfo, isAdjusted, setAdjusted, isEconomicSymbol, tickCount, isChartableResolution, isFullSymbol, isIntradayInterval, isIntradayResolution, symbolServesResolution, tickerOf, toFullSymbol, type SessionId } from "./data/datafeed";
 import { displayTimeZone } from "./data/session";
 import { tradeJournal } from "./data/trade-journal";
 import { chartFrame } from "./data/trade-journal-calc";
 import { LayoutNameDialog } from "./window/header/LayoutNameDialog";
 import { DialogHost, showNotice } from "./components/Dialogs";
+import { onListFull } from "./data/watchlist-limit";
+import { warnListFull } from "./window/right-rail/watchlist/list-full";
 import { startLocalFolderSync } from "./data/local-folders";
 import { installDialogDrag } from "./components/dialog-drag";
 import { buildFavoriteIndicatorsMenu } from "./data/indicator-favorites";
@@ -92,12 +98,15 @@ import { ReplayEndDialog } from "./window/replay/ReplayEndDialog";
 import { OrderTicket } from "./window/trading/OrderTicket";
 import { BrokerPicker } from "./window/trading/BrokerPicker";
 import { TradingToasts } from "./window/trading/TradingToasts";
+import { SavedFileToast } from "./window/shell/SavedFileToast";
 import { tradingUi } from "./data/trading/trading-ui";
 import { replayBroker } from "./data/trading/replay-broker";
 import { pluginBroker } from "./data/trading/plugin-broker";
 import { events } from "./bindings";
 import { refreshPluginSessions } from "./data/session/symbol-sessions";
 import { forgetUnknownSymbols } from "./data/unknown-symbols";
+import { affects as pluginChangeAffects } from "./data/plugin-events";
+import { wakeRetries } from "./data/connection";
 import { createDrawingStore } from "./window/drawings/drawing-store";
 import { createChartBridge } from "./window/right-rail/community/chart-bridge";
 import { setChartBridge } from "./data/community/chart-share";
@@ -213,6 +222,22 @@ function App() {
   });
   createEffect(on(activeTabId, (id) => showPanels(tabById().get(id)?.panels ?? DEFAULT_PANELS), { defer: true }));
 
+  // The shown watchlist is per tab too (the reference app, #387): kept in the active tab, a tab switch shows the next
+  // tab's. A new tab, or one saved before, keeps the list shown when it opens.
+  const startList = activeTab().watchlist;
+  if (startList) watchlistStore.setActive(startList);
+  createEffect(() => {
+    const id = watchlistStore.activeId();
+    untrack(() => {
+      const t = activeTab();
+      if (id && t.watchlist !== id) appTabs.patchTab(t.id, { watchlist: id });
+    });
+  });
+  createEffect(on(activeTabId, (id) => {
+    const list = tabById().get(id)?.watchlist;
+    if (list) watchlistStore.setActive(list);
+  }, { defer: true }));
+
   // Reap localStorage for closed detached/new windows: non-main windows clear
   // themselves on close; the main window sweeps orphans at launch.
   let disposeStorageCleanup = () => {};
@@ -224,6 +249,8 @@ function App() {
   onCleanup(() => disposeStorageCleanup());
 
   onCleanup(installDialogDrag());
+  // A watchlist change past the list size limit is refused with this warning (#358).
+  onListFull(warnListFull);
 
   // Tab-title parts (App Settings → Tabs).
   const [tabTitleParts, setTabTitlePartsRaw] = createSignal<TabTitlePartState[]>(loadTabTitleParts());
@@ -261,7 +288,7 @@ function App() {
     // getBars rejects them too; this stops the remaining paths — keyboard
     // digit-entry, a stale persisted favourite — from ever applying an
     // unservable id.
-    if (!isSupportedResolution(v)) return;
+    if (!isChartableResolution(v)) return;
     undoablePaneChange("interval", "change resolution", () => {
       if (layoutSync().interval) patchSyncGroupPanes({ interval: v });
       else patchActivePane({ interval: v });
@@ -410,6 +437,8 @@ function App() {
     moveDrawingToDisplayIndex,
   } = drawingStore;
   const chartEdits = createChartEdits(appTabs, undo, drawingStore);
+  // The OakScript editor in a tab or in a window of its own (#325).
+  const editorPlacements = createEditorPlacements({ tabs: appTabs, edits: chartEdits, editorOpen: oakPanelOpen, setEditorOpen: setOakPanelOpen });
   // Settings > About > Copy diagnostic info and the get_diagnostics agent tool read the tabs and drawings.
   setDiagnosticsHost({ tabs: appTabs, drawings: drawingStore });
   const {
@@ -438,14 +467,38 @@ function App() {
   onMount(() => { if (isTauri() && windowLabel === "main") openFirstStartOnboarding(); });
 
   // A data plugin that connects again may describe its symbols otherwise (an update: #340's bar grid): each window
-  // reads their sessions again and reloads its charts when one changed.
+  // reads their sessions again and reloads its charts when one changed. The requests waiting for a plugin that was
+  // not connected yet (restored charts and watchlists at start, #371) are asked again at once.
   onMount(() => {
     if (!isTauri()) return;
     const stop = events.pluginsChanged.listen(() => {
       forgetUnknownSymbols();
+      forgetTickerInfo();
+      wakeRetries();
       void refreshPluginSessions().then((changed) => changed && emitAppEvent("chart-reload-data"));
     });
     onCleanup(() => void stop.then((f) => f()));
+  });
+
+  // A data plugin reloaded its reference data (#400): the windows forget what they kept of those symbols alone.
+  onMount(() => {
+    if (!isTauri()) return;
+    const stop = events.pluginSymbolInfoChanged.listen(({ payload }) => {
+      const which = pluginChangeAffects(payload);
+      forgetUnknownSymbols(which);
+      forgetTickerInfo(which);
+      void refreshPluginSessions(which).then((changed) => changed && emitAppEvent("chart-reload-data"));
+    });
+    onCleanup(() => void stop.then((f) => f()));
+  });
+
+  // Plugins' questions to the user (a broker login's code): asked in the main window.
+  onMount(() => {
+    if (isTauri() && windowLabel === "main") onCleanup(startPluginPrompts());
+  });
+  // Data plugins' watchlists (#381): the main window keeps the opened ones up to date.
+  onMount(() => {
+    if (isTauri() && windowLabel === "main") onCleanup(startPluginListSync());
   });
 
   // Synced folders of CSV files (#267): the main window keeps them in sync.
@@ -846,7 +899,12 @@ function App() {
           The split view takes its width from the right; in its fullscreen
           mode the main layout is hidden (kept mounted). The panels keep their
           places right to left (ot-panel-row, styles/rtl.css). */}
-      <div class="ot-panel-row flex flex-1 flex-row" style={{ "min-height": 0, "min-width": 0, position: "relative" }}>
+      {/* An editor tab (#325) shows the editor in place of the layout below (kept mounted). */}
+      <editorPlacements.EditorTabView theme={theme()} />
+      <div
+        class="ot-panel-row flex flex-1 flex-row"
+        style={{ "min-height": 0, "min-width": 0, position: "relative", display: activeTab().editor ? "none" : undefined }}
+      >
       <div
         class="flex flex-1 flex-col"
         style={{
@@ -871,7 +929,7 @@ function App() {
         interval={interval()}
         chartType={chartType()}
         onChartTypeChange={setChartType}
-        chartTypeAvailable={(id) => !isEconomicSymbol(activeFullSymbol() ?? symbol()) || SINGLE_VALUE_TYPES.has(id)}
+        chartTypeAvailable={(id) => chartTypeAllowed(id, isEconomicSymbol(activeFullSymbol() ?? symbol()), tickCount(interval()))}
         layout={layout()}
         onIntervalChange={setInterval}
         intervalAvailable={(id) => symbolServesResolution(activeFullSymbol() ?? symbol(), id)}
@@ -1035,6 +1093,7 @@ function App() {
               onToggleIndicator={toggleScriptOnChart}
               onAddIndicator={addIndicator}
               onClose={() => setOakPanelOpen(false)}
+              onOpenEditor={(where) => where !== "in-place" && editorPlacements.openOut(where)}
             />
           </Show>
           {/* The screener placed in the bottom panel (its title menu, Placement). */}
@@ -1148,7 +1207,7 @@ function App() {
           anchor={anchorRect()!}
           selectedRowId={selectedRowForOpenMenu()}
           intervalAvailable={(id) => symbolServesResolution(activeFullSymbol() ?? symbol(), id)}
-          chartTypeAvailable={(id) => !isEconomicSymbol(activeFullSymbol() ?? symbol()) || SINGLE_VALUE_TYPES.has(id as ChartTypeId)}
+          chartTypeAvailable={(id) => chartTypeAllowed(id as ChartTypeId, isEconomicSymbol(activeFullSymbol() ?? symbol()), tickCount(interval()))}
           onSelect={onMenuSelect}
           onClose={closeMenu}
         />
@@ -1171,6 +1230,7 @@ function App() {
         <BrokerPicker />
       </Show>
       <TradingToasts />
+      <SavedFileToast />
       <Show when={symbolInfoFor()}>{(s) => <SymbolInfoDialog symbol={s()} onClose={() => setSymbolInfoFor(null)} />}</Show>
       <SavedLayoutDialogs layouts={layouts} activeId={activeTab().savedLayoutId} />
       <Show when={intervalDialog()}>
@@ -1179,7 +1239,7 @@ function App() {
             initVal={d().initVal}
             selectOnInit={d().selectOnInit}
             current={interval()}
-            isSupported={isSupportedResolution}
+            isSupported={isChartableResolution}
             onApply={setInterval}
             onClose={() => setIntervalDialog(null)}
           />
