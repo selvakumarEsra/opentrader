@@ -891,6 +891,7 @@ function App() {
           themeSetting={themeSetting()}
           onThemeChange={setThemeSetting}
           onOpenLink={openLink}
+          chartSymbol={symbol}
         />
         <WindowControls />
       </div>
