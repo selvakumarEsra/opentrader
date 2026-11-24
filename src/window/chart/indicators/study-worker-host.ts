@@ -3,12 +3,13 @@
  * the least busy worker. A job still running after JOB_TIMEOUT_MS ends its worker (the next job starts a new one) and
  * fails, so a study that never ends cannot hold the others.
  */
-import StudyWorkerCtor from "../../../backtester/worker?worker";
+import studyWorkerUrl from "../../../backtester/worker?worker&url";
 import type { StudyJob, StudyReply } from "./study-worker-types";
+import { startWorker, type AppWorker } from "../../../data/worker-start";
 
 const JOB_TIMEOUT_MS = 120_000;
 
-type Slot = { worker: Worker; pending: Map<number, { resolve: (r: StudyReply) => void; timer: ReturnType<typeof setTimeout> }> };
+type Slot = { worker: AppWorker; pending: Map<number, { resolve: (r: StudyReply) => void; timer: ReturnType<typeof setTimeout> }> };
 
 /** One worker per four cores, two to four: a slow study does not delay the others. */
 const POOL_SIZE = Math.min(4, Math.max(2, Math.floor((globalThis.navigator?.hardwareConcurrency ?? 8) / 4)));
@@ -30,16 +31,19 @@ function failAll(slot: Slot, message: string, culprit?: number): void {
 }
 
 function open(index: number): Slot {
-  const worker = new StudyWorkerCtor();
-  const slot: Slot = { worker, pending: new Map() };
-  worker.onmessage = (e: MessageEvent<StudyReply>) => {
-    const p = slot.pending.get(e.data.id);
-    if (!p) return;
-    slot.pending.delete(e.data.id);
-    clearTimeout(p.timer);
-    p.resolve(e.data);
+  const slot: Slot = {
+    worker: startWorker(studyWorkerUrl, "study", {
+      message: (e: MessageEvent<StudyReply>) => {
+        const p = slot.pending.get(e.data.id);
+        if (!p) return;
+        slot.pending.delete(e.data.id);
+        clearTimeout(p.timer);
+        p.resolve(e.data);
+      },
+      crash: () => close(index, "The calculation stopped."),
+    }),
+    pending: new Map(),
   };
-  worker.onerror = () => close(index, "The calculation stopped.");
   slots[index] = slot;
   return slot;
 }

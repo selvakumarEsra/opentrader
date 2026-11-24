@@ -93,6 +93,8 @@ describe("symbolOf / chartWithSymbols", () => {
     expect(symbolOf(undefined)).toEqual({});
     expect(symbolOf({ timezone: "Europe/Paris", mintick: 0.5 })).toEqual({ timezone: "Europe/Paris", mintick: 0.5 });
     expect(symbolOf({ timeframe: "1D" })).toEqual({});
+    // A future's multiplier sizes the strategy's profits (#345).
+    expect(symbolOf({ mintick: 0.05, pointvalue: 65 })).toEqual({ mintick: 0.05, pointValue: 65 });
   });
 
   it("adds accessors of the other symbols' bars keyed symbol|timeframe", () => {
@@ -233,5 +235,18 @@ describe("runOakScriptStrategy", () => {
       });
     };
     expect(() => runOakScriptStrategy(body2, bars)).toThrow(/immediately/);
+  });
+});
+
+describe("declaration run", () => {
+  it("reads the chart's ticker: a series of the symbol's own is declared (#383)", async () => {
+    const { executeScript, indicator, plot, request, syminfo } = await import("oakscriptjs/script");
+    const { DECLARATION_CHART } = await import("../oakscript");
+    const run = executeScript(() => {
+      indicator("OI");
+      plot(request.security(syminfo.tickerid + "_OI", "", () => close), "OI");
+    }, [], {}, DECLARATION_CHART);
+    expect(run.metadata.title).toBe("OI");
+    expect(run.plotConfig.map((p) => p.title)).toEqual(["OI"]);
   });
 });

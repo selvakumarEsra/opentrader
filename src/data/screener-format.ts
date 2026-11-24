@@ -9,6 +9,7 @@
 import type { Fmt } from "./screener-catalog";
 import { volumeFormat } from "./volume-format";
 import { localNumber } from "../i18n/format";
+import { patternsOf, type CandlePattern } from "./candle-patterns";
 
 export const DASH = "—";
 const MINUS = "−";
@@ -39,7 +40,7 @@ function signed(n: number, body: string): string {
 /** A technical rating's bucket (the reference screener's rating enum). */
 export type Rating = "StrongBuy" | "Buy" | "Neutral" | "Sell" | "StrongSell";
 
-export type Cell = { text: string; unit?: string; tone?: "up" | "down"; rating?: Rating };
+export type Cell = { text: string; unit?: string; tone?: "up" | "down"; rating?: Rating; patterns?: CandlePattern[] };
 
 const RATING_TEXT: Record<Rating, string> = { StrongBuy: "Strong buy", Buy: "Buy", Neutral: "Neutral", Sell: "Sell", StrongSell: "Strong sell" };
 
@@ -55,7 +56,11 @@ export function ratingOf(v: number): Rating {
 /** Format one table cell. `currency` is the row currency (unit suffix). */
 export function formatCell(fmt: Fmt, v: number | string | null | undefined, currency: string | null): Cell {
   if (v === null || v === undefined || v === "") return { text: DASH };
-  if (typeof v === "string") return { text: v };
+  if (typeof v === "string") {
+    if (fmt !== "patterns") return { text: v };
+    const patterns = patternsOf(v);
+    return { text: patterns.map((p) => p.title).join(", "), patterns };
+  }
   if (!Number.isFinite(v)) return { text: DASH };
   const unit = currency ? currency.toUpperCase() : undefined;
   const tone = v > 0 ? "up" : v < 0 ? "down" : undefined;
@@ -71,8 +76,12 @@ export function formatCell(fmt: Fmt, v: number | string | null | undefined, curr
     // Cells: the reference volume formatter, whole numbers under 1,000.
     case "volume":
       return { text: volumeFormat(v, 0) };
+    case "signedVolume":
+      return { text: signed(v, volumeFormat(Math.abs(v), 0)), tone };
     case "money":
       return { text: volumeFormat(v, 0), unit };
+    case "signedMoney":
+      return { text: signed(v, volumeFormat(Math.abs(v), 0)), unit, tone };
     case "number":
       return { text: `${v < 0 ? MINUS : ""}${Math.abs(v).toFixed(2)}` };
     case "integer":
@@ -101,7 +110,9 @@ export function valueText(fmt: Fmt, n: number): string {
 function englishValueText(fmt: Fmt, n: number): string {
   switch (fmt) {
     case "volume":
+    case "signedVolume":
     case "money":
+    case "signedMoney":
       return abbrev(n);
     case "change":
     case "percent":

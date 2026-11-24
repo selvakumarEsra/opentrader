@@ -10,11 +10,13 @@ import {
   SYMBOLS,
   filterSymbols,
   liveResultsToRows,
+  splitExchangeQuery,
   type FilteredRow,
   type SymbolRow,
   type SymbolCategoryId,
 } from "../../../data/symbol-search";
-import { economicSources, getTickerInfo, searchEconomic, searchSymbols } from "../../../data/datafeed";
+import { economicCountries, economicSources, getTickerInfo, searchEconomic, searchSymbols } from "../../../data/datafeed";
+import type { EconomicCountry } from "../../../bindings";
 import { LOCAL_EXCHANGE, localSeriesList, localSymbol } from "../../../data/local-series";
 import { recentSymbols } from "../../../data/recent-symbols";
 import type { SymbolSearchResult } from "../../../bindings";
@@ -112,13 +114,15 @@ export const [econCountry, setEconCountry] = createSignal<string | null>(null);
 export const [econSource, setEconSource] = createSignal<string | null>(null);
 export const [econCategory, setEconCategory] = createSignal<string | null>(null);
 
-/** Countries of the economic catalogue (its series are US ones), by region:
- *  the Economy tab's country filter. */
-const ECON_REGIONS: { title: string; countries: { code: string; name: string }[] }[] = [
-  { title: "North America", countries: [{ code: "US", name: "USA" }] },
-];
-export const econCountryName = (code: string) =>
-  ECON_REGIONS.flatMap((r) => r.countries).find((c) => c.code === code)?.name ?? code;
+/** The economies of the economic catalogue (loaded with the Economy tab), the US first. */
+const [econCountries, setEconCountries] = createSignal<EconomicCountry[]>([{ code: "US", name: "USA", region: "North America" }]);
+let econCountriesAsked = false;
+/** The country panel's regions, in the reference order. */
+const REGION_ORDER = ["North America", "Latin America", "Europe", "Asia", "Africa", "Middle East", "Pacific"];
+const econRegions = () =>
+  REGION_ORDER.map((title) => ({ title, countries: econCountries().filter((c) => c.region === title).sort((a, b) => (a.code === "US" ? -1 : b.code === "US" ? 1 : a.name.localeCompare(b.name))) }))
+    .filter((r) => r.countries.length > 0);
+export const econCountryName = (code: string) => econCountries().find((c) => c.code === code)?.name ?? code;
 
 export type SymbolSearch = ReturnType<typeof createSymbolSearch>;
 
@@ -182,9 +186,10 @@ export function createSymbolSearch(props: SymbolSearchProps) {
     const q = searchText().trim();
     const source = econSource();
     const cat = econCategory();
+    const country = econCountry();
     // A local catalog: asked on every keystroke, the latest answer kept.
     const my = ++econSeq;
-    searchEconomic(q, source, cat)
+    searchEconomic(q, source, cat, country)
       .then((data) => {
         if (econSeq === my) setEconRaw(data);
       })
@@ -194,6 +199,10 @@ export function createSymbolSearch(props: SymbolSearchProps) {
   });
   createEffect(() => {
     if (economy() && untrack(sources).length === 0) economicSources().then(setSources).catch(() => {});
+    if (economy() && !econCountriesAsked) {
+      econCountriesAsked = true;
+      economicCountries().then((list) => list.length && setEconCountries(list)).catch(() => (econCountriesAsked = false));
+    }
   });
   // Economy tab: the countries panel (opened from the country chip) and its search.
   const [countryPanel, setCountryPanel] = createSignal(false);
@@ -203,7 +212,7 @@ export function createSymbolSearch(props: SymbolSearchProps) {
   });
   const countryRegions = createMemo(() => {
     const q = countryQuery().trim().toLowerCase();
-    return ECON_REGIONS.map((r) => ({ ...r, countries: r.countries.filter((c) => !q || c.name.toLowerCase().includes(q)) })).filter(
+    return econRegions().map((r) => ({ ...r, countries: r.countries.filter((c) => !q || c.name.toLowerCase().includes(q)) })).filter(
       (r) => r.countries.length > 0,
     );
   });
@@ -222,7 +231,10 @@ export function createSymbolSearch(props: SymbolSearchProps) {
     // waits for a typing pause only when it has to ask the gateway instead).
     setSearching(true);
     const my = ++reqSeq;
-    searchSymbols(q, type)
+    // "NASDAQ:AAPL": the text is looked up and the rows of that exchange kept (liveResultsToRows). A bare exchange
+    // ("MT5:") is asked as it is: a data plugin then lists its symbols.
+    const { exchange, text } = splitExchangeQuery(q);
+    searchSymbols(exchange && text ? text : q, type)
       .then((data) => {
         if (reqSeq === my) setLiveRaw(data); // else a newer keystroke superseded this
       })

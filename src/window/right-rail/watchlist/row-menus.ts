@@ -9,6 +9,7 @@ import {
   watchlistStore,
   isSectionId,
   isDeletedList,
+  isPluginList,
   listItems,
   sectionId,
   sectionNameOf,
@@ -67,6 +68,8 @@ export function createRowMenus(cx: WatchlistCx): RowMenusApi {
       return;
     }
     if (!isSectionSelected(name)) selectOnly(sectionId(name));
+    // A data plugin's sections are not edited by hand: nothing to offer.
+    if (cx.locked()) return;
     setSectionCtx({ name, x: e.clientX, y: e.clientY });
   };
   // The items the open row menu acts on, in list order: the selection
@@ -84,7 +87,7 @@ export function createRowMenus(cx: WatchlistCx): RowMenusApi {
   const toggleFlags = (rows: Row[], ask = rows.length > 1) => {
     if (!rows.length) return;
     const color = rows.every((r) => flagOf(r.ticker)) ? null : lastFlagColor();
-    const run = () => rows.forEach((r) => watchlistStore.setRowFlag(r.ticker, color));
+    const run = () => watchlistStore.setRowsFlag(rows.map((r) => r.ticker), color);
     if (!ask || color) {
       run();
       return;
@@ -109,7 +112,7 @@ export function createRowMenus(cx: WatchlistCx): RowMenusApi {
   // misses.
   const ctxLists = () => {
     const id = watchlistStore.activeId();
-    const all = watchlistStore.lists().filter((l) => !l.id.startsWith("color-") && (l.id === id || !isDeletedList(l.id)));
+    const all = watchlistStore.lists().filter((l) => !l.id.startsWith("color-") && !isPluginList(l) && (l.id === id || !isDeletedList(l.id)));
     return [
       ...all.filter((l) => l.id === id),
       ...all.filter((l) => l.id !== id).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })),
@@ -117,7 +120,8 @@ export function createRowMenus(cx: WatchlistCx): RowMenusApi {
   };
   // A section header among the items is added / removed like a symbol: added
   // at the end of the list (the symbols after it are its rows); removed, its
-  // rows stay.
+  // rows stay. The items are added all or none: a list they would take past
+  // its size limit takes none (the store shows the warning).
   const toggleItemsInList = (listId: string, ids: string[]) => {
     const missing = ids.filter((id) => !watchlistStore.listHas(listId, id));
     if (!missing.length) {
@@ -127,11 +131,14 @@ export function createRowMenus(cx: WatchlistCx): RowMenusApi {
       }
       return;
     }
-    for (const id of missing) {
-      const r = allRows().find((x) => x.ticker === id);
-      if (isSectionId(id)) watchlistStore.addSectionTo(listId, sectionNameOf(id));
-      else if (r) watchlistStore.addRowTo(listId, r);
-    }
+    watchlistStore.addItemsTo(
+      listId,
+      missing.flatMap((id): (Row | string)[] => {
+        if (isSectionId(id)) return [sectionNameOf(id)];
+        const r = allRows().find((x) => x.ticker === id);
+        return r ? [r] : [];
+      }),
+    );
   };
   const createListWithItems = (ids: string[]) => {
     const items = ids.flatMap((id): (Row | string)[] => {
@@ -142,7 +149,7 @@ export function createRowMenus(cx: WatchlistCx): RowMenusApi {
     const rows = items.filter((it): it is Row => typeof it !== "string");
     promptNewWatchlist((name) => {
       const nm = watchlistStore.createListWith(items, name);
-      showToast(`Added ${rows.length === 1 ? rows[0].short : `${rows.length} symbols`} to ${nm}`);
+      if (nm) showToast(`Added ${rows.length === 1 ? rows[0].short : `${rows.length} symbols`} to ${nm}`);
     });
   };
   // "Add note": the editor lives in the details pane and shows the SELECTED

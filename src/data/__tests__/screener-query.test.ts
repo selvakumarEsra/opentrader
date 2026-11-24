@@ -13,6 +13,7 @@ import {
   planScreen,
   presetFilter,
   presetTitle,
+  relativeDateRange,
 } from "../screener-query";
 import {
   COLUMN_BY_ID,
@@ -80,6 +81,12 @@ describe("pillTexts", () => {
     expect(pillTexts(box(C("Index"), ["SPX", "NDX"]))).toEqual({ primary: "Index", value: null });
     // Not adaptive (options from the data).
     expect(pillTexts(box(C("Sector"), ["Technology"]))).toEqual({ primary: "Sector", value: null });
+  });
+
+  it("a single-value filter shows its title and the value picked", () => {
+    expect(pillTexts(box(C("Management"), ["Passive"]))).toEqual({ primary: "Management style", value: "Passive" });
+    expect(pillTexts(box(C("DividendTreatment"), ["Distributes"]))).toEqual({ primary: "Div treat", value: "Distributes" });
+    expect(pillTexts(box(C("Management"), []))).toEqual({ primary: "Management style", value: null });
   });
 
   it("price-like values carry the USD unit", () => {
@@ -200,6 +207,24 @@ describe("filterClauses", () => {
     expect(filterClauses(box(C("TechnicalRating"), ["Buy", "StrongBuy"]))).toEqual([{ left: "TechRating_1D", operation: "in_range", right: ["Buy", "StrongBuy"] }]);
   });
 
+  it("compiles a relative date filter to the range of its days (New York calendar days, weeks from Monday)", () => {
+    const day = (d: string) => Date.parse(`${d}T00:00:00Z`) / 1000;
+    const end = (d: string) => day(d) + 86399;
+    // Monday 23/11/2026, 14:30 New York (19:30 UTC); late evening New York is still that day (03:00 UTC the next day).
+    for (const now of [new Date("2026-11-23T19:30:00Z"), new Date("2026-11-24T03:00:00Z")]) {
+      expect(relativeDateRange("Today", now)).toEqual([day("2026-11-23"), end("2026-11-23")]);
+      expect(relativeDateRange("Yesterday", now)).toEqual([day("2026-11-22"), end("2026-11-22")]);
+      expect(relativeDateRange("Previous5Days", now)).toEqual([day("2026-11-18"), end("2026-11-22")]);
+      expect(relativeDateRange("ThisWeek", now)).toEqual([day("2026-11-23"), end("2026-11-29")]);
+      expect(relativeDateRange("PreviousWeek", now)).toEqual([day("2026-11-16"), end("2026-11-22")]);
+      expect(relativeDateRange("ThisMonth", now)).toEqual([day("2026-11-01"), end("2026-11-30")]);
+    }
+    expect(relativeDateRange("Nope")).toBeNull();
+    const [lo, hi] = relativeDateRange("ThisMonth")!;
+    expect(filterClauses(box(C("EarningsRecent"), ["ThisMonth"]))).toEqual([{ left: "f.earnings_recent", operation: "in_range", right: [lo, hi] }]);
+    expect(pillTexts(box(C("EarningsRecent"), ["Today"]))).toEqual({ primary: "Recent earnings date", value: "Current trading day" });
+  });
+
   it("compiles ranges", () => {
     const mc = C("MarketCap");
     expect(filterClauses(cond(mc, "between", { left: 1, right: 2 }))).toEqual([{ left: "market_cap_basic", operation: "in_range", right: [1, 2] }]);
@@ -264,7 +289,7 @@ describe("planScreen", () => {
     const plan = planScreen(defaultEtfScreen(), all, null);
     expect(plan.filter).toEqual([ETF_UNIVERSE_CLAUSE]);
     expect(planScreen({ ...defaultEtfScreen(), primaryListing: true }, all, null).filter).toEqual([ETF_PRIMARY_UNIVERSE_CLAUSE]);
-    expect(plan.columns.map((c) => c.id)).toEqual(["Price", "Change", "VolumePrice", "RelativeVolume", "AssetsUnderManagement"]);
+    expect(plan.columns.map((c) => c.id)).toEqual(["Price", "Change", "VolumePrice", "RelativeVolume", "AssetsUnderManagement", "TotalHoldings", "ExpenseRatio", "AssetClass"]);
   });
 
   it("never sends fields the backend does not have", () => {

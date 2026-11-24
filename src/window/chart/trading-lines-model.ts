@@ -5,7 +5,7 @@ import { localNumber } from "../../i18n/format";
  * labels, the dialog summaries, tick snapping, the default bracket of a
  * position and the order request a dragged line sends.
  */
-import type { OrderRequest, TradingExecution, TradingOrder, TradingPosition } from "../../data/trading/types";
+import type { ExitLevel, OrderRequest, TradingExecution, TradingOrder, TradingPosition } from "../../data/trading/types";
 
 /** Default bracket distances in ticks (the order ticket's). */
 export const TP_TICKS = 75;
@@ -55,6 +55,32 @@ export function orderLinePrice(o: TradingOrder): number | null {
   return o.type === "stop" || o.type === "stopLimit" ? o.stopPrice : o.limitPrice;
 }
 
+/** A stop-limit order waiting for its stop shows its limit price on a
+ *  dotted line of its own (reference app). */
+export const hasLimitLine = (o: TradingOrder) => o.kind === "order" && o.type === "stopLimit" && !o.stopTriggered && o.limitPrice !== null;
+
+/** A line of an order: its main line (the stop of a stop-limit until the
+ *  stop is reached) or the limit line of a stop-limit. Key "<id>" or
+ *  "<id>#limit". */
+export type OrderLine = { key: string; id: string; limit: boolean };
+
+/** The lines of `list` in drawing order (reference app: the last placed on
+ *  top): the position's brackets, then each order followed by its own
+ *  brackets. A line already in `prev` (by key) is reused as it is. */
+export function orderLines(list: TradingOrder[], prev: ReadonlyMap<string, OrderLine>): OrderLine[] {
+  const seq = (o: TradingOrder) => Number(o.kind === "order" ? o.id : o.parentId) || 0;
+  const rank = (o: TradingOrder) => (o.parentId === "position" ? -1 : seq(o));
+  const out: OrderLine[] = [];
+  const add = (key: string, id: string, limit: boolean) => out.push(prev.get(key) ?? { key, id, limit });
+  for (const { o } of list
+    .map((o, i) => ({ o, i }))
+    .sort((a, b) => rank(a.o) - rank(b.o) || (a.o.kind === "order" ? -1 : 0) - (b.o.kind === "order" ? -1 : 0) || a.i - b.i)) {
+    add(o.id, o.id, false);
+    if (hasLimitLine(o)) add(`${o.id}#limit`, o.id, true);
+  }
+  return out;
+}
+
 /** Order chip text: "Buy limit", "Sell stop limit"; brackets "Take profit" /
  *  "Stop loss" (reference app). */
 export function orderChipText(o: TradingOrder): string {
@@ -79,8 +105,10 @@ export function orderMenuTitle(o: TradingOrder, tick: number): string {
   return `${o.side === "buy" ? "Buy" : "Sell"} ${fmtQty(o.qty)}${price !== null ? ` @${fmtPrice(price, tick)}` : ""} ${type}`;
 }
 
-/** Cancel dialog title: "Cancel order", "Cancel take profit order", "Cancel stop loss order". */
+/** Cancel dialog title: "Cancel order", "Cancel take profit order", "Cancel stop loss order"; a level's line cancels
+ *  its whole level: "Cancel exit level" (reference). */
 export function cancelTitle(o: TradingOrder): string {
+  if (o.levelId) return "Cancel exit level";
   return o.kind === "tp" ? "Cancel take profit order" : o.kind === "sl" ? "Cancel stop loss order" : "Cancel order";
 }
 
@@ -104,6 +132,14 @@ export function fmtPl(v: number, currency: string): string {
   const abs = Math.abs(v).toFixed(2);
   const sign = v > 0 ? "+" : v < 0 ? "−" : "";
   return localNumber(`${sign}${abs} ${currency}`);
+}
+
+/** Colour of a P&L text (the reference app's rule): green in profit, red in
+ *  loss, the line's own colour at zero (null). A money P&L is judged on its
+ *  cents, so a shown "0.00" stays neutral. */
+export function plTone(v: number, cents = false): "profit" | "loss" | null {
+  const x = cents ? Math.round(v * 100) / 100 : v;
+  return x > 0 ? "profit" : x < 0 ? "loss" : null;
 }
 
 /** Take profit / stop loss of a position at the ticket's default distance. */
@@ -186,10 +222,39 @@ export function requestWithPrice(o: TradingOrder, price: number | null, patch: P
     stopPrice: o.stopPrice,
     takeProfit: o.takeProfit,
     stopLoss: o.stopLoss,
+    // A modified order keeps its exit levels (#330).
+    ...(o.exitLevels?.length ? { exitLevels: o.exitLevels } : {}),
   };
   if (price !== null) {
     if (o.type === "stop" || o.type === "stopLimit") base.stopPrice = price;
     else base.limitPrice = price;
   }
   return { ...base, ...patch };
+}
+
+/**
+ * The exit levels of an order or a position of `qty` once a level is added on the chart (#330, "Multiple exit
+ * levels"): its one take profit / stop loss becomes the first level, and the new level takes the quantity no level
+ * protects yet, else half of the largest level (whole `step`s). The levels never protect more than the quantity: each
+ * is an exit of its own part. Null when no part is left to give it.
+ */
+export function withNewLevel(
+  qty: number,
+  current: { exitLevels?: ExitLevel[]; takeProfit: number | null; stopLoss: number | null },
+  add: { takeProfit: number; stopLoss: number },
+  step: number,
+): ExitLevel[] | null {
+  const levels: ExitLevel[] = current.exitLevels?.length
+    ? current.exitLevels.map((l) => ({ qty: l.qty, takeProfit: l.takeProfit, stopLoss: l.stopLoss }))
+    : current.takeProfit !== null || current.stopLoss !== null
+      ? [{ qty, takeProfit: current.takeProfit, stopLoss: current.stopLoss }]
+      : [];
+  const whole = (v: number) => Number((Math.floor(v / step + 1e-9) * step).toFixed(10));
+  const free = whole(qty - levels.reduce((a, l) => a + l.qty, 0));
+  if (free >= step) return [...levels, { qty: free, ...add }];
+  const big = levels.reduce<ExitLevel | null>((m, l) => (!m || l.qty > m.qty ? l : m), null);
+  const half = big ? whole(big.qty / 2) : 0;
+  if (!big || half < step) return null;
+  big.qty = Number((big.qty - half).toFixed(10));
+  return [...levels, { qty: half, ...add }];
 }

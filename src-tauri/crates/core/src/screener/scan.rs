@@ -354,6 +354,7 @@ mod tests {
             prev_close: Some(last),
             live,
             updated_ms: ms,
+            ext: Default::default(),
         }
     }
 
@@ -445,6 +446,44 @@ mod tests {
     }
 
     #[test]
+    fn extended_hours_fields_from_the_feed_values() {
+        use crate::data::market_rest::ExtHours;
+        let mut a = mrow("AAA", 10.0, 1000.0, true, "2026-09-29T20:30:00Z");
+        a.ext = ExtHours {
+            pre_open: Some(8.4),
+            pre_close: Some(8.8),
+            pre_volume: Some(500.0),
+            pre_base: Some(8.0),
+            post_close: Some(10.5),
+            post_volume: Some(70.0),
+            post_base: Some(10.0),
+            hour_base: Some(12.5),
+            h4_base: Some(8.0),
+            reg_close: Some(10.2),
+            ..Default::default()
+        };
+        // No feed values (the REST snapshot): every extended-hours field is empty.
+        let b = mrow("BBB", 4.0, 5000.0, true, "2026-09-29T20:30:00Z");
+        let t = Table::build(1, vec![a, b], Arc::new(vec![]), None);
+        let mut r = req(vec![], Some(("name", SortOrder::Asc)));
+        let fields = [
+            "premarket_close", "premarket_change", "premarket_gap", "premarket_volume", "premarket_change_from_open",
+            "postmarket_close", "postmarket_change", "postmarket_volume", "change|60", "change|240", "premarket_high",
+        ];
+        r.columns = fields.iter().map(|f| f.to_string()).collect();
+        let r = run(&t, &r).unwrap();
+        let num = |row: usize, i: usize| match r.rows[row].d[i] {
+            Some(Cell::Num(v)) => Some((v * 1e6).round() / 1e6),
+            _ => None,
+        };
+        let want = [Some(8.8), Some(10.0), Some(5.0), Some(500.0), Some(4.761905), Some(10.5), Some(5.0), Some(70.0), Some(-18.4), Some(27.5), None];
+        for (i, w) in want.iter().enumerate() {
+            assert_eq!(num(0, i), *w, "{}", fields[i]);
+            assert_eq!(num(1, i), None, "{} without feed values", fields[i]);
+        }
+    }
+
+    #[test]
     fn filters_sorts_and_pages() {
         let t = table(None);
         let r = run(&t, &req(vec![clause("close", Op::EGreater, Operand::Num(5.0))], Some(("volume", SortOrder::Desc)))).unwrap();
@@ -505,6 +544,29 @@ mod tests {
         let ids: Vec<String> = crate::screener::fields::catalog(&t).into_iter().filter(|f| f.available).map(|f| f.id).collect();
         assert!(ids.contains(&"TechRating_1D".to_string()) && ids.contains(&"Value.Traded|1W".to_string()));
         assert!(!ids.contains(&"Volatility.M".to_string()) && !ids.contains(&"AO".to_string()));
+    }
+
+    #[test]
+    fn volume_change_fields() {
+        // AAA on 29/09: volume 1000; D's volume 800 (S's previous session).
+        let with_values = |mut st: StateFile| {
+            for (k, v) in [("volume_change", 60.0), ("volume_change_abs", 300.0), ("volume_change|next", 800.0)] {
+                st.num.insert(k.to_string(), vec![Some(v), None, None]);
+            }
+            st
+        };
+        let t = table(Some(with_values(state((2026, 9, 28)))));
+        let v = |id: &str| Field::parse(id).unwrap().eval(&t, &t.rows[0]);
+        assert_eq!(v("volume_change"), Some(Val::Num(25.0)));
+        assert_eq!(v("volume_change_abs"), Some(Val::Num(200.0)));
+        // On the state's own day: the values at its close.
+        let t = table(Some(with_values(state((2026, 9, 29)))));
+        let v = |id: &str| Field::parse(id).unwrap().eval(&t, &t.rows[0]);
+        assert_eq!(v("volume_change"), Some(Val::Num(60.0)));
+        assert_eq!(v("volume_change_abs"), Some(Val::Num(300.0)));
+        // Offered only once the served state holds them.
+        let ids: Vec<String> = crate::screener::fields::catalog(&table(Some(state((2026, 9, 28))))).into_iter().filter(|f| f.available).map(|f| f.id).collect();
+        assert!(!ids.contains(&"volume_change".to_string()));
     }
 
     #[test]

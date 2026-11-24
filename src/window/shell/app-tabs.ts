@@ -39,13 +39,18 @@ import {
   takeDetachPayload,
 } from "./window-bridge";
 import { bindLayoutSync, rememberCrosshair, type LayoutSyncKey } from "../chart/layout-sync";
-import { isEconomicSymbol, isFullSymbol, toFullSymbol } from "../../data/datafeed";
-import { SINGLE_VALUE_TYPES, lastSingleValueType } from "../chart/chart-types";
+import { isEconomicSymbol, isFullSymbol, tickCount, toFullSymbol } from "../../data/datafeed";
+import { chartTypeAllowed, chartTypeInstead } from "../chart/chart-types";
 import { migrateDrawingKey } from "../drawings/persistence";
 import { setSelectedDrawingId } from "../drawings/drawing-selection";
+import { embedConfig } from "../../embed/config";
+import { embedSeedTab } from "../../embed/seed";
+import { chartLinkUrl } from "../../data/chart-link";
 
 export function createAppTabs(windowLabel: string) {
-  const initial = loadTabs(windowLabel, takeDetachPayload(windowLabel));
+  // An embedded chart (#338) opens on the chart its settings describe.
+  const embed = embedConfig();
+  const initial = loadTabs(windowLabel, embed ? embedSeedTab(embed) : takeDetachPayload(windowLabel));
   const [tabs, setTabs] = createSignal<TabChart[]>(initial.tabs);
   const [activeTabId, setActiveTabId] = createSignal<string>(initial.activeId);
   const activeTab = () => tabs().find((t) => t.id === activeTabId()) ?? tabs()[0];
@@ -63,7 +68,8 @@ export function createAppTabs(windowLabel: string) {
     setMountedTabs(new Set([...cur].filter((x) => ids.has(x)).concat(id)));
   });
   const tabById = createMemo(() => new Map(tabs().map((t) => [t.id, t] as const)));
-  const gridTabIds = createMemo(() => tabs().map((t) => t.id).filter((id) => mountedTabs().has(id)));
+  // An editor tab (#325) draws no chart: it has no grid.
+  const gridTabIds = createMemo(() => tabs().filter((t) => !t.editor && mountedTabs().has(t.id)).map((t) => t.id));
 
   /** Patch one tab's (tab-level) state. */
   function patchTab(id: string, patch: Partial<TabChart>) {
@@ -133,24 +139,27 @@ export function createAppTabs(windowLabel: string) {
   };
   bindLayoutSync(layoutSync, toggleLayoutSync);
 
-  // A close-only symbol (an economic series) draws a single-value type: a
-  // pane on another type takes the last single-value type picked on such a
-  // symbol, and gets its own type back with the next symbol that has OHLC bars
-  // (the reference app's style recovery).
+  // A close-only symbol (an economic series) and one-tick bars draw a
+  // single-value type, tick bars no price-move type (#376): a pane on another
+  // type takes one it can draw, and gets its own type back with the next
+  // symbol or interval that draws it (the reference app's style recovery).
   function followCloseOnlyTypes() {
     createEffect(() => {
       for (const t of tabs()) {
         let changed = false;
         const panes = t.panes.map((p) => {
-          if (isEconomicSymbol(p.symbol)) {
-            if (SINGLE_VALUE_TYPES.has(p.chartType)) return p;
+          const closeOnly = isEconomicSymbol(p.symbol);
+          const ticks = tickCount(p.interval);
+          // The type it had before, once the chart draws it again (1T → 10T: candles back).
+          if (p.styleToRecover && chartTypeAllowed(p.styleToRecover, closeOnly, ticks)) {
             changed = true;
-            return { ...p, chartType: lastSingleValueType(), styleToRecover: p.styleToRecover ?? p.chartType };
+            const { styleToRecover, ...rest } = p;
+            return { ...rest, chartType: styleToRecover };
           }
-          if (!p.styleToRecover) return p;
+          const instead = chartTypeInstead(p.chartType, closeOnly, ticks);
+          if (!instead) return p;
           changed = true;
-          const { styleToRecover, ...rest } = p;
-          return { ...rest, chartType: styleToRecover };
+          return { ...p, chartType: instead, styleToRecover: p.styleToRecover ?? p.chartType };
         });
         if (changed) untrack(() => patchTab(t.id, { panes }));
       }
@@ -206,9 +215,30 @@ export function createAppTabs(windowLabel: string) {
     setTabs([...tabs(), t]);
     activateTab(t.id);
   }
+  /** "Open editor ▸ New tab" (#325): an OakScript editor tab linked to chart tab `chartTab`, after it, shown. */
+  function newEditorTab(chartTab: string) {
+    const t: TabChart = { ...makeTab({ isChart: false }), editor: { chartTab } };
+    const arr = tabs().slice();
+    arr.splice(insertPosition(arr, false, arr.findIndex((x) => x.id === chartTab) + 1), 0, t);
+    setTabs(arr);
+    activateTab(t.id);
+  }
+  /** The editor tab goes back in place (#325, "Open editor ▸ In-place"): it closes, not kept for "Reopen closed tab",
+   *  and its chart tab is shown. */
+  function closeEditorTab(id: string) {
+    const tab = tabOf(id);
+    if (!tab?.editor) return;
+    const next = tabs().filter((t) => t.id !== id);
+    // No chart left in the window: the editor goes under a new one.
+    if (!next.some((t) => !t.editor)) next.push(makeTab());
+    const chart = next.find((t) => t.id === tab.editor!.chartTab) ?? next.find((t) => !t.editor) ?? next[0];
+    setTabs(next);
+    activateTab(chart.id);
+  }
   function duplicateTab(id: string) {
     const src = tabs().find((t) => t.id === id);
-    if (!src) return;
+    // An editor tab is not copied: one editor per chart.
+    if (!src || src.editor) return;
     const clone: TabChart = {
       id: newTabId(),
       layout: src.layout,
@@ -274,7 +304,7 @@ export function createAppTabs(windowLabel: string) {
    *  keeps at least one tab. Returns true when the tab moved. */
   async function dropTabOnWindow(id: string, sx: number, sy: number): Promise<boolean> {
     const tab = tabs().find((t) => t.id === id);
-    if (!tab || (tabs().length <= 1 && windowLabel === "main")) return false;
+    if (!tab || tab.editor || (tabs().length <= 1 && windowLabel === "main")) return false;
     const hit = await findStripAt(sx, sy);
     if (!hit || hit.label === windowLabel) return false;
     if (!(await sendTabTo(hit.label, tab, hit.index))) return false;
@@ -313,7 +343,8 @@ export function createAppTabs(windowLabel: string) {
     const arr = tabs();
     if (arr.length <= 1) return;
     const tab = arr.find((t) => t.id === id);
-    if (!tab || !detachTabToWindow(tab, screenX, screenY)) return;
+    // An editor tab stays in the window of its chart (#325).
+    if (!tab || tab.editor || !detachTabToWindow(tab, screenX, screenY)) return;
     const idx = arr.findIndex((t) => t.id === id);
     const next = arr.filter((t) => t.id !== id);
     setTabs(next);
@@ -382,6 +413,13 @@ export function createAppTabs(windowLabel: string) {
     const t = tabs().find((x) => x.id === id);
     if (t) navigator.clipboard?.writeText(fullSymbolFor(activePaneOf(t).symbol)).catch(() => undefined);
   }
+  /** Tab menu "Copy link" (#350): the web link of the tab's focused chart, its symbol and interval. */
+  function copyTabLink(id: string) {
+    const t = tabs().find((x) => x.id === id);
+    if (!t) return;
+    const p = activePaneOf(t);
+    navigator.clipboard?.writeText(chartLinkUrl({ symbol: fullSymbolFor(p.symbol), interval: p.interval })).catch(() => undefined);
+  }
 
   return {
     tabs,
@@ -404,6 +442,8 @@ export function createAppTabs(windowLabel: string) {
     followCloseOnlyTypes,
     activateTab,
     newTab,
+    newEditorTab,
+    closeEditorTab,
     duplicateTab,
     insertTab,
     reopenClosed,
@@ -418,6 +458,7 @@ export function createAppTabs(windowLabel: string) {
     reloadTab,
     openDevTools,
     copyTabSymbol,
+    copyTabLink,
   };
 }
 

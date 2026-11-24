@@ -10,6 +10,10 @@ import { emitTo } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { createAppTheme } from "../shell/app-theme";
 import { currentWindowLabel } from "../shell/window-bridge";
+import { DialogHost } from "../../components/Dialogs";
+import { onListFull } from "../../data/watchlist-limit";
+import { warnListFull } from "../right-rail/watchlist/list-full";
+import { SavedFileToast } from "../shell/SavedFileToast";
 import { ScreenerPanel } from "./ScreenerPanel";
 
 /** Event to the main window: a symbol picked in the screener window ({ ticker }). */
@@ -18,6 +22,8 @@ export const SCREENER_PICK_EVENT = "screener-symbol-picked";
 export function ScreenerWindow() {
   const { observeTheme } = createAppTheme();
   onMount(observeTheme);
+  // "Save as watchlist" past the list size limit: its warning shows here (#358).
+  onListFull(warnListFull);
   return (
     <div class="screener-window">
       <ScreenerPanel
@@ -26,6 +32,9 @@ export function ScreenerWindow() {
         onSymbolPicked={(ticker) => void emitTo("main", SCREENER_PICK_EVENT, { ticker })}
         onCloseWindow={() => void getCurrentWebviewWindow().close()}
       />
+      {/* The screener's CSV exports: "File downloaded" or "Export failed". */}
+      <DialogHost />
+      <SavedFileToast />
     </div>
   );
 }

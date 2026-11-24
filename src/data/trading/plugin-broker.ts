@@ -8,16 +8,19 @@
  * refusal comes back as a rejected-order toast.
  */
 import { createEffect, createRoot, createSignal } from "solid-js";
-import { commands, events, type BrokerState, type BrokerStatus, type Execution, type Order, type OrderTicket, type Position as WirePosition } from "../../bindings";
+import { commands, events, type BrokerState, type OrderPreview, type BrokerStatus, type Execution, type Order, type OrderTicket, type Position as WirePosition } from "../../bindings";
 import type { Finite } from "../datafeed-rest";
 import { getTickerInfo } from "../datafeed";
 import { onTradeTick } from "../datafeed-live";
 import { cachedSymbolSessions } from "../session";
 import { strategyTester } from "../strategy-tester-store";
 import { translate } from "../../i18n/translator";
-import { capabilitiesOf, type TradingCapabilities } from "./capabilities";
+import { ticketDurationPref, ticketFieldPrefs } from "./trading-ui";
+import { ANY_INSTRUMENT, capabilitiesOf, fieldsFor, instrumentOf, pickDuration, type Instrument, type TradingCapabilities } from "./capabilities";
+import { applyDepth, type DepthBook } from "./depth-book";
+import { qtyMessage } from "./qty-message";
 import type { Tradability } from "./replay-broker";
-import { ORDER_LABEL, type OrderRequest, type Side, type TradingEvent, type TradingExecution, type TradingOrder, type TradingPosition, type TradingQuote } from "./types";
+import { ORDER_LABEL, type ExitLevel, type OrderRequest, type Side, type TradingEvent, type TradingExecution, type TradingOrder, type TradingPosition, type TradingQuote } from "./types";
 
 const POSITION_ID = "position";
 
@@ -42,7 +45,17 @@ export const pluginBroker = createRoot(() => {
   const tickers = new Map<string, string | null | "pending">();
   const bidAsk = new Map<string, { bid: number | null; ask: number | null; last: number | null }>();
   const lastPrice = new Map<string, number>();
+  /** Broker ticker → its order book (`broker.depth`), while the DOM shows it. */
+  const books = new Map<string, DepthBook>();
+  /** Order book updates: read by the DOM only, so a busy book doesn't recompute the rest of the trading UI. */
+  const [bookVersion, setBookVersion] = createSignal(0);
+  /** The DOM tabs open: the focused chart's book is asked while there is one. */
+  const [depthViews, setDepthViews] = createSignal(0);
   const metas = new Map<string, { description: string; iconUrl: string | null; stock: boolean } | "loading">();
+  /** Broker ticker → how it trades (`broker_instrument`); "pending" while asked. */
+  const instruments = new Map<string, Instrument | "pending">();
+  /** The tickers whose instrument gave no point value: the symbol's own is used (#345). */
+  const noPointValue = new Set<string>();
 
   const take = (s: BrokerStatus) => {
     const prev = status();
@@ -52,6 +65,9 @@ export const pluginBroker = createRoot(() => {
     if (!prev || prev.active !== s.active || prev.pluginConnected !== s.pluginConnected) {
       tickers.clear();
       bidAsk.clear();
+      books.clear();
+      instruments.clear();
+      noPointValue.clear();
     }
     setStatus(s);
     bump();
@@ -75,6 +91,12 @@ export const pluginBroker = createRoot(() => {
       const q = e.payload;
       bidAsk.set(q.ticker, { bid: q.bid ?? null, ask: q.ask ?? null, last: q.last ?? null });
       bump();
+    });
+    void events.brokerDepth.listen((e) => {
+      const d = e.payload;
+      if (!watchedDepth.includes(d.ticker)) return;
+      books.set(d.ticker, applyDepth(books.get(d.ticker), d));
+      setBookVersion((v) => v + 1);
     });
     void onTradeTick((t) => {
       lastPrice.set(t.symbol.toUpperCase(), t.price);
@@ -149,8 +171,11 @@ export const pluginBroker = createRoot(() => {
     version();
     const s = status();
     if (!s?.active) return { ok: false, reason: "launch", title: translate("Connect a broker"), text: translate("Connect a broker plugin from the Trade menu to trade.") };
-    if (!s.pluginConnected || !s.state?.connected)
+    if (!s.pluginConnected)
       return { ok: false, reason: "launch", title: translate("Broker not connected"), text: translate("The broker plugin is not connected. Check it in Settings > Plugins.") };
+    // The plugin runs but says it is not logged in to its broker (its last `broker.state`).
+    if (!s.state?.connected)
+      return { ok: false, reason: "launch", title: translate("Broker not connected"), text: translate("The broker plugin is not logged in to its broker. Check its log and settings in Settings > Plugins.") };
     const sym = symbolOf(paneId);
     if (!sym) return { ok: false, reason: "launch", title: "", text: translate("Select a chart to trade its symbol.") };
     const t = tickerOf(sym);
@@ -173,7 +198,18 @@ export const pluginBroker = createRoot(() => {
     const symbol = symbolOf(paneId) ?? list[0].ticker;
     if (list.length === 1) {
       const p = list[0];
-      return { id: p.id, symbol, side: p.side, qty: p.qty, avgPrice: p.avgPrice, pl: p.unrealizedPnl ?? 0, takeProfit: p.takeProfit ?? null, stopLoss: p.stopLoss ?? null };
+      const levels = levelsOf(p.exitLevels);
+      return {
+        id: p.id,
+        symbol,
+        side: p.side,
+        qty: p.qty,
+        avgPrice: p.avgPrice,
+        pl: p.unrealizedPnl ?? 0,
+        takeProfit: p.takeProfit ?? null,
+        stopLoss: p.stopLoss ?? null,
+        ...(levels ? { exitLevels: levels } : {}),
+      };
     }
     const signed = list.reduce((a, p) => a + (p.side === "buy" ? p.qty : -p.qty), 0);
     if (signed === 0) return null;
@@ -182,6 +218,12 @@ export const pluginBroker = createRoot(() => {
     const avg = same.reduce((a, p) => a + p.avgPrice * p.qty, 0) / qty;
     const pl = list.reduce((a, p) => a + (p.unrealizedPnl ?? 0), 0);
     return { id: `net:${list[0].ticker}`, symbol, side: signed > 0 ? "buy" : "sell", qty: Math.abs(signed), avgPrice: avg, pl, takeProfit: null, stopLoss: null };
+  };
+
+  /** A plugin's exit levels (#330), each with an id the lines and cancels name (its own, else its place). */
+  const levelsOf = (list: { id?: string | null; qty?: number | null; takeProfit?: number | null; stopLoss?: number | null }[] | null | undefined): ExitLevel[] | null => {
+    const out = (list ?? []).map((l, i) => ({ id: l.id || String(i + 1), qty: l.qty ?? 0, takeProfit: l.takeProfit ?? null, stopLoss: l.stopLoss ?? null })).filter((l) => l.qty > 0);
+    return out.length ? out : null;
   };
 
   const toOrder = (o: Working, symbol: string): TradingOrder => ({
@@ -196,7 +238,14 @@ export const pluginBroker = createRoot(() => {
     parentId: null,
     takeProfit: o.takeProfit ?? null,
     stopLoss: o.stopLoss ?? null,
+    ...(levelsOf(o.exitLevels) ? { exitLevels: levelsOf(o.exitLevels)! } : {}),
   });
+  /** The take profit / stop loss lines of each exit level: "<parent>:tp:<level>". */
+  const levelBrackets = (parent: string, symbol: string, side: Side, levels: ExitLevel[] | undefined): TradingOrder[] =>
+    (levels ?? []).flatMap((l) => [
+      ...(l.takeProfit !== null ? [{ ...bracket(`${parent}:tp:${l.id}`, symbol, side, l.qty, "tp", l.takeProfit, parent), levelId: l.id }] : []),
+      ...(l.stopLoss !== null ? [{ ...bracket(`${parent}:sl:${l.id}`, symbol, side, l.qty, "sl", l.stopLoss, parent), levelId: l.id }] : []),
+    ]);
   const bracket = (id: string, symbol: string, side: Side, qty: number, kind: "tp" | "sl", price: number, parentId: string): TradingOrder => ({
     id,
     symbol,
@@ -224,11 +273,13 @@ export const pluginBroker = createRoot(() => {
       out.push(w);
       if (w.takeProfit !== null) out.push(bracket(`${w.id}:tp`, symbol, exitSide(w.side), w.qty, "tp", w.takeProfit, w.id));
       if (w.stopLoss !== null) out.push(bracket(`${w.id}:sl`, symbol, exitSide(w.side), w.qty, "sl", w.stopLoss, w.id));
+      out.push(...levelBrackets(w.id, symbol, exitSide(w.side), w.exitLevels));
     }
     const p = position(paneId);
     if (p && !p.id.startsWith("net:")) {
       if (p.takeProfit !== null) out.push(bracket(`${POSITION_ID}:tp`, symbol, exitSide(p.side), p.qty, "tp", p.takeProfit, POSITION_ID));
       if (p.stopLoss !== null) out.push(bracket(`${POSITION_ID}:sl`, symbol, exitSide(p.side), p.qty, "sl", p.stopLoss, POSITION_ID));
+      out.push(...levelBrackets(POSITION_ID, symbol, exitSide(p.side), p.exitLevels));
     }
     return out;
   };
@@ -247,7 +298,61 @@ export const pluginBroker = createRoot(() => {
   const refused = (req: { symbol: string; side: Side; type: OrderRequest["type"]; qty: number; price?: number | null }, message: string) =>
     emit({ kind: "rejected", label: ORDER_LABEL[req.type], symbol: req.symbol, side: req.side, qty: req.qty, price: req.price ?? null, message });
 
-  const ticketOf = (req: OrderRequest, ticker: string): OrderTicket => ({
+  /** How a broker ticker trades: asked once per connection; anything goes until the answer. */
+  const instrumentOfTicker = (ticker: string): Instrument => {
+    version();
+    const known = instruments.get(ticker);
+    const caps = instrumentOf(null, account()?.capabilities?.ticketFields, account()?.capabilities?.durations);
+    if (known && known !== "pending")
+      return { ...known, fields: known.fields.length ? known.fields : caps.fields, durations: known.durations.length ? known.durations : caps.durations };
+    if (!known && HAS_TAURI) {
+      instruments.set(ticker, "pending");
+      void commands.brokerInstrument(ticker).then((r) => {
+        if (r.status === "ok") {
+          instruments.set(ticker, instrumentOf(r.data, null));
+          if (!(r.data.pointValue != null && r.data.pointValue > 0)) noPointValue.add(ticker);
+        } else instruments.delete(ticker);
+        bump();
+      });
+    }
+    return { ...ANY_INSTRUMENT, fields: caps.fields, durations: caps.durations };
+  };
+  /** The symbol is one of the broker plugin's own data symbols: its point value counts the same quantities. */
+  const ownSymbol = (symbol: string): boolean => {
+    const st = status();
+    const ex = symbol.split(":")[0].toUpperCase();
+    return !!st && (st.dataExchange?.toUpperCase() === ex || st.dataExchanges.some((e) => e.toUpperCase() === ex));
+  };
+  const instrumentOfPane = (paneId: number | null): Instrument => {
+    const symbol = symbolOf(paneId);
+    const t = tickerOf(symbol);
+    if (!t || !symbol) return ANY_INSTRUMENT;
+    const i = instrumentOfTicker(t);
+    // No point value from the broker: the plugin's symbol gives it (a future counted in contracts, #345).
+    if ((noPointValue.has(t) || instruments.get(t) === "pending") && ownSymbol(symbol)) {
+      const pv = cachedSymbolSessions(symbol)?.pointValue;
+      if (pv && pv !== i.pointValue) return { ...i, pointValue: pv };
+    }
+    return i;
+  };
+
+  /** The order's ticket fields (those its type and exits take): each field's value picked, else the last one picked,
+   *  else its default. */
+  const fieldsOf = (ticker: string, req: OrderRequest, picked: Record<string, string> | undefined): Record<string, string> => {
+    const out: Record<string, string> = {};
+    const last = ticketFieldPrefs();
+    for (const f of fieldsFor(instrumentOfTicker(ticker).fields, req.type, req.takeProfit !== null, req.stopLoss !== null)) {
+      const ok = (v: string | undefined) => (v !== undefined && f.options.some((o) => o.value === v) ? v : undefined);
+      out[f.id] = ok(picked?.[f.id]) ?? ok(last[f.id]) ?? f.default;
+    }
+    return out;
+  };
+
+  /** A new order's time in force (#349): the one picked, else the last one picked, else the broker's default. */
+  const durationOf = (ticker: string, req: OrderRequest): string | null =>
+    pickDuration(instrumentOfTicker(ticker).durations, req.type, req.duration, ticketDurationPref());
+
+  const ticketOf = (req: OrderRequest, ticker: string, fields: Record<string, string>, duration: string | null | undefined): OrderTicket => ({
     ticker,
     side: req.side,
     type: req.type,
@@ -256,7 +361,20 @@ export const pluginBroker = createRoot(() => {
     stopPrice: req.stopPrice,
     takeProfit: req.takeProfit,
     stopLoss: req.stopLoss,
+    fields,
+    // Left out when the broker declares none: it keeps its own.
+    ...(duration ? { duration } : {}),
+    ...(req.confirmId ? { confirmId: req.confirmId } : {}),
+    // The plugin's level ids stay its own: the app sends quantities and prices only.
+    ...(req.exitLevels?.length ? { exitLevels: req.exitLevels.map((l) => ({ qty: l.qty, takeProfit: l.takeProfit, stopLoss: l.stopLoss })) } : {}),
   });
+
+  /** An order quantity the broker would refuse (not whole lots…): refused here, with the quantities it takes. */
+  const badQty = (req: OrderRequest, ticker: string, symbol: string): boolean => {
+    const msg = qtyMessage(req.qty, instrumentOfTicker(ticker));
+    if (msg) refused({ ...req, symbol, price: req.limitPrice ?? req.stopPrice }, msg);
+    return msg !== null;
+  };
 
   const ready = (paneId: number | null): { ticker: string; symbol: string } | null => {
     if (!tradabilityOf(paneId).ok) return null;
@@ -280,6 +398,21 @@ export const pluginBroker = createRoot(() => {
     if (next === watched) return;
     watched = next;
     if (HAS_TAURI && status()?.pluginConnected) void commands.brokerWatchQuotes(t ? [t] : []);
+  });
+
+  // The order book of the focused chart's ticker (`broker.depth`), while a DOM tab shows it. A book no longer watched
+  // is dropped: it would be stale when watched again.
+  let watchedDepth: string[] = [];
+  let depthKey = "";
+  createEffect(() => {
+    const t = connected() && depthViews() > 0 ? tickerOf(activeSymbol()) : null;
+    const next = `${status()?.active}|${status()?.pluginConnected}|${t ?? ""}`;
+    if (next === depthKey) return;
+    depthKey = next;
+    watchedDepth = t ? [t] : [];
+    for (const k of [...books.keys()]) if (k !== t) books.delete(k);
+    setBookVersion((v) => v + 1);
+    if (HAS_TAURI && status()?.pluginConnected) void commands.brokerWatchDepth(watchedDepth);
   });
 
   const api = {
@@ -310,6 +443,17 @@ export const pluginBroker = createRoot(() => {
       version();
       return capabilitiesOf(account()?.capabilities);
     },
+    /** How the focused chart's (or `paneId`'s) ticker trades: quantity step and minimum, point value, ticket fields. */
+    instrument: (paneId?: number | null): Instrument => instrumentOfPane(paneId ?? activePane()),
+    /** What the ticket calls an order's time in force (`orders[].duration`): the broker's label, else its id. */
+    durationLabel: (ticker: string, id: string | null | undefined): string => {
+      if (!id) return "";
+      return instrumentOfTicker(ticker).durations.find((d) => d.id === id)?.label ?? id;
+    },
+    /** Ask the plugin for its whole state again (the ticket or the account manager opened). */
+    refresh: () => {
+      if (HAS_TAURI && status()?.pluginConnected) void commands.brokerRefreshState();
+    },
     symbol: activeSymbol,
     description: (symbol: string) => {
       version();
@@ -333,6 +477,22 @@ export const pluginBroker = createRoot(() => {
       if (last === null && !q) return null;
       return { symbol: sym, bid: q?.bid ?? last, ask: q?.ask ?? last, last: last ?? q?.bid ?? q?.ask ?? null, minTick: cachedSymbolSessions(sym)?.mintick ?? 0.01 };
     },
+    /** The focused chart's order book, null while the broker sent none. */
+    depth: (): DepthBook | null => {
+      bookVersion();
+      const t = tickerOf(activeSymbol());
+      return (t && books.get(t)) || null;
+    },
+    /** A DOM tab shows the order book: asked of the plugin until the returned function is called. */
+    watchDepth(): () => void {
+      setDepthViews((n) => n + 1);
+      let done = false;
+      return () => {
+        if (done) return;
+        done = true;
+        setDepthViews((n) => n - 1);
+      };
+    },
     currency: (_paneId?: number | null): string => {
       version();
       return account()?.account?.currency || "USD";
@@ -342,27 +502,61 @@ export const pluginBroker = createRoot(() => {
       const a = account()?.account;
       return a?.balance ?? a?.equity ?? 0;
     },
+    /** The account's free margin, null when the broker doesn't report it. */
+    marginFree: (): number | null => {
+      version();
+      return account()?.account?.marginFree ?? null;
+    },
     position,
     orders,
     executions,
 
+    /** What the broker says of an order before it is sent (`broker.previewOrder`): its preview, or why there is none. */
+    async preview(req: OrderRequest): Promise<OrderPreview | string> {
+      const r = ready(activePane());
+      if (!r) return tradabilityOf(activePane()).text;
+      const fields = fieldsOf(r.ticker, req, req.fields);
+      const res = await commands.brokerPreviewOrder(ticketOf(req, r.ticker, fields, durationOf(r.ticker, req)));
+      return res.status === "ok" ? res.data : res.error;
+    },
     place(req: OrderRequest): string | null {
       const r = ready(activePane());
       if (!r) return null;
-      guarded(summary(req, r.symbol), () => report(commands.brokerPlace(ticketOf(req, r.ticker)), { ...req, symbol: r.symbol, price: req.limitPrice ?? req.stopPrice }));
+      if (badQty(req, r.ticker, r.symbol)) return "sent";
+      const fields = fieldsOf(r.ticker, req, req.fields);
+      const duration = durationOf(r.ticker, req);
+      guarded(summary(req, r.symbol), () => report(commands.brokerPlace(ticketOf(req, r.ticker, fields, duration)), { ...req, symbol: r.symbol, price: req.limitPrice ?? req.stopPrice }));
       return "sent";
     },
     modify(id: string, req: OrderRequest, paneId = activePane() ?? undefined): string | null {
       const r = ready(paneId ?? null);
       if (!r) return null;
-      guarded(summary(req, r.symbol), () => report(commands.brokerModify(id, ticketOf(req, r.ticker)), { ...req, symbol: r.symbol, price: req.limitPrice ?? req.stopPrice }));
+      if (badQty(req, r.ticker, r.symbol)) return "sent";
+      // A modified order keeps the fields and the time in force it was placed with.
+      const fields = req.fields ?? findOrder(id)?.fields ?? {};
+      const duration = req.duration ?? findOrder(id)?.duration;
+      guarded(summary(req, r.symbol), () => report(commands.brokerModify(id, ticketOf(req, r.ticker, fields, duration)), { ...req, symbol: r.symbol, price: req.limitPrice ?? req.stopPrice }));
       return "sent";
     },
     cancel(id: string, paneId = activePane() ?? undefined): string | null {
       const pane = paneId ?? null;
       const symbol = symbolOf(pane) ?? "";
-      // A bracket line: its order's or the position's take profit / stop loss goes.
-      const [base, leg] = id.split(":");
+      // A bracket line: its order's or the position's take profit / stop loss goes; a level's line, its whole level.
+      const [base, leg, level] = id.split(":");
+      if ((leg === "tp" || leg === "sl") && level) {
+        const rest = (list: ExitLevel[] | undefined) => (list ?? []).filter((l) => l.id !== level);
+        if (base === POSITION_ID) {
+          const p = pane !== null ? position(pane) : null;
+          if (p) api.setPositionExitLevels(rest(p.exitLevels), paneId);
+          return "sent";
+        }
+        const o = findOrder(base);
+        if (o && pane !== null) {
+          const w = toOrder(o, symbol);
+          api.modify(o.id, { symbol, side: w.side, type: w.type, qty: w.qty, limitPrice: w.limitPrice, stopPrice: w.stopPrice, takeProfit: null, stopLoss: null, exitLevels: rest(w.exitLevels) }, paneId);
+        }
+        return "sent";
+      }
       if (leg === "tp" || leg === "sl") {
         if (base === POSITION_ID) {
           const p = pane !== null ? position(pane) : null;
@@ -397,7 +591,8 @@ export const pluginBroker = createRoot(() => {
       const r = ready(paneId);
       if (!p || !r) return null;
       const req: OrderRequest = { symbol: r.symbol, side: exitSide(p.side), type: "market", qty: p.qty * 2, limitPrice: null, stopPrice: null, takeProfit: null, stopLoss: null };
-      guarded(summary(req, r.symbol), () => report(commands.brokerPlace(ticketOf(req, r.ticker)), { ...req, price: null }));
+      const fields = fieldsOf(r.ticker, req, undefined);
+      guarded(summary(req, r.symbol), () => report(commands.brokerPlace(ticketOf(req, r.ticker, fields, durationOf(r.ticker, req))), { ...req, price: null }));
       return "sent";
     },
     setPositionBrackets(tp: number | null, sl: number | null, paneId = activePane() ?? undefined): string | null {
@@ -405,7 +600,17 @@ export const pluginBroker = createRoot(() => {
       const list = positionsOf(paneId);
       if (list.length !== 1) return null;
       const p = list[0];
-      report(commands.brokerSetPositionBrackets(p.id, tp, sl), { symbol: symbolOf(paneId) ?? p.ticker, side: exitSide(p.side), type: tp !== null ? "limit" : "stop", qty: p.qty, price: tp ?? sl });
+      report(commands.brokerSetPositionBrackets(p.id, tp, sl, null), { symbol: symbolOf(paneId) ?? p.ticker, side: exitSide(p.side), type: tp !== null ? "limit" : "stop", qty: p.qty, price: tp ?? sl });
+      return "sent";
+    },
+    /** The position's exit levels (#330), in place of its take profit / stop loss; none: no exits. */
+    setPositionExitLevels(levels: ExitLevel[], paneId = activePane() ?? undefined): string | null {
+      if (paneId === undefined) return null;
+      const list = positionsOf(paneId);
+      if (list.length !== 1) return null;
+      const p = list[0];
+      const wire = levels.map((l) => ({ qty: l.qty, takeProfit: l.takeProfit, stopLoss: l.stopLoss }));
+      report(commands.brokerSetPositionBrackets(p.id, null, null, wire), { symbol: symbolOf(paneId) ?? p.ticker, side: exitSide(p.side), type: "limit", qty: p.qty, price: null });
       return "sent";
     },
     onEvent(fn: (e: TradingEvent) => void): () => void {

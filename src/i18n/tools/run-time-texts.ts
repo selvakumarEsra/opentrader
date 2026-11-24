@@ -46,6 +46,9 @@ const GROUPS: Record<string, string[]> = {
     "Percentage of equity you will lose if the stop loss is executed",
     "Reward % balance",
     "Risk % balance",
+    "% balance",
+    "Order size in cash equivalent",
+    "Order size in equity percentage equivalent",
     "Shares",
     "Units",
     "Limit price",
@@ -79,6 +82,9 @@ const GROUPS: Record<string, string[]> = {
     "crypto",
     "options",
     "warrant",
+    "cfd",
+    "commodity",
+    "option",
     "stock|market",
     "dr|market",
     "etf|market",
@@ -95,6 +101,9 @@ const GROUPS: Record<string, string[]> = {
     "forex|market",
     "crypto|market",
     "options|market",
+    "cfd|market",
+    "commodity|market",
+    "option|market",
   ],
   // "Money" is also the profit and loss shown as an amount (chart settings), "Trade" the header's trading button: the
   // categories have their own sense.
@@ -123,7 +132,24 @@ const GROUPS: Record<string, string[]> = {
     "Untitled screen",
     "Untitled script",
   ],
+  "data/screener-catalog.ts EarningsRecent, the ranges of the recent earnings date filter (a tuple)": [
+    "Current trading day",
+    "Previous day",
+    "Previous 5 days",
+    "This week",
+    "Previous week",
+    "This month",
+  ],
   "window/right-rail/AlertsPanel.tsx, the Log tab (SegmentedControl sense)": ["Log|history"],
+  "window/header/symbol-search/search-model.ts REGION_ORDER, the region headers of the Economy country panel": [
+    "North America",
+    "Latin America",
+    "Europe",
+    "Asia",
+    "Africa",
+    "Middle East",
+    "Pacific",
+  ],
 };
 
 export const RUN_TIME_TEXTS: FoundText[] = Object.entries(GROUPS).flatMap(([at, texts]) => texts.map((text) => ({ text, at: `run time: ${at}` })));

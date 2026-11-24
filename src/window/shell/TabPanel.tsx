@@ -27,6 +27,7 @@ import { activePaneOf, clampMoveIndex, tabTitle, tickerInitial, type TabChart } 
 import { tickerOf } from "../../data/symbol-name";
 import { DEFAULT_TAB_TITLE_PARTS, type TabTitlePartState } from "./tab-title";
 import { localNumber } from "../../i18n/format";
+import { shownScriptName } from "../oakscript/editor-state";
 
 const PRICE_PARTS = new Set(["priceChangeIcon", "lastPrice", "priceChange"]);
 // In the marks of the interface language ("545,18", "+2,75%").
@@ -44,6 +45,7 @@ type Props = {
   onCloseOthers: (id: string) => void;
   onCloseToRight: (id: string) => void;
   onCopySymbol: (id: string) => void;
+  onCopyLink: (id: string) => void;
   /** Open App Settings → Tabs to customise the tab title. */
   onCustomizeTitle: () => void;
   /** Tab-title parts (order + visibility) from App Settings → Tabs. */
@@ -119,7 +121,7 @@ export function TabPanel(props: Props) {
   createEffect(() => {
     const parts = props.titleParts ?? DEFAULT_TAB_TITLE_PARTS;
     const wantsQuotes = parts.some((p) => p.visible && PRICE_PARTS.has(p.id));
-    setSubscription("tab-titles", wantsQuotes ? props.tabs.map((t) => activePaneOf(t).symbol) : []);
+    setSubscription("tab-titles", wantsQuotes ? props.tabs.filter((t) => !t.editor).map((t) => activePaneOf(t).symbol) : []);
   });
   onCleanup(() => clearSubscription("tab-titles"));
 
@@ -279,7 +281,8 @@ export function TabPanel(props: Props) {
                     isCloseOtherVisible: props.tabs.length > 1 && props.tabs.some((t) => t.id !== tab.id && !t.pinned),
                     isCloseToRightVisible:
                       props.tabs.length > 1 && idx() < props.tabs.length - 1 && props.tabs.some((t) => !t.pinned),
-                    isDetachVisible: props.canDetach && props.tabs.length > 1,
+                    // An editor tab stays in the window of its chart (#325).
+                    isDetachVisible: props.canDetach && props.tabs.length > 1 && !tab.editor,
                     pinned: !!tab.pinned,
                     hasShiftKey: e.shiftKey,
                   });
@@ -291,7 +294,12 @@ export function TabPanel(props: Props) {
                 />
                 <div class={`tab-title ${tabSize()}`}>
                   <div class="title-container">
-                    <For each={(props.titleParts ?? DEFAULT_TAB_TITLE_PARTS).filter((p) => p.visible)}>
+                    {/* An editor tab (#325): the editor's mark and the script it shows. */}
+                    <Show when={tab.editor}>
+                      <span class="tab-part tab-part-editor" aria-hidden="true"><Icon name="oak-editor-logo" size={18} /></span>
+                      <span class="tab-part tab-part-ticker" data-no-translate>{shownScriptName() || "OakScript Editor"}</span>
+                    </Show>
+                    <For each={tab.editor ? [] : (props.titleParts ?? DEFAULT_TAB_TITLE_PARTS).filter((p) => p.visible)}>
                       {(part) => {
                         // Price parts come from the live quote store and stay
                         // hidden until a tick arrives (no quote, no price).
@@ -397,6 +405,7 @@ export function TabPanel(props: Props) {
             onTogglePin={props.onTogglePin}
             onDevTools={props.onDevTools}
             onCopySymbol={props.onCopySymbol}
+            onCopyLink={props.onCopyLink}
             onDetach={props.onDetach}
             onCustomizeTitle={props.onCustomizeTitle}
             onCloseTab={props.onClose}

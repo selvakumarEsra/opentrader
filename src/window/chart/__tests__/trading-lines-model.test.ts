@@ -7,8 +7,11 @@ import {
   fmtPl,
   orderChipText,
   orderLinePrice,
+  orderLines,
   orderMenuTitle,
   plText,
+  withNewLevel,
+  plTone,
   positionQtyText,
   orderSummary,
   cancelTitle,
@@ -113,5 +116,57 @@ describe("trading lines model", () => {
     expect(plText(5, 2, 655.11, "money", 0.01, "USD")).toBe("+10.00 USD");
     expect(plText(0.75, 1, 640, "ticks", 0.01, "USD")).toBe("+75 ticks");
     expect(plText(-6.4, 1, 640, "percent", 0.01, "USD")).toBe("−1.00%");
+  });
+
+  it("profit and loss colour: profit, loss, neutral at zero (money judged on cents)", () => {
+    expect(plTone(12.46)).toBe("profit");
+    expect(plTone(-98)).toBe("loss");
+    expect(plTone(0)).toBeNull();
+    expect(plTone(0.004, true)).toBeNull();
+    expect(plTone(-0.004, true)).toBeNull();
+    expect(plTone(0.004)).toBe("profit");
+  });
+
+  it("order lines: drawing order, and each line kept across broker updates (#370)", () => {
+    const list = () => [
+      order({ id: "2", type: "stopLimit", stopPrice: 655, limitPrice: 654 }),
+      order({ id: "2:tp", kind: "tp", parentId: "2", side: "sell", limitPrice: 660 }),
+      order({ id: "position:sl", kind: "sl", parentId: "position", side: "sell", type: "stop", limitPrice: null, stopPrice: 630 }),
+      order({ id: "1" }),
+    ];
+    const first = orderLines(list(), new Map());
+    expect(first.map((l) => l.key)).toEqual(["position:sl", "1", "2", "2#limit", "2:tp"]);
+    expect(first[3]).toEqual({ key: "2#limit", id: "2", limit: true });
+    // A quote rebuilds the orders: the same lines (same rows) come back, a new order adds its own.
+    const prev = new Map(first.map((l) => [l.key, l]));
+    const next = orderLines([...list(), order({ id: "3" })], prev);
+    expect(next.slice(0, 5).every((l, i) => l === first[i])).toBe(true);
+    expect(next[5]).toEqual({ key: "3", id: "3", limit: false });
+    // The stop reached: the limit line goes.
+    const hit = orderLines([order({ id: "2", type: "stopLimit", stopPrice: 655, limitPrice: 654, stopTriggered: true })], prev);
+    expect(hit.map((l) => l.key)).toEqual(["2"]);
+    expect(hit[0]).toBe(prev.get("2"));
+  });
+});
+
+describe("withNewLevel (#330)", () => {
+  const add = { takeProfit: 110, stopLoss: 90 };
+  it("turns one take profit / stop loss into the first level and gives the new one the rest", () => {
+    expect(withNewLevel(4, { exitLevels: [{ id: "a", qty: 1, takeProfit: 105, stopLoss: 95 }], takeProfit: null, stopLoss: null }, add, 1)).toEqual([
+      { qty: 1, takeProfit: 105, stopLoss: 95 },
+      { qty: 3, ...add },
+    ]);
+    expect(withNewLevel(2, { takeProfit: null, stopLoss: null }, add, 1)).toEqual([{ qty: 2, ...add }]);
+  });
+  it("splits the largest level when every unit is protected, never below one step", () => {
+    expect(withNewLevel(3, { takeProfit: 105, stopLoss: 95 }, add, 1)).toEqual([
+      { qty: 2, takeProfit: 105, stopLoss: 95 },
+      { qty: 1, ...add },
+    ]);
+    expect(withNewLevel(1, { takeProfit: 105, stopLoss: null }, add, 1)).toBeNull();
+    expect(withNewLevel(1, { takeProfit: 105, stopLoss: null }, add, 0.01)).toEqual([
+      { qty: 0.5, takeProfit: 105, stopLoss: null },
+      { qty: 0.5, ...add },
+    ]);
   });
 });

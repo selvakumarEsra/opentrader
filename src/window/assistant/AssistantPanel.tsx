@@ -20,7 +20,8 @@ import { activeChat, answerConfirm, chats, deleteChat, newChat, openChat, rateAn
 import { attach, MAX_ATTACHMENT_BYTES } from "../../data/assistant/attachments";
 import { Popup } from "./Popup";
 import { AssistantSetup } from "./LocalModel";
-import { gb, localError, localInfo, localProgress, refreshLocal, removeLocal, setUpdateLater, updateBytes, updateLater, updateLocal } from "../../data/assistant/local";
+import { trackPanelOpened } from "../../data/assistant/telemetry";
+import { gb, localError, localInfo, localProgress, localState, refreshLocal, removeLocal, setUpdateLater, updateBytes, updateLater, updateLocal } from "../../data/assistant/local";
 import { stepTitle } from "./steps";
 import { activeModel, BUILTIN, chooseModel, chosenModel, cliModels, fellBack, modelName, notReady, refreshModels } from "../../data/assistant/models";
 import "../../styles/screener.css";
@@ -39,7 +40,7 @@ const suggestions = (ticker: string) => [
 
 export function AssistantPanel(props: { ticker: string }) {
   onMount(() => {
-    void refreshLocal();
+    void refreshLocal().then(() => trackPanelOpened(localState(localInfo())));
     void refreshModels();
   });
   // The download screen shows only while the built-in model is the one in use and not yet downloaded.

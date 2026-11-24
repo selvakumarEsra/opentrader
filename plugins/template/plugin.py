@@ -64,7 +64,8 @@ class Source:
     # ── market data ──
     def _info(self, ticker):
         if ticker not in self.SYMBOLS:
-            raise PluginError(f"Unknown symbol {ticker}", -32602)
+            # -32004: the app stops asking for it (an expired contract left in a watchlist) and shows it in red.
+            raise PluginError(f"Unknown symbol {ticker}", -32004)
         return self.SYMBOLS[ticker]
 
     def price(self, ticker, t):
@@ -77,6 +78,38 @@ class Source:
     def _bar(self, ticker, start, step):
         points = [self.price(ticker, start + i * step // 8) for i in range(9)]
         return [start, points[0], max(points), min(points), points[-1], 100 + start % 900]
+
+    def watchlists(self):
+        """Ready-made watchlists of your symbols (optional, Plugin API 4): sent after connecting, and again whenever
+        they change (new contracts, new index members). Return [] to offer none."""
+        return [
+            {"id": "majors", "name": "Majors", "symbols": [t for t, (_d, kind, *_r) in self.SYMBOLS.items() if kind == "forex"]},
+            {"id": "all", "name": "All symbols", "sections": [
+                {"name": kind, "symbols": [t for t, (_d, k, *_r) in self.SYMBOLS.items() if k == kind]}
+                for kind in sorted({k for (_d, k, *_r) in self.SYMBOLS.values()})
+            ]},
+        ]
+
+    def scripts(self):
+        """Your OakScript studies and strategies (optional, Plugin API 8, set "api": 8 in the manifest): listed in the
+        Indicators dialog under the plugin's name. Sent after connecting; send data.scripts again when they change.
+        Return [] to offer none."""
+        return []
+
+    def events(self, ticker):
+        """The dividends, splits and earnings the chart marks (optional, Plugin API 5): dates are calendar days in the
+        symbol's time zone. A bonus issue is a split (1:1 bonus = from 1 to 2). Send `data.eventsChanged` when they
+        change. Return [] for a symbol without any."""
+        if self._info(ticker)[1] != "stock":
+            return []
+        day = lambda days_ago: time.strftime("%Y-%m-%d", time.gmtime(time.time() - days_ago * 86400))
+        return [
+            {"type": "split", "date": day(400), "from": 1, "to": 2},
+            *({"type": "dividend", "date": day(d), "amount": 0.25, "payDate": day(d - 14)} for d in (320, 230, 140, 50)),
+            *({"type": "earnings", "date": day(d), "fiscalPeriod": f"Q{q}", "fiscalYear": int(day(d - 30)[:4]),
+               "periodEnd": day(d + 25), "session": "amc", "eps": 1.2 + q / 10, "revenue": 3.1e9, "currency": "USD"}
+              for q, d in ((1, 290), (2, 200), (3, 110), (4, 20))),
+        ]
 
     def search(self, query):
         q = query.upper()
@@ -96,7 +129,11 @@ class Source:
             "session": "24x7",
             "pricescale": scale,
             "minmov": 1,
+            # The money one unit makes per price point; a future counted in contracts gives its multiplier (NSE NIFTY: 65).
+            "pointValue": 1,
             "intervals": list(self.RESOLUTIONS),
+            # Optional: how far back the source serves bars, in calendar days, e.g. {"minute": 30, "day": 365}.
+            # The app then asks for nothing older.
         }
 
     def bars(self, ticker, resolution, frm, to, count_back):
@@ -121,6 +158,14 @@ class Source:
     def resolve_symbol(self, symbol, ticker):
         """The broker ticker of a chart symbol from another exchange (e.g. NASDAQ:AAPL), or None."""
         return ticker if ticker in self.SYMBOLS else None
+
+    def instrument(self, ticker):
+        """`broker.instrument`: the quantities the broker takes (units) and the money a unit makes per point, every
+        field optional. Here forex trades in micro lots of 1,000 units: the ticket steps and checks by 1,000."""
+        kind = self._info(ticker)[1]
+        if kind == "forex":
+            return {"qtyMin": 1000, "qtyStep": 1000, "pointValue": 1}
+        return {"qtyMin": 1, "qtyStep": 1, "pointValue": 1}
 
     def _id(self):
         self.next_id += 1
@@ -167,7 +212,10 @@ class Source:
         order = {"id": order_id, "ticker": ticker, "side": side, "type": kind, "qty": qty, "filledQty": 0,
                  "limitPrice": p.get("limitPrice"), "stopPrice": p.get("stopPrice"),
                  "takeProfit": p.get("takeProfit"), "stopLoss": p.get("stopLoss"), "status": "working",
-                 "duration": "gtc", "updatedMs": int(time.time() * 1000)}
+                 # The time in force picked, one of the capabilities' durations ("gtc" when the app sends none).
+                 "duration": p.get("duration") or "gtc", "updatedMs": int(time.time() * 1000),
+                 # The values of the capabilities' ticketFields (a product type), sent back by broker.modify.
+                 "fields": p.get("fields") or {}}
         self.orders[order_id] = order
         events = [{"kind": "placed", "ticker": ticker, "side": side, "type": kind, "qty": qty}]
         if kind == "market":
@@ -184,7 +232,7 @@ class Source:
         order = self.orders.get(p["orderId"])
         if not order or order["status"] != "working":
             raise PluginError("The order is no longer working")
-        for k in ("qty", "limitPrice", "stopPrice", "takeProfit", "stopLoss"):
+        for k in ("qty", "limitPrice", "stopPrice", "takeProfit", "stopLoss", "duration"):
             if k in p:
                 order[k] = p[k]
         order["updatedMs"] = int(time.time() * 1000)
@@ -252,8 +300,16 @@ class Source:
             "accounts": [{"id": account["id"], "name": account["name"]}],
             "account": account,
             "positionMode": "netting",
+            # ticketFields: the broker's own choices with each order, e.g. a product type:
+            # [{"id": "product", "label": "Product", "options": [{"value": "MIS", "label": "Intraday"},
+            #   {"value": "CNC", "label": "Delivery"}], "default": "MIS"}]
+            # durations: the times in force the order ticket offers; leave it empty to keep your broker's own.
+            # stopOrdersBothSides / stopLimitOrdersBothSides / strictLimitPrice (false when left out): see the
+            # protocol's price rules if your broker takes stops on either side of the market or refuses crossing limits.
             "capabilities": {"orderTypes": ["market", "limit", "stop"], "brackets": True, "positionBrackets": True,
-                             "partialClose": True, "modifyOrders": True},
+                             "partialClose": True, "modifyOrders": True, "ticketFields": [],
+                             "durations": [{"id": "day", "label": "Day"},
+                                           {"id": "gtc", "label": "Good Till Cancel", "default": True}]},
             "positions": positions,
             "orders": sorted(self.orders.values(), key=lambda o: o["updatedMs"])[-200:],
             "executions": self.executions[-200:],
@@ -292,6 +348,7 @@ class Plugin:
         self.send_lock = threading.Lock()
         self.tickers = set()  # data.subscribe
         self.watched = set()  # broker.watchQuote
+        self.watched_depth = set()  # broker.watchDepth
         self.alive = False
 
     # ── JSON-RPC ──
@@ -309,6 +366,12 @@ class Plugin:
             self.notify("log", {"level": level, "message": message})
         else:
             print(message, flush=True)
+
+    def toast(self, message, level="info", sound=False):
+        """A short message on the user's screen that goes away by itself: a reconnection, a reload done (Plugin API 8,
+        set "api": 8 in the manifest). level is info, warn or error; sound plays the alert sound."""
+        if self.alive:
+            self.notify("plugin.toast", {"level": level, "message": message, "sound": sound})
 
     def push_state(self):
         with self.source.lock:
@@ -331,6 +394,12 @@ class Plugin:
                 return s.symbol_info(p["ticker"])
             if method == "data.bars":
                 return {"bars": s.bars(p["ticker"], p["resolution"], int(p["from"]), int(p["to"]), int(p.get("countBack", 2000)))}
+            if method == "data.events":
+                return {"events": s.events(p["ticker"])}
+            if method == "broker.getState":
+                return s.state()
+            if method == "broker.instrument":
+                return s.instrument(p["ticker"])
             if method == "broker.resolveSymbol":
                 return {"ticker": s.resolve_symbol(p.get("symbol"), p.get("ticker"))}
             if method == "broker.selectAccount":
@@ -372,13 +441,15 @@ class Plugin:
             self.tickers = set(p.get("tickers", []))
         elif method == "broker.watchQuote":
             self.watched = set(p.get("tickers", []))
+        elif method == "broker.watchDepth":
+            self.watched_depth = set(p.get("tickers", []))
 
     # ── streaming: live prices, the ticket's bid / ask, orders reaching their price ──
     def stream(self):
         while self.alive:
             try:
                 with self.source.lock:
-                    quotes = [self.source.quote(t) for t in self.tickers | self.watched if t in self.source.SYMBOLS]
+                    quotes = [self.source.quote(t) for t in self.tickers | self.watched | self.watched_depth if t in self.source.SYMBOLS]
                     events = self.source.on_tick()
                 for q in quotes:
                     if q["ticker"] in self.tickers:
@@ -386,6 +457,13 @@ class Plugin:
                     if q["ticker"] in self.watched:
                         tick = 1 / self.source.SYMBOLS[q["ticker"]][3]
                         self.notify("broker.quote", {"ticker": q["ticker"], "bid": q["price"], "ask": round(q["price"] + 2 * tick, 10), "last": None})
+                    if q["ticker"] in self.watched_depth:
+                        # A made-up order book of 5 levels a side around the bid / ask (a real source sends its own).
+                        tick = 1 / self.source.SYMBOLS[q["ticker"]][3]
+                        level = lambda price, n: {"price": round(price, 10), "qty": 100 * (1 + (int(price / tick) * 7 + n) % 9)}
+                        self.notify("broker.depth", {"ticker": q["ticker"], "snapshot": True,
+                                                     "bids": [level(q["price"] - n * tick, n) for n in range(5)],
+                                                     "asks": [level(q["price"] + (2 + n) * tick, n) for n in range(5)]})
                 self.events(events)
                 if self.source.positions:
                     self.push_state()  # the open P&L moves with the price
@@ -407,6 +485,14 @@ class Plugin:
         self.alive = True
         self.log(f"Connected to {welcome.get('result', {}).get('app', 'OpenTrader')} (Plugin API {welcome.get('result', {}).get('api')})")
         self.push_state()
+        with self.source.lock:
+            lists = self.source.watchlists()
+        if lists:
+            self.notify("data.watchlists", {"watchlists": lists})
+        with self.source.lock:
+            scripts = self.source.scripts()
+        if scripts:
+            self.notify("data.scripts", {"scripts": scripts})
         threading.Thread(target=self.stream, daemon=True).start()
         for line in reader:
             if not line.strip():

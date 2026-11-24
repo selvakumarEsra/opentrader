@@ -18,6 +18,7 @@ import { DASH, compact, count, money, percent, tone, tradeDate } from "./format"
 import { tradesCsv, tradesCsvFileName } from "./trades-csv";
 import { DEFAULT_SYMBOL } from "../../backtester/types";
 import { cachedSymbolSessions, symbolSessions } from "../../data/session";
+import { saveFile } from "../../data/save-file";
 
 const ROW = 98;
 const OVERSCAN = 6;
@@ -64,15 +65,6 @@ type Props = {
   /** Title of the Signal column (Replay Trading: "Order type"). */
   signalLabel?: string;
 };
-
-/** Save a text file through the browser download (as the app's other exports). */
-function download(name: string, text: string) {
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([text], { type: "application/octet-stream" }));
-  a.download = name;
-  a.click();
-  URL.revokeObjectURL(a.href);
-}
 
 export function TradesView(props: Props) {
   let scroller!: HTMLDivElement;
@@ -166,11 +158,11 @@ export function TradesView(props: Props) {
                   priceCurrency: r.currency,
                   initialCapital: r.properties.initialCapital,
                   mintick: sessions?.mintick ?? DEFAULT_SYMBOL.mintick,
-                  pointValue: DEFAULT_SYMBOL.pointValue,
+                  pointValue: sessions?.pointValue ?? DEFAULT_SYMBOL.pointValue,
                   timeZone: zone,
                   interval: props.interval,
                 });
-                download(tradesCsvFileName(props.title, props.symbol), csv);
+                void saveFile(tradesCsvFileName(props.title, props.symbol), csv);
               }}
             >
               <Icon name="st-trades-download-csv" size={28} />

@@ -69,7 +69,7 @@ async fn hello_state_and_errors_without_ib() {
     assert_eq!(hello["method"], "hello");
     assert_eq!(hello["params"]["plugin"], "ibkr");
     assert_eq!(hello["params"]["token"], "secret");
-    assert_eq!(hello["params"]["api"], 1);
+    assert_eq!(hello["params"]["api"], opentrader_ibkr::API);
     assert_eq!(hello["params"]["version"], env!("CARGO_PKG_VERSION"));
 
     // A first state at once: not connected to the broker.
@@ -82,6 +82,14 @@ async fn hello_state_and_errors_without_ib() {
     app.send(json!({ "jsonrpc": "2.0", "id": 5, "method": "broker.resolveSymbol", "params": { "symbol": "NASDAQ:AAPL", "ticker": "AAPL" } })).await;
     let a = app.answer_of(5).await;
     assert_eq!(a["error"]["code"], -32000);
+    assert!(a["error"]["message"].as_str().unwrap().contains("not configured"), "{a}");
+
+    // The state on request (#341), and a ticker's instrument needs the broker.
+    app.send(json!({ "jsonrpc": "2.0", "id": 9, "method": "broker.getState", "params": {} })).await;
+    let a = app.answer_of(9).await;
+    assert_eq!(a["result"]["connected"], false, "{a}");
+    app.send(json!({ "jsonrpc": "2.0", "id": 10, "method": "broker.instrument", "params": { "ticker": "ES" } })).await;
+    let a = app.answer_of(10).await;
     assert!(a["error"]["message"].as_str().unwrap().contains("not configured"), "{a}");
 
     app.send(json!({ "jsonrpc": "2.0", "id": 6, "method": "broker.nope", "params": {} })).await;

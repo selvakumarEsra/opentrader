@@ -18,12 +18,12 @@
  */
 import { For, Show } from "solid-js";
 import { reconcile } from "solid-js/store";
-import { flagOf, lastFlagColor, setFlag } from "../../../data/symbol-flags";
+import { flagOf, flagSymbols, lastFlagColor, setFlag } from "../../../data/symbol-flags";
 import { FlagColorPopup } from "../FlagColorPopup";
 import { ChartSyncMenu, SYNC_GROUPS } from "../ChartSyncMenu";
 import { FLAG_HEX } from "../../../data/watchlist";
 import { type PriceSource } from "../../header/chart-settings";
-import { intervalLabel, isEconomicSymbol, isLocalSymbol, splitSymbol } from "../../../data/datafeed";
+import { economicCountry, intervalLabel, isEconomicSymbol, isLocalSymbol, splitSymbol } from "../../../data/datafeed";
 import { flagUrl } from "../../../data/country-flags";
 import { CHART_TYPE_ICON, isTransformType, transformBarsOf, type OHLC } from "../chart-types";
 import { ChartLegend } from "../ChartLegend";
@@ -35,6 +35,7 @@ import { type ChartCx } from "./context";
 import { buildLegend } from "./helpers";
 import { indexOfTime } from "../time-search";
 import { emitAppEvent } from "../../../data/app-events";
+import { inSourceOrder } from "../tree-order";
 import type { JSX } from "solid-js";
 
 /** What createLegend adds to the chart context. */
@@ -61,10 +62,20 @@ export function createLegend(cx: ChartCx): LegendApi {
     const right = g && !g.left ? g.w : 0;
     return `calc(100% - ${8 + cx.legendLeft() + right + 8}px)`;
   };
-  /** Studies legend of one pane (the price pane's under the series row). */
+  /** The same width in px (read when the chart is resized or the scales
+   *  change width). */
+  const legendWidth = () => {
+    void cx.coordEpoch();
+    const g = cx.scaleGeom();
+    const right = g && !g.left ? g.w : 0;
+    return Math.max(0, cx.hostW - (8 + cx.legendLeft() + right + 8));
+  };
+  /** Studies legend of one pane (the price pane's under the series row), in
+   *  the Object tree's order (front first). */
   const studyLegend = (pane: () => number) => (
     <IndicatorLegend
-      rows={indLegend().filter((r) => r.pane === pane())}
+      rows={inSourceOrder(indLegend().filter((r) => r.pane === pane()), props.sourceOrder)}
+      width={legendWidth()}
       collapsed={!!props.indicatorsLegendCollapsed}
       onToggleCollapsed={cx.edits.toggleIndicatorsLegend}
       mainPane={pane() === (void cx.mainPaneEpoch(), cx.mainPane())}
@@ -192,7 +203,7 @@ export function createLegend(cx: ChartCx): LegendApi {
             ticker={splitSymbol(props.symbol ?? "").ticker}
             interval={intervalLabel(props.interval ?? "1D")}
             exchange={isEconomicSymbol(props.symbol) ? cx.legendSource() : splitSymbol(props.symbol ?? "").exchange}
-            logoUrl={isEconomicSymbol(props.symbol) ? flagUrl("US") : undefined}
+            logoUrl={isEconomicSymbol(props.symbol) ? flagUrl(economicCountry(props.symbol!)) : undefined}
             values={legend()}
             formatPrice={cx.legendPriceFormat()}
             titleMode={appearance().legendTitleMode}
@@ -218,12 +229,14 @@ export function createLegend(cx: ChartCx): LegendApi {
               const sym = props.symbol;
               if (!sym) return;
               if (flagOf(sym)) { setFlag(sym, null); setFlagPopup(null); return; }
-              setFlag(sym, lastFlagColor());
-              setFlagPopup(btn);
+              // A full colour list refuses the flag (its warning shows): no popup then.
+              if (flagSymbols([sym], lastFlagColor())) setFlagPopup(btn);
             }}
             onChangeSymbol={props.onChangeSymbol}
             onChangeInterval={props.onChangeInterval}
             onMore={cx.openSeriesMoreMenu}
+            width={legendWidth()}
+            multiChart={(props.layoutCount ?? 1) > 1}
             linkVisible={!!props.linkSyncVisible}
             linkIcon={props.linkGroup != null ? SYNC_GROUPS[props.linkGroup]?.icon ?? null : null}
             onLink={(r) => setSyncMenu(syncMenu() ? null : r)}
@@ -240,7 +253,7 @@ export function createLegend(cx: ChartCx): LegendApi {
               <FlagColorPopup
                 anchor={btn()}
                 value={props.symbol ? flagOf(props.symbol) : null}
-                onPick={(c) => { if (props.symbol) setFlag(props.symbol, c); }}
+                onPick={(c) => { if (props.symbol) flagSymbols([props.symbol], c); }}
                 onClose={() => setFlagPopup(null)}
               />
             )}

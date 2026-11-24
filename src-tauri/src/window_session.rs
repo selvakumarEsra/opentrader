@@ -40,6 +40,14 @@ const FILE: &str = "window-session.json";
 const MAIN: &str = "main";
 /// The screener's own window (placement "Separate window", window-bridge.ts).
 const SCREENER_WINDOW: &str = "screener";
+/// Label prefix of the OakScript editor's own windows ("Open editor > New window", detached-editor.ts).
+const EDITOR_WINDOW_PREFIX: &str = "oakscript-";
+
+/// A window that is not a chart window (the screener's, an editor's): not saved, not restored, not counted among the
+/// app's windows, and closed with the last chart window.
+pub fn is_aux_window(label: &str) -> bool {
+    label == SCREENER_WINDOW || label.starts_with(EDITOR_WINDOW_PREFIX)
+}
 /// Minimum overlap (physical px) between a saved window and a monitor for the
 /// saved position to be used.
 const MIN_VISIBLE: i32 = 64;
@@ -148,8 +156,7 @@ fn record(session: &Session, window: &Window) {
 /// Window events: keep bounds / focus current, forget a window the user closes
 /// while others stay open.
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
-    // The screener's own window is not a chart window: not saved, not restored.
-    if window.label() == SCREENER_WINDOW {
+    if is_aux_window(window.label()) {
         return;
     }
     let app = window.app_handle();
@@ -165,7 +172,7 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
             schedule_save(app);
         }
         WindowEvent::CloseRequested { .. } => {
-            let open = app.webview_windows().len();
+            let open = app.webview_windows().keys().filter(|l| !is_aux_window(l)).count();
             {
                 let mut file = session.file.locked();
                 if open > 1 {
@@ -180,14 +187,55 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
                 }
             }
             if open <= 1 {
-                // Quitting: keep the last window with its latest bounds.
+                // Quitting: keep the last window with its latest bounds. The screener's and the editor's windows
+                // close with it (they would otherwise keep the app running without a chart).
                 record(&session, window);
+                for (label, w) in app.webview_windows() {
+                    if is_aux_window(&label) {
+                        let _ = w.destroy();
+                    }
+                }
             }
             session.save_now();
         }
         _ => {}
     }
 }
+
+/// Windows minimised now (their page told it is hidden), by label.
+#[cfg(windows)]
+static MINIMIZED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A minimised window's page is told it is hidden, as a browser tab in the background: it stops its animation frames
+/// and slows its timers, and the chart draws again once shown. The webview does not learn it by itself: its page stayed
+/// visible and drew every live update while the window was minimised (#249). Shown again when the window is restored.
+#[cfg(windows)]
+pub fn follow_minimized(window: &Window, event: &WindowEvent) {
+    if !matches!(event, WindowEvent::Resized(_)) {
+        return;
+    }
+    let Ok(minimized) = window.is_minimized() else { return };
+    let label = window.label().to_string();
+    {
+        let mut list = MINIMIZED.locked();
+        let was = list.contains(&label);
+        if was == minimized {
+            return;
+        }
+        if minimized {
+            list.push(label.clone());
+        } else {
+            list.retain(|l| *l != label);
+        }
+    }
+    let Some(webview) = window.app_handle().get_webview_window(&label) else { return };
+    let _ = webview.with_webview(move |w| unsafe {
+        let _ = w.controller().SetIsVisible(!minimized);
+    });
+}
+
+#[cfg(not(windows))]
+pub fn follow_minimized(_window: &Window, _event: &WindowEvent) {}
 
 /// True when the saved outer rectangle overlaps a monitor enough to be seen.
 fn on_screen(win: &WebviewWindow, st: &WindowState) -> bool {

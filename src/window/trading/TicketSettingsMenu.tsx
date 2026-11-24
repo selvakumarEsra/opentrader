@@ -1,12 +1,13 @@
 /*
  * The order ticket's ⋯ menu (dock / undock, Trading settings, DOM and risk options), its field tips and the
- * Exits section.
+ * collapsible sections (Exits, Extra settings).
  */
 import { Show, createSignal, onCleanup, type JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 import { Tooltip } from "../../components/Tooltip";
 import { CheckMarkBox } from "../../components/form";
 import { emitAppEvent } from "../../data/app-events";
+import { broker } from "../../data/trading/broker";
 import { tradingUi } from "../../data/trading/trading-ui";
 import { ChevronIcon } from "./icons";
 import { Popup } from "./TicketMenus";
@@ -40,7 +41,8 @@ const DockIcon = () => (
 );
 
 /** ⋯ (tooltip "Settings"): Undock order ticket / Dock to right, Trading settings… (the chart Settings dialog on
- *  its Trading tab) and "SL enables quantity in risk". */
+ *  its Trading tab), "SL enables quantity in risk" and, for a broker that previews orders, "Show order
+ *  confirmation". */
 export function TicketSettingsMenu() {
   const [open, setOpen] = createSignal(false);
   const prices = tradingUi.domPrices;
@@ -98,6 +100,10 @@ export function TicketSettingsMenu() {
             <div class="trd-menu-divider" />
             <CheckRow label="SL enables quantity in risk" on={tradingUi.slEnablesRisk()} onToggle={() => tradingUi.setSlEnablesRisk(!tradingUi.slEnablesRisk())} />
           </Show>
+          {/* Only for a broker that previews orders (reference). */}
+          <Show when={!domTab() && broker.capabilities().orderPreview}>
+            <CheckRow label="Show order confirmation" on={tradingUi.showOrderPreview()} onToggle={() => tradingUi.setShowOrderPreview(!tradingUi.showOrderPreview())} />
+          </Show>
         </Popup>
       </Show>
     </>
@@ -146,12 +152,13 @@ function CheckRow(p: { label: string; on: boolean; onToggle: () => void }) {
   );
 }
 
-export function ExitsSection(props: { children: JSX.Element }) {
+/** A collapsible part of the ticket, open at first: Exits, Extra settings. */
+export function TicketSection(props: { title: string; class?: string; children: JSX.Element }) {
   const [open, setOpen] = createSignal(true);
   return (
-    <div class="trd-tk-section">
+    <div class={`trd-tk-section ${props.class ?? ""}`}>
       <button type="button" class="trd-tk-section-head" onClick={() => setOpen(!open())} aria-expanded={open()}>
-        Exits <ChevronIcon open={open()} />
+        {props.title} <ChevronIcon open={open()} />
       </button>
       <Show when={open()}>{props.children}</Show>
     </div>

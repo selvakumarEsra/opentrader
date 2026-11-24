@@ -26,6 +26,7 @@ import { setSourceResolver, type Bar, type PlotConfig, type IndicatorResult } fr
 import type { StudyChart } from './script-chart';
 import type { ChartContext as IndicatorChartContext, IndicatorRegistryEntry } from 'lightweight-charts-indicators';
 import { IndicatorRenderer, type PlotOverride } from 'lightweight-charts-indicators/render';
+import { reportUnorderedData } from '../../../data/error-reports';
 import type { OwnScaleMeta, PlotDefaultVisible, PlotPalette } from './volume';
 import { applyOpacity } from 'lightweight-charts-drawing/core/color';
 import { SelectionMarkers, type BackgroundAt } from '../selection-markers';
@@ -285,6 +286,29 @@ const ANCHOR_STYLES = new Set<string>(['cross', 'linebr', 'steplinebr']);
  *  name a plot by it; the legend skips hidden plots). */
 export type IndicatorLegendPlot = { color: string; value: number; index: number };
 
+type LegendCandle = { time: number; open: number; high: number; low: number; close: number; color?: string };
+
+/** The candles' values at `time` (or their last candle), after the plots as the reference lists them: open, high,
+ *  low and close of each, in its colour (#383). A candle output hidden in the Style tab is out of the result already. */
+export function candleLegendValues(
+  map: Record<string, LegendCandle[]> | undefined,
+  decls: ReadonlyArray<{ id: string; color?: string }>,
+  time: number | undefined,
+  first: number,
+): IndicatorLegendPlot[] {
+  const out: IndicatorLegendPlot[] = [];
+  for (const [k, decl] of decls.entries()) {
+    const list = map?.[decl.id];
+    if (!list?.length) continue;
+    const i = time == null ? list.length - 1 : indexOfTime(list, time);
+    const c = i >= 0 ? list[i] : undefined;
+    if (!c) continue;
+    const color = resetTransparency(c.color ?? decl.color ?? '#787b86');
+    [c.open, c.high, c.low, c.close].forEach((value, j) => out.push({ color, value, index: first + k * 4 + j }));
+  }
+  return out;
+}
+
 /** Drop a colour's alpha (#rrggbbaa / #rgba / rgba()), keeping its RGB. */
 function resetTransparency(color: string): string {
   const c = color.trim();
@@ -434,6 +458,10 @@ export class IndicatorLayer {
 
   /** Bars the study draws (null: all), set by the controller as the view moves. */
   private drawWindow: DrawWindow | null = null;
+  /** The study was last given these bars. */
+  holdsBars(bars: readonly Bar[]): boolean {
+    return this.lastBars === bars;
+  }
   /** Draw in another window; `redraw`: the last result now, keeping the series drawn (no calculation). */
   setDrawWindow(win: DrawWindow | null, redraw = true): void {
     if (win === this.drawWindow) return;
@@ -866,6 +894,7 @@ export class IndicatorLayer {
   /** Draw the last result (nothing when not drawn or when it failed).
    *  `reuseSeries`: keep the series of the previous draw (live update). */
   private draw(reuseSeries = false): void {
+    this.liveDraw = reuseSeries;
     this.detachMarkers();
     this.removeExtras();
     this.plotSeries = [];
@@ -986,15 +1015,27 @@ export class IndicatorLayer {
     const chart = this.scriptChart;
     const sessions = chart?.tickerid ? cachedSymbolSessions(chart.tickerid) : null;
     if (!sessions || !chart?.timeframe) return null;
-    return sessionFutureSlots(chart.timeframe, chart.sessionType === 'extended' ? sessions.extended : sessions.regular);
+    return sessionFutureSlots(chart.timeframe, chart.sessionType === 'extended' ? sessions.extended : sessions.regular, sessions.barGrid);
   }
+
+  /** The draw under way is a live update (reuseSeries). */
+  private liveDraw = false;
 
   /** The renderer of the current main series (a new one when it changed). */
   private rendererFor(): IndicatorRenderer {
     const main = this.mainSeries();
     if (!this.renderer || main !== this.rendererMain) {
       try { this.renderer?.clear(); } catch { /* the old main series is gone */ }
-      this.renderer = new IndicatorRenderer(this.chart, { paneIndex: this.paneIndex, mainSeries: main ?? undefined });
+      this.renderer = new IndicatorRenderer(this.chart, {
+        paneIndex: this.paneIndex,
+        mainSeries: main ?? undefined,
+        // Points out of time order are drawn in order; which study gave them tells where they come from (#360).
+        // A user's script is not named.
+        onUnorderedData: (info) => {
+          const id = this.entry?.id ?? '';
+          reportUnorderedData(isUserIndicatorId(id) || isStrategyId(id) ? 'script' : id, info, this.liveDraw);
+        },
+      });
       this.rendererMain = main;
     }
     return this.renderer;
@@ -1261,7 +1302,8 @@ export class IndicatorLayer {
       const a = result.plots[p.id];
       if (a?.length) { sample = a; break; }
     }
-    if (!sample) return loadingPlots();
+    const candles = this.legendCandles(time, entry.plotConfig.length);
+    if (!sample) return candles.length ? candles : loadingPlots();
     let idx = sample.length - 1;
     if (time != null) {
       const hit = indexOfTime(sample, time);
@@ -1290,7 +1332,12 @@ export class IndicatorLayer {
       const color = mapped ?? own ?? ov?.color ?? p.color ?? '#787b86';
       out.push({ color: resetTransparency(color), value: pt.value, index });
     }
+    out.push(...candles);
     return out;
+  }
+
+  private legendCandles(time: number | undefined, first: number): IndicatorLegendPlot[] {
+    return candleLegendValues(this.lastResult?.plotCandles, this.entry?.plotCandleConfig ?? [], time, first);
   }
 
   /** Tear down every series + primitive this layer owns. */

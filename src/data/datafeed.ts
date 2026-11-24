@@ -17,7 +17,7 @@
  * Time is UNIX seconds everywhere (lightweight-charts UTCTimestamp), matching
  * the backend `Candle.time`.
  */
-import { commands, type Candle, type SymbolSearchResult } from "../bindings";
+import { commands, type Candle, type EconomicCountry, type SymbolEvent, type SymbolSearchResult } from "../bindings";
 import {
   getSecondHistory,
   getSecondHistoryTail,
@@ -41,6 +41,7 @@ import { localDay, localToUtc, symbolSessions, cachedSymbolSessions, type Sessio
 import { aggregateCandles, periodStart, type AggregatePeriod } from "../window/chart/chart-aggregate";
 import { isLocalSymbol, localBarsBefore, localDailyBars, localIntradayBars, localSeriesMeta, localServesResolution } from "./local-series";
 import { builtFromServed, finestServed, servedMinuteSizes } from "./interval";
+import { tickBarMs, tickBars, tickCount, ticksPerPage, type TickRow } from "./tick-bars";
 import { translateWith } from "../i18n/translator";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
@@ -60,10 +61,11 @@ export type { TradeTick } from "./datafeed-live";
 // Reference info, live snapshot and headlines are part of the feed's symbol contract; expose
 // them here so consumers (watchlist, detail panel) have one front door rather
 // than reaching into datafeed-rest directly.
-export { getLatestNews, getTickerInfo, getTickerSnapshot } from "./datafeed-rest";
+export { forgetTickerInfo, getLatestNews, getTickerInfo, getTickerSnapshot, tickerInfoEpoch } from "./datafeed-rest";
 export type { NewsItem, TickerInfo, Snapshot } from "./datafeed-rest";
 export type { SymbolSearchResult } from "../bindings";
 export { isLocalSymbol } from "./local-series";
+export { isTickResolution, tickCount } from "./tick-bars";
 
 // ── Resolution map ────────────────────────────────────────────────────────
 // The canonical routing table: an interval id → which source serves it and
@@ -221,16 +223,47 @@ function pluginIntervals(symbol: string | null | undefined): readonly string[] |
   return served?.length ? served : null;
 }
 
+/** Whether a symbol's daily load is its whole history: the app's own data
+ *  sends decades at once, a data plugin may send its newest bars only (its
+ *  older ones come page by page, #386). */
+export function dailyLoadIsWhole(symbol: string | null | undefined): boolean {
+  return pluginIntervals(symbol) === null;
+}
+
 /** True for an economic series symbol ("ECONOMICS:UNRATE"): one value per
  *  observation date, daily or coarser intervals only, no live data. */
 export function isEconomicSymbol(symbol: string | null | undefined): boolean {
   return !!symbol && /^ECONOMICS:/i.test(symbol.trim());
 }
 
-/** Text of an interval `symbol` has no bars on: the ones under its finest bars
- *  (an imported series' file, a data plugin's finest served interval), under D
- *  for an economic series. */
-export function unsupportedIntervalMessage(symbol: string | null | undefined): string {
+/** The economy of an economic series: the international series' ids start with its code ("ECONOMICS:DE_INFL"),
+ *  the others are US series. */
+export function economicCountry(symbol: string): string {
+  return /^ECONOMICS:([A-Z]{2})_[A-Z0-9]+$/i.exec(symbol.trim())?.[1].toUpperCase() ?? "US";
+}
+
+/** Whether `resolution` is an interval the app can chart for some symbol: a
+ *  served one, or ticks (a data plugin's symbols, #376). */
+export function isChartableResolution(resolution: string): boolean {
+  return isSupportedResolution(resolution) || tickCount(resolution) !== null;
+}
+
+/** Whether a symbol's data plugin serves ticks ("1T" among its intervals);
+ *  true while its session is not known yet, so a restored tick chart keeps its
+ *  interval. */
+function servesTicks(symbol: string | null | undefined): boolean {
+  if (!symbol || isLocalSymbol(symbol) || isEconomicSymbol(symbol)) return false;
+  const sessions = cachedSymbolSessions(symbol);
+  if (!sessions) return true;
+  return sessions.intervals.some((i) => i.trim().toUpperCase() === "1T");
+}
+
+/** Text of an interval `symbol` has no bars on: tick intervals for a symbol
+ *  without ticks; else the ones under its finest bars (an imported series'
+ *  file, a data plugin's finest served interval), under D for an economic
+ *  series. */
+export function unsupportedIntervalMessage(symbol: string | null | undefined, resolution?: string): string {
+  if (resolution && tickCount(resolution) !== null) return translateWith("Tick-based intervals are not available for {0}.", splitSymbol(symbol ?? "").ticker);
   const finest = isLocalSymbol(symbol) ? (localSeriesMeta(symbol)?.base ?? "1D") : (finestServed(pluginIntervals(symbol) ?? []) ?? "D");
   return translateWith("Intervals less than {0} are not supported for this symbol. Please change the interval to any available one.", finest);
 }
@@ -240,6 +273,7 @@ export function unsupportedIntervalMessage(symbol: string | null | undefined): s
 export function symbolServesResolution(symbol: string | null | undefined, resolution: string): boolean {
   // An imported series: the intervals its file's bars build (../local-series).
   if (isLocalSymbol(symbol)) return localServesResolution(symbol!, resolution);
+  if (tickCount(resolution) !== null) return servesTicks(symbol);
   if (!isSupportedResolution(resolution)) return false;
   if (isEconomicSymbol(symbol)) return dailyFamily(resolution) !== null;
   // A data plugin's symbol (served until its session is known, so a restored chart keeps its interval).
@@ -353,11 +387,17 @@ export async function searchSymbols(
 }
 
 /** Economy tab of the symbol search: series matching `query` (the most popular for an empty query) within a source
- *  agency and / or a category (null = all). */
-export async function searchEconomic(query: string, source: string | null, category: string | null): Promise<SymbolSearchResult[]> {
-  const res = await commands.searchEconomic(query, source, category);
+ *  agency, a category and / or an economy (null = all). */
+export async function searchEconomic(query: string, source: string | null, category: string | null, country: string | null = null): Promise<SymbolSearchResult[]> {
+  const res = await commands.searchEconomic(query, source, category, country);
   if (res.status === "error") throw new Error(res.error);
   return res.data;
+}
+
+/** The economies of the economic series (the country panel), the US first. */
+export async function economicCountries(): Promise<EconomicCountry[]> {
+  const res = await commands.economicCountries();
+  return res.status === "ok" ? res.data : [];
 }
 
 /** Source agencies of the economic series, most series first (the Sources filter). */
@@ -395,10 +435,42 @@ export type ChartEvent = {
   currency?: string;
 };
 
+/** "Q2 '25" of an earnings release's fiscal period and year ("" without them). */
+function fiscalLabel(period: string | null | undefined, year: number | null | undefined): string {
+  return period && year ? `${period} '${String(year).slice(-2)}` : "";
+}
+
+/** The events of a data plugin's symbol, as its plugin sends them (#382). */
+export function pluginChartEvents(list: SymbolEvent[], onDay: (utcMidnight: number) => number): ChartEvent[] {
+  const out: ChartEvent[] = [];
+  for (const e of list) {
+    if (e.date == null) continue;
+    const time = onDay(e.date);
+    if (e.kind === "dividend") {
+      out.push({ time, kind: "dividend", label: (e.amount ?? 0).toFixed(2), amount: e.amount ?? 0, payDate: e.payDate == null ? null : onDay(e.payDate) });
+    } else if (e.kind === "split") {
+      out.push({ time, kind: "split", label: `${e.to ?? 1}:${e.from ?? 1}`, from: e.from, to: e.to });
+    } else if (e.kind === "earnings") {
+      out.push({
+        time,
+        kind: "earnings",
+        label: fiscalLabel(e.fiscalPeriod, e.fiscalYear),
+        periodEnd: e.periodEnd ?? undefined,
+        session: e.session === "bmo" || e.session === "amc" ? e.session : null,
+        eps: e.eps ?? null,
+        revenue: e.revenue ?? null,
+        currency: e.currency ?? undefined,
+      });
+    }
+  }
+  return out.sort((a, b) => a.time - b.time);
+}
+
 /** Dividend + split + earnings markers for `symbol`, time-ascending.
  *  Best-effort: a failing endpoint contributes nothing rather than throwing
  *  (events are decorative), except a server that cannot be reached, which is
- *  tried again until it answers. */
+ *  tried again until it answers. A data plugin's symbol has its plugin's
+ *  events. */
 export async function getEvents(symbol: string): Promise<ChartEvent[]> {
   const settled = <T>(call: () => Promise<{ status: "ok"; data: T } | { status: "error"; error: string }>) =>
     retryTransient(async () => {
@@ -406,21 +478,26 @@ export async function getEvents(symbol: string): Promise<ChartEvent[]> {
       if (r.status === "error" && isTransientError(r.error)) throw new Error(r.error);
       return r;
     });
-  const company = hasFundamentals(symbol);
-  const [divs, splits, fundamentals, sessions] = await Promise.all([
-    company ? settled(() => commands.getDividends(symbol)) : null,
-    company ? settled(() => commands.getSplits(symbol)) : null,
-    company ? getFundamentals(symbol) : null,
-    retryTransient(() => symbolSessions(symbol)),
-  ]);
+  const sessions = await retryTransient(() => symbolSessions(symbol));
   // Event dates arrive as 00:00 UTC of the calendar date; place them on that
   // date's daily-bar stamp (local midnight in the exchange zone).
   const onDay = (utcMidnight: number) => localToUtc(sessions.timeZone, Math.floor(utcMidnight / 86400), 0);
+  // A data plugin's symbol (it lists the intervals it serves).
+  if (sessions.intervals.length) {
+    const r = await settled(() => commands.pluginEvents(symbol));
+    return r.status === "ok" ? pluginChartEvents(r.data, onDay) : [];
+  }
+  const company = hasFundamentals(symbol);
+  const [divs, splits, fundamentals] = await Promise.all([
+    company ? settled(() => commands.getDividends(symbol)) : null,
+    company ? settled(() => commands.getSplits(symbol)) : null,
+    company ? getFundamentals(symbol) : null,
+  ]);
   const out: ChartEvent[] = [];
   if (divs?.status === "ok") {
     for (const d of divs.data) {
       if (d.date != null) {
-        out.push({ time: onDay(d.date), kind: "dividend", label: (d.amount ?? 0).toFixed(2), amount: d.amount ?? 0, payDate: d.payDate ?? null });
+        out.push({ time: onDay(d.date), kind: "dividend", label: (d.amount ?? 0).toFixed(2), amount: d.amount ?? 0, payDate: d.payDate == null ? null : onDay(d.payDate) });
       }
     }
   }
@@ -436,7 +513,7 @@ export async function getEvents(symbol: string): Promise<ChartEvent[]> {
     out.push({
       time: onDay(day),
       kind: "earnings",
-      label: e.fp && e.fy ? `${e.fp} '${String(e.fy).slice(-2)}` : "",
+      label: fiscalLabel(e.fp, e.fy),
       periodEnd: end,
       session: e.time === "bmo" || e.time === "amc" ? e.time : null,
       eps: e.eps ?? null,
@@ -463,7 +540,11 @@ export async function getEvents(symbol: string): Promise<ChartEvent[]> {
 //   • a data plugin may serve no size that divides the open (hours only, 09:30
 //     open, #332): its bars keep their clock grid (09:00, 10:00, …), the one
 //     the open falls in kept and stamped at the open, and larger sizes are
-//     built on that grid.
+//     built on that grid;
+//   • a data plugin whose bars ignore the session opens (`barOrigin`, a broker
+//     terminal: 5-minute bars at 01:00 when trading opens at 01:01, #340):
+//     its bars are shown as served and the other sizes are built on its clock
+//     grid, so they match the terminal's.
 
 export type { SessionId } from "./session";
 
@@ -488,8 +569,10 @@ function sessionOpenMinutes(spec: SessionSpec, sec: number): number[] {
  *  that divides `mins` and every open, else the largest served size that
  *  divides `mins` (built on its own grid, see sessionBucketStart). Every
  *  caller has checked that one divides it (isSupportedResolution, pluginBuilds). */
-function sessionBaseMinutes(spec: SessionSpec, mins: number, served: number[]): number | null {
-  const opens = spec.always ? [0] : sessionOpenMinutes(spec, Date.now() / 1000);
+function sessionBaseMinutes(spec: SessionSpec, mins: number, served: number[], onGrid = false): number | null {
+  // Bars on the source's clock grid: the served size as it is, else the largest that builds it.
+  if (onGrid && served.includes(mins)) return null;
+  const opens = spec.always || onGrid ? [0] : sessionOpenMinutes(spec, Date.now() / 1000);
   if (served.includes(mins) && (spec.always || opens.every((m) => m % mins === 0))) return null;
   const sizes = served.filter((m) => m <= mins && mins % m === 0);
   if (sizes.length === 0) throw new Error(`no served bar size builds ${mins}-minute bars`);
@@ -497,10 +580,28 @@ function sessionBaseMinutes(spec: SessionSpec, mins: number, served: number[]): 
   return Math.max(...(fits.length ? fits : sizes));
 }
 
-/** Drop bars that start outside `spec`'s sessions. */
-function inSession(rows: Candle[], spec: SessionSpec): Candle[] {
+/** Drop bars that start outside `spec`'s sessions; with `barSecs` (bars on
+ *  the source's clock grid), keep a bar that holds an open (01:00 for 01:01). */
+function inSession(rows: Candle[], spec: SessionSpec, barSecs?: number): Candle[] {
   if (spec.always) return rows;
-  return rows.filter((c) => c.time != null && spec.contains(c.time as number));
+  return rows.filter((c) => c.time != null && holdsSession(spec, c.time as number, barSecs ?? 1));
+}
+
+/** Whether a bar of `barSecs` starting at `t` starts in, or holds the open of, one of `spec`'s sessions. */
+function holdsSession(spec: SessionSpec, t: number, barSecs: number): boolean {
+  if (spec.contains(t)) return true;
+  const next = barSecs > 1 ? spec.currentOrNext(t, 1) : null;
+  return !!next && next.start < t + barSecs;
+}
+
+/** The bars of `mins` minutes of a symbol from rows of `base` minutes (null:
+ *  the rows are those bars): session-anchored, or on the source's clock grid. */
+function sessionBars(rows: Candle[], sessions: SymbolSessions, spec: SessionSpec, mins: number, base: number | null): Candle[] {
+  if (sessions.barOrigin !== null) {
+    if (base === null) return inSession(rows, spec, mins * 60);
+    return aggregateSessionMinutes(rows, spec, mins, base, (t, step) => sessions.barGridStart(t, step));
+  }
+  return base === null ? inSession(rows, spec) : aggregateSessionMinutes(rows, spec, mins, base);
 }
 
 /** Start of the bucket of `stepSecs` holding time `t` of session interval `iv`
@@ -518,8 +619,15 @@ function sessionBucketStart(spec: SessionSpec, iv: SessionInterval, t: number, s
  *  sessionBucketStart), dropping those outside `spec`'s sessions; a base bar
  *  that starts before an open it holds belongs to that session. The last
  *  bucket of an interval may be short (15:30–16:00). Each bucket is stamped
- *  with its start, even when its first base bar is missing. */
-function aggregateSessionMinutes(rows: Candle[], spec: SessionSpec, targetMins: number, baseMins: number): Candle[] {
+ *  with its start, even when its first base bar is missing. `grid` gives the
+ *  bucket instead, for bars on the source's clock grid. */
+function aggregateSessionMinutes(
+  rows: Candle[],
+  spec: SessionSpec,
+  targetMins: number,
+  baseMins: number,
+  grid?: (t: number, stepSecs: number) => number,
+): Candle[] {
   const out: Candle[] = [];
   const step = targetMins * 60;
   const baseSecs = baseMins * 60;
@@ -534,7 +642,7 @@ function aggregateSessionMinutes(rows: Candle[], spec: SessionSpec, targetMins: 
       if (!next || next.start >= t + baseSecs) continue;
       iv = next;
     }
-    const start = sessionBucketStart(spec, iv, t, step, baseMins);
+    const start = grid ? grid(t, step) : sessionBucketStart(spec, iv, t, step, baseMins);
     if (start !== curStart) {
       if (cur) out.push(cur);
       cur = { ...b, time: start };
@@ -605,6 +713,8 @@ export function getBars(
 
 async function getBarsOnce(symbol: string, resolution: string, session: SessionId): Promise<BarsResult> {
   if (isLocalSymbol(symbol)) return localBars(symbol, resolution);
+  const ticks = tickCount(resolution);
+  if (ticks !== null) return { bars: await tickHistory(symbol, ticks, null, session), daily: null, aggregate: null };
   // Guard the catch-all daily branch below: an unservable resolution (tick,
   // range, too large a multiplier) must error here rather than silently
   // resolve to daily bars. The picker gates on the same set, so this is a
@@ -630,10 +740,10 @@ async function getBarsOnce(symbol: string, resolution: string, session: SessionI
     // A size its data plugin can't build: no bars (the chart shows the interval is not supported).
     if (!pluginBuilds(sessions, resolution)) return { bars: [], daily: null, aggregate: null };
     const spec = sessions.spec(session);
-    const base = sessionBaseMinutes(spec, intra.mins, symbolMinutes(sessions));
+    const base = sessionBaseMinutes(spec, intra.mins, symbolMinutes(sessions), sessions.barOrigin !== null);
     const res = await commands.getMinuteHistory(symbol, intra.days, base ?? intra.mins, adjusted);
     if (res.status === "error") throw new Error(res.error);
-    const bars = base === null ? inSession(res.data.bars, spec) : aggregateSessionMinutes(res.data.bars, spec, intra.mins, base);
+    const bars = sessionBars(res.data.bars, sessions, spec, intra.mins, base);
     return { bars, daily: null, aggregate: null, partial: res.data.partial };
   }
   const cfg = dailyConfig(resolution);
@@ -645,6 +755,25 @@ async function getBarsOnce(symbol: string, resolution: string, session: SessionI
   const daily = res.data.bars;
   const bars = cfg.aggregate ? aggregateCandles(daily, cfg.aggregate, sessions.regular) : daily;
   return { bars, daily, aggregate: cfg.aggregate ?? null, partial: res.data.partial };
+}
+
+/** Daily sessions a figure of the last year reads (52-week range, performance, YTD): a year of a market open every
+ *  day, with margin. */
+const YEAR_DAYS = 400;
+
+/** Daily bars of at least the last year, for figures of the last year (the Details panel's 52-week range and
+ *  performance). A data plugin's symbol asks just that window: its source owns its history, and the daily chart's
+ *  30 years can cost it a request per year (#347). The others read the series the daily chart reads, kept once
+ *  read. */
+export async function getLastYearDailyBars(symbol: string, wanted?: () => boolean): Promise<Candle[]> {
+  if (!isLocalSymbol(symbol) && !isEconomicSymbol(symbol) && (await symbolSessions(symbol)).intervals.length) {
+    return retryTransient(async () => {
+      const res = await commands.getDailyHistory(symbol, YEAR_DAYS, isAdjusted());
+      if (res.status === "error") throw new Error(res.error);
+      return res.data.bars;
+    }, wanted);
+  }
+  return (await getBars(symbol, "1D", "ETH", wanted)).bars;
 }
 
 /** Bars of an imported series: the whole series at once. */
@@ -674,6 +803,8 @@ export async function getBarsBefore(
 ): Promise<Candle[]> {
   // An economic series is loaded whole.
   if (isEconomicSymbol(symbol)) return [];
+  const ticks = tickCount(resolution);
+  if (ticks !== null) return tickHistory(symbol, ticks, tickBarMs(beforeSec), session);
   if (isLocalSymbol(symbol)) return localBarsBefore(symbol, resolution, beforeSec, spanDays ?? dailyConfig(resolution).days);
   const adjusted = isAdjusted();
   const second = SECOND_INTERVALS[resolution];
@@ -691,11 +822,49 @@ export async function getBarsBefore(
     const sessions = await symbolSessions(symbol);
     if (!pluginBuilds(sessions, resolution)) return [];
     const spec = sessions.spec(session);
-    const base = sessionBaseMinutes(spec, intra.mins, symbolMinutes(sessions));
+    const base = sessionBaseMinutes(spec, intra.mins, symbolMinutes(sessions), sessions.barOrigin !== null);
     const rows = await getAggregatesBefore(symbol, "minute", base ?? intra.mins, beforeSec, days, adjusted);
-    return base === null ? inSession(rows, spec) : aggregateSessionMinutes(rows, spec, intra.mins, base);
+    return sessionBars(rows, sessions, spec, intra.mins, base);
   }
   return getDailyHistoryBefore(symbol, beforeSec, spanDays ?? dailyConfig(resolution).days, adjusted);
+}
+
+/** Bars of `n` ticks of a data plugin's symbol: one page of whole bars before
+ *  `beforeMs` (none: up to now), in the chosen session. None for a symbol
+ *  without ticks. */
+async function tickHistory(symbol: string, n: number, beforeMs: number | null, session: SessionId): Promise<Candle[]> {
+  if (!servesTicks(symbol)) return [];
+  const [res, sessions] = await Promise.all([commands.pluginTicks(symbol, beforeMs, null, ticksPerPage(n)), symbolSessions(symbol)]);
+  if (res.status === "error") throw new Error(res.error);
+  const spec = sessions.spec(session);
+  const ticks = res.data as TickRow[];
+  const bars = tickBars(ticks.filter((t) => spec.contains(Math.floor(t.timeMs / 1000))), n);
+  // A page before a loaded bar stays before it.
+  return beforeMs === null ? bars : bars.filter((b) => tickBarMs(b.time as number) < beforeMs);
+}
+
+/** A page of ticks read forward: those in the chosen session, whether the
+ *  source may have newer ones (it answered a full page), and the time of its
+ *  last tick with how many ticks it had then (the next page starts there and
+ *  skips them). */
+export type TickPage = { ticks: TickRow[]; more: boolean; lastMs: number | null; atLast: number };
+
+/** The first `count` ticks of a data plugin's symbol from `fromMs` on, the
+ *  first `skip` of that millisecond left out (read already: the last page
+ *  ended there), for Bar Replay on a tick chart (#377). */
+export async function getTicksFrom(symbol: string, fromMs: number, count: number, session: SessionId = "ETH", skip = 0): Promise<TickPage> {
+  if (!servesTicks(symbol)) return { ticks: [], more: false, lastMs: null, atLast: 0 };
+  const [res, sessions] = await Promise.all([commands.pluginTicks(symbol, null, fromMs, count), symbolSessions(symbol)]);
+  if (res.status === "error") throw new Error(res.error);
+  const spec = sessions.spec(session);
+  const all = res.data as TickRow[];
+  let k = 0;
+  while (k < skip && k < all.length && all[k].timeMs === fromMs) k++;
+  const lastMs = all.length ? all[all.length - 1].timeMs : null;
+  let atLast = 0;
+  for (let i = all.length - 1; i >= 0 && all[i].timeMs === lastMs; i--) atLast++;
+  const ticks = all.slice(k).filter((t) => spec.contains(Math.floor(t.timeMs / 1000)));
+  return { ticks, more: all.length >= count, lastMs, atLast };
 }
 
 /** Seconds live tail: bars strictly newer than `sinceSec` for a second-family
@@ -803,9 +972,14 @@ export function bucketLiveTick(
   const bucketSecs = intra.mins * 60;
   // Re-aggregated sizes (US 1H/2H/4H RTH) take the history's buckets
   // (sessionBucketStart); the others keep the provider's clock grid, which
-  // already breaks at the open.
-  const base = sessionBaseMinutes(spec, intra.mins, symbolMinutes(sessions));
-  const bucketTime = base !== null ? sessionBucketStart(spec, iv, tick.time, bucketSecs, base) : Math.floor(tick.time / bucketSecs) * bucketSecs;
+  // already breaks at the open; a source's own grid (barOrigin) is kept too.
+  const base = sessionBaseMinutes(spec, intra.mins, symbolMinutes(sessions), sessions.barOrigin !== null);
+  const bucketTime =
+    sessions.barOrigin !== null
+      ? sessions.barGridStart(tick.time, bucketSecs)
+      : base !== null
+        ? sessionBucketStart(spec, iv, tick.time, bucketSecs, base)
+        : Math.floor(tick.time / bucketSecs) * bucketSecs;
   return {
     time: bucketTime,
     open: tick.open,

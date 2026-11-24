@@ -8,6 +8,7 @@ import { createRoot, createSignal } from "solid-js";
 import * as kv from "../kv";
 import { oneOf, persisted } from "../persisted";
 import { broker } from "./broker";
+import { stopLimitPrice } from "./price-rules";
 import type { OrderType, Side, TradingOrder, TradingPosition } from "./types";
 
 /** What the order ticket edits. Prices are strings while typed. */
@@ -33,10 +34,10 @@ export type TicketDraft = {
   /** Offsets typed, in ticks ("" = at the base). */
   limitOffset?: string;
   stopOffset?: string;
-  /** Quantity typed in units or as a risk (money / % balance). */
-  qtyType?: "units" | "riskUsd" | "riskPct";
-  qtyEquiv?: "units" | "riskUsd" | "riskPct";
-  /** The risk typed (qtyType riskUsd / riskPct). */
+  /** Quantity typed in units, as the order's value (money / % balance) or as a risk (money / % balance). */
+  qtyType?: QtyFieldType;
+  qtyEquiv?: QtyFieldType;
+  /** The value typed when the quantity is not in units (qtyType money, balancePct, riskUsd, riskPct). */
   risk?: string;
   /** Exits typed as a price, ticks, % price, money or % balance. */
   tpType?: ExitFieldType;
@@ -49,7 +50,20 @@ export type TicketDraft = {
   /** Order preset to apply when the ticket opens (chart Buy / Sell buttons
    *  with an active preset). */
   applyPreset?: string;
+  /** The values picked in the broker's own ticket fields (field id → value). */
+  fields?: Record<string, string>;
+  /** The time in force picked (a broker duration id). */
+  duration?: string;
+  /** Stop limit: the limit's distance from the stop in ticks, kept when the stop moves (#370; one tick beyond it at
+   *  first, then what the user set). */
+  stopLimitGap?: number;
+  /** Exit levels in place of the take profit / stop loss (#330): each its quantity in units and its prices, as typed. */
+  levels?: { qty: string; tp: string; sl: string }[];
 };
+
+/** The exit levels of an order or a position, as the ticket types them. */
+const draftLevels = (list: { qty: number; takeProfit: number | null; stopLoss: number | null }[] | undefined) =>
+  list?.length ? list.map((l) => ({ qty: String(l.qty), tp: l.takeProfit != null ? String(l.takeProfit) : "", sl: l.stopLoss != null ? String(l.stopLoss) : "" })) : undefined;
 
 /** What the open order ticket offers the chart's project order line. */
 export type TicketActions = {
@@ -64,6 +78,8 @@ export type TicketActions = {
   setType: (t: OrderType) => void;
   setQty: (qty: number) => void;
 };
+
+export type QtyFieldType = "units" | "money" | "balancePct" | "riskUsd" | "riskPct";
 
 export type ExitFieldType = "price" | "ticks" | "pricePct" | "cash" | "balancePct";
 
@@ -101,9 +117,11 @@ const K = {
   reportView: "ot:replay-trading:view",
   presets: "ot:order-ticket:presets",
   slRisk: "ot:order-ticket:sl-enables-risk",
+  showPreview: "ot:order-ticket:show-preview",
   tab: "ot:order-ticket:tab",
   mode: "ot:order-ticket:mode",
   domPrices: "ot:order-ticket:dom-prices",
+  domSteps: "ot:order-ticket:dom-steps",
 };
 
 /** DOM panel settings (⋯ menu of the DOM tab). */
@@ -114,12 +132,20 @@ function parseDomPrices(raw: string): DomPrices {
   return { zeroVolume: v?.zeroVolume !== false, spread: v?.spread !== false };
 }
 
+/** DOM price step per symbol, in ticks. */
+function parseDomSteps(raw: string): Record<string, number> {
+  const v = JSON.parse(raw) as Record<string, unknown> | null;
+  const out: Record<string, number> = {};
+  if (v && typeof v === "object") for (const [k, n] of Object.entries(v)) if (typeof n === "number" && Number.isInteger(n) && n > 0) out[k] = n;
+  return out;
+}
+
 function parsePresets(raw: string): OrderPreset[] {
   const v = JSON.parse(raw) as unknown;
   return Array.isArray(v) ? v.filter((p): p is OrderPreset => !!p && typeof p.id === "string" && typeof p.title === "string" && typeof p.orderType === "string") : [];
 }
 
-type TicketPrefs = { qty: string; orderType: OrderType };
+type TicketPrefs = { qty: string; orderType: OrderType; fields?: Record<string, string>; duration?: string };
 const DEFAULT_PREFS: TicketPrefs = { qty: "1", orderType: "market" };
 
 /** Decimals of a price step (0.01 → 2). */
@@ -144,6 +170,17 @@ const [prefs, setPrefs] = createRoot(() =>
 export function ticketQty(): number {
   const q = Number(prefs().qty);
   return Number.isFinite(q) && q > 0 ? q : 1;
+}
+
+/** The broker ticket fields' last picked values (a product type): the next orders start from them, the chart's
+ *  one-click orders too. */
+export function ticketFieldPrefs(): Record<string, string> {
+  return prefs().fields ?? {};
+}
+
+/** The time in force last picked (#349): the next orders start from it when the broker takes it for their type. */
+export function ticketDurationPref(): string | undefined {
+  return prefs().duration;
 }
 
 /** The quantity of the next orders (chart Buy / Sell quantity calculator). */
@@ -179,6 +216,8 @@ export const tradingUi = createRoot(() => {
   // Order presets and the ticket's ⋯ menu setting.
   const [presets, setPresets] = persisted<OrderPreset[]>(K.presets, { parse: parsePresets, default: [], sync: true });
   const [slEnablesRisk, setSlEnablesRisk] = persisted(K.slRisk, { parse: (raw) => raw === "true", default: false, sync: true });
+  /** "Show order confirmation": a broker that previews orders shows the order and its preview before sending it. */
+  const [showOrderPreview, setShowOrderPreview] = persisted(K.showPreview, { parse: (raw) => raw !== "false", default: true, sync: true });
 
   /** The order preset of the chart Buy / Sell buttons (presets menu). */
   const [activePreset, setActivePreset] = createSignal<string | null>(null);
@@ -190,6 +229,7 @@ export const tradingUi = createRoot(() => {
   const [ticketTab, setTicketTabRaw] = createSignal<"order" | "dom">(kv.getItem(K.tab) === "dom" ? "dom" : "order");
   const [domHover, setDomHover] = createSignal<{ price: number; buy: boolean } | null>(null);
   const [domPrices, setDomPrices] = persisted<DomPrices>(K.domPrices, { parse: parseDomPrices, default: { zeroVolume: true, spread: true }, sync: true });
+  const [domSteps, setDomSteps] = persisted<Record<string, number>>(K.domSteps, { parse: parseDomSteps, default: {}, sync: true });
   /** Docked at the right ("panel") or a floating dialog ("popup": "Undock
    *  order ticket"). */
   const [ticketMode, saveTicketMode] = persisted<"panel" | "popup">(K.mode, { parse: oneOf("panel", "popup"), format: String, default: "panel" });
@@ -211,14 +251,17 @@ export const tradingUi = createRoot(() => {
     }
     // No chart price: limit and stop prices start at the market price.
     const q = broker.quote();
-    const mkt = q?.last != null ? q.last.toFixed(Math.max(2, decimalsOf(q.minTick))) : "";
+    const dec = Math.max(2, decimalsOf(q?.minTick ?? 0.01));
+    const mkt = q?.last != null ? q.last.toFixed(dec) : "";
     const base = px || mkt;
+    // A stop limit's limit starts one tick beyond its stop.
+    const limit = orderType === "stopLimit" && base ? stopLimitPrice(Number(base), side, q?.minTick ?? 0.01).toFixed(dec) : base;
     return {
       symbol,
       side,
       orderType,
       qty: p.qty,
-      limitPrice: orderType === "limit" || orderType === "stopLimit" ? base : "",
+      limitPrice: orderType === "limit" || orderType === "stopLimit" ? limit : "",
       stopPrice: orderType === "stop" || orderType === "stopLimit" ? base : "",
       tpOn: false,
       takeProfit: "",
@@ -226,6 +269,7 @@ export const tradingUi = createRoot(() => {
       stopLoss: "",
       editing: null,
       paneId: null,
+      fields: { ...p.fields },
     };
   };
 
@@ -251,7 +295,7 @@ export const tradingUi = createRoot(() => {
     setSent,
     /** Remember the ticket choices the next order starts from. */
     savePrefs(d: TicketDraft) {
-      setPrefs({ qty: d.qty, orderType: d.orderType });
+      setPrefs({ qty: d.qty, orderType: d.orderType, fields: { ...prefs().fields, ...d.fields }, duration: d.duration ?? prefs().duration });
     },
     /** A new order's draft (the ticket's starting values). */
     newDraft,
@@ -286,6 +330,7 @@ export const tradingUi = createRoot(() => {
         stopLoss: o.stopLoss != null ? String(o.stopLoss) : "",
         editing: o.id,
         paneId,
+        levels: draftLevels(o.exitLevels),
       });
       setSent(false);
       setTicketOpen(true);
@@ -307,6 +352,7 @@ export const tradingUi = createRoot(() => {
         stopLoss: pos.stopLoss != null ? String(pos.stopLoss) : "",
         editing: POSITION_EDIT,
         paneId,
+        levels: draftLevels(pos.exitLevels),
       });
       setSent(false);
       setTicketOpen(true);
@@ -380,9 +426,19 @@ export const tradingUi = createRoot(() => {
     setDomHover,
     domPrices,
     setDomPrices,
+    /** The DOM's price step of a symbol, in ticks (1: none). */
+    domStep: (symbol: string): number => domSteps()[symbol] ?? 1,
+    setDomStep(symbol: string, ticks: number) {
+      const next = { ...domSteps() };
+      if (ticks === 1) delete next[symbol];
+      else next[symbol] = ticks;
+      setDomSteps(next);
+    },
     /** "SL enables quantity in risk" (ticket ⋯ menu). */
     slEnablesRisk,
     setSlEnablesRisk,
+    showOrderPreview,
+    setShowOrderPreview,
 
     settingsOpen,
     openReplaySettings: () => setSettingsOpen(true),

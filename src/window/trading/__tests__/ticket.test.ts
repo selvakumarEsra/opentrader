@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { TicketDraft } from "../../../data/trading/trading-ui";
-import { fmtPnl, fmtPrice, parsePositive, tickDecimals } from "../format";
+import { fmtPnl, fmtPrice, fmtSize, parsePositive, tickDecimals } from "../format";
 import {
   buildTicket,
   describeTicket,
@@ -10,6 +10,7 @@ import {
   exitTicks,
   exitTypeDisabled,
   exitValueIn,
+  followStop,
   fmtTypeValue,
   marketHint,
   parseSigned,
@@ -150,6 +151,49 @@ describe("order ticket field types (reference: QQQ at 717.12, TP 75 / SL 25 tick
     expect(qtyValueIn("riskUsd", resolveDraft(base, q, c), q, c)).toBeNull();
   });
 
+  it("sizes a risk in whole lots with the instrument's point value (#341)", () => {
+    const nifty = { qtyMin: 65, qtyStep: 65, qtyMax: null, pointValue: 1, fields: [], durations: [], marginRate: null };
+    const d = { ...base, qtyType: "riskUsd" as const, risk: "1000", slOn: true, stopLoss: "707.12" };
+    // 1000 at 10 a unit = 100 units: one lot of 65.
+    expect(resolveDraft(d, q, { ...c, instrument: nifty }).qty).toBe("65");
+    expect(resolveDraft({ ...d, risk: "500" }, q, { ...c, instrument: nifty }).qty).toBe("");
+    // A futures multiplier: 1000 at 10 × 50 a contract = 2 contracts.
+    const es = { qtyMin: null, qtyStep: 1, qtyMax: null, pointValue: 50, fields: [], durations: [], marginRate: null };
+    expect(resolveDraft(d, q, { ...c, pointValue: 50, instrument: es }).qty).toBe("2");
+    expect(riskValue({ ...d, qty: "2" }, q, 50)).toBeCloseTo(1000, 6);
+  });
+
+  it("sizes the order by its value in money / % balance (#346), without a stop loss", () => {
+    // 10 000 at 717.12 a unit = 13.94 units: 13; 1 % of 100 000 is 1 000: 1 unit.
+    const d = { ...base, qtyType: "money" as const, risk: "10000" };
+    expect(resolveDraft(d, q, c).qty).toBe("13");
+    expect(resolveDraft({ ...d, qtyType: "balancePct", risk: "1" }, q, c).qty).toBe("1");
+    expect(resolveDraft({ ...d, risk: "100" }, q, c).qty).toBe("");
+    expect(resolveDraft({ ...d, qtyType: "balancePct" }, q, { ...c, balance: null }).qty).toBe("");
+    // A market order is valued at the quote; a futures contract at its point value, in whole lots.
+    expect(resolveDraft({ ...d, orderType: "market", limitPrice: "" }, { bid: 99, ask: 100, last: 100 }, c).qty).toBe("100");
+    const es = { qtyMin: null, qtyStep: 1, qtyMax: null, pointValue: 50, fields: [], durations: [], marginRate: null };
+    expect(resolveDraft({ ...d, risk: "100000" }, q, { ...c, pointValue: 50, instrument: es }).qty).toBe("2");
+    // The equivalents: the order's value and its share of the balance.
+    const r = resolveDraft({ ...base, qty: "10" }, q, c);
+    expect(qtyValueIn("money", r, q, c)).toBeCloseTo(7171.2, 6);
+    expect(fmtTypeValue("balancePct", qtyValueIn("balancePct", r, q, c)!, 2)).toBe("7.17");
+    expect(qtyValueIn("balancePct", r, q, { ...c, balance: null })).toBeNull();
+    // Exits measured on the units it buys; a money stop loss is allowed (no risk is measured to it).
+    const x = resolveDraft({ ...d, slOn: true, slType: "cash", slValue: "13" }, q, c);
+    expect(x.stopLoss).toBe("716.12");
+    expect(exitTypeDisabled("sl", "cash", "money")).toBe(false);
+  });
+
+  it("refuses a quantity that is not whole lots and sends the broker's fields (#341)", () => {
+    const nifty = { qtyMin: 65, qtyStep: 65, qtyMax: null, pointValue: 1, fields: [], durations: [], marginRate: null };
+    expect(buildTicket({ ...base, qty: "1" }, q, nifty)).toBe("65 is one lot: use 65 or 130");
+    expect(buildTicket({ ...base, qty: "100" }, q, nifty)).toBe("65 is one lot: use 65 or 130");
+    expect(buildTicket({ ...base, qty: "130" }, q, nifty)).toMatchObject({ qty: 130 });
+    expect(buildTicket({ ...base, qty: "1", fields: { product: "CNC" } }, q)).toMatchObject({ fields: { product: "CNC" } });
+    expect(buildTicket({ ...base, qty: "1" }, q)).not.toHaveProperty("fields");
+  });
+
   it("resolves exits typed in ticks / money with the quantity", () => {
     const d = { ...base, qty: "2", tpOn: true, tpType: "ticks" as const, tpValue: "75", slOn: true, slType: "cash" as const, slValue: "0.5" };
     const r = resolveDraft(d, q, c);
@@ -188,5 +232,53 @@ describe("trading formats", () => {
     expect(fmtPnl(-3)).toBe("−3.00");
     expect(parsePositive("1,250.5")).toBe(1250.5);
     expect(parsePositive("-1")).toBeNull();
+  });
+
+  it("refuses an order price the tick or the market refuses (#370)", () => {
+    const prices = { tick: 0.05, rules: { stopOrdersBothSides: false, stopLimitOrdersBothSides: false, strictLimitPrice: false } };
+    expect(buildTicket(draft({ limitPrice: "100.03" }), quote, undefined, prices)).toBe("The price must be a multiple of 0.05");
+    // A buy stop below the ask would trigger at once.
+    expect(buildTicket(draft({ orderType: "stop", stopPrice: "99.5" }), quote, undefined, prices)).toBe("This price is not valid for this order type");
+    expect(typeof buildTicket(draft({ orderType: "stop", stopPrice: "100.5" }), quote, undefined, prices)).toBe("object");
+    // A marketable limit is sent; without `prices` nothing is checked.
+    expect(typeof buildTicket(draft({ limitPrice: "100.5" }), quote, undefined, prices)).toBe("object");
+    expect(typeof buildTicket(draft({ orderType: "stop", stopPrice: "99.5" }), quote)).toBe("object");
+  });
+
+  it("keeps a stop limit's limit at its distance from the stop (#370)", () => {
+    const c = { tick: 0.05, decimals: 2, balance: null };
+    const sl = draft({ orderType: "stopLimit", stopPrice: "100.00", limitPrice: "100.05" });
+    // A new stop limit: one tick beyond the stop (above to buy, below to sell).
+    expect(followStop(draft({ orderType: "limit" }), { orderType: "stopLimit", stopPrice: "101.00" }, quote, c)).toEqual({ stopLimitGap: 1, limitPrice: "101.05" });
+    expect(followStop(draft({ side: "sell", orderType: "stop", stopPrice: "99.00" }), { orderType: "stopLimit" }, quote, c)).toEqual({ stopLimitGap: -1, limitPrice: "98.95" });
+    // The stop moves: the limit follows.
+    expect(followStop(sl, { stopPrice: "102.00" }, quote, c)).toEqual({ stopLimitGap: 1, limitPrice: "102.05" });
+    // The user sets another distance: kept from then on.
+    expect(followStop(sl, { limitPrice: "100.25" }, quote, c)).toEqual({ stopLimitGap: 5 });
+    const wide = { ...sl, limitPrice: "100.25", stopLimitGap: 5 };
+    expect(followStop(wide, { stopPrice: "101.00" }, quote, c)).toEqual({ stopLimitGap: 5, limitPrice: "101.25" });
+    // A stop being retyped is empty for a moment: the distance is kept for the next value.
+    const typing = { ...wide, stopPrice: "" };
+    expect(followStop(wide, { stopPrice: "" }, quote, c)).toEqual({ stopLimitGap: 5 });
+    expect(followStop(typing, { stopPrice: "10" }, quote, c)).toEqual({ stopLimitGap: 5, limitPrice: "10.25" });
+    // The other side: the limit goes to the other side of the stop.
+    expect(followStop(sl, { side: "sell" }, quote, c)).toEqual({ stopLimitGap: -1, limitPrice: "99.95" });
+    // Nothing for other order types, or a limit typed as an offset from the stop.
+    expect(followStop(draft(), { limitPrice: "99" }, quote, c)).toEqual({});
+    expect(followStop({ ...sl, limitMode: "offset", limitOffset: "2" }, { stopPrice: "101" }, quote, c)).toEqual({});
+  });
+});
+
+describe("fmtSize (order book sizes, #372)", () => {
+  it("keeps three integer digits, then K / M / B with at most 2 decimals", () => {
+    expect(fmtSize(320)).toBe("320");
+    expect(fmtSize(1234)).toBe("1.23 K");
+    expect(fmtSize(2_475_000)).toBe("2.48 M");
+    expect(fmtSize(4_000_000)).toBe("4 M");
+    expect(fmtSize(999_999)).toBe("1 M");
+    expect(fmtSize(12_500_000_000)).toBe("12.5 B");
+    expect(fmtSize(0.25, 2)).toBe("0.25");
+    expect(fmtSize(12.5, 0)).toBe("13");
+    expect(fmtSize(NaN)).toBe("—");
   });
 });

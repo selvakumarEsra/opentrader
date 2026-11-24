@@ -17,6 +17,7 @@ pub async fn get_ticker_info(app: AppHandle, provider: State<'_, Provider>, symb
     if let Some(r) = plugin::route(&app, &symbol) {
         return plugin::ticker_info(&app, &r).await;
     }
+    plugin::refuse_idle(&app, &symbol)?;
     Ok(core::ticker_info(&provider, &symbol).await?)
 }
 
@@ -29,6 +30,7 @@ pub async fn get_symbol_session(app: AppHandle, provider: State<'_, Provider>, s
     if let Some(r) = plugin::route(&app, &symbol) {
         return plugin::session(&app, &r).await;
     }
+    plugin::refuse_idle(&app, &symbol)?;
     Ok(core::symbol_session(&provider, &symbol).await?)
 }
 
@@ -38,6 +40,7 @@ pub async fn get_ticker_snapshot(app: AppHandle, provider: State<'_, Provider>, 
     if let Some(r) = plugin::route(&app, &symbol) {
         return plugin::snapshot(&app, &r).await;
     }
+    plugin::refuse_idle(&app, &symbol)?;
     Ok(core::ticker_snapshot(&provider, &symbol).await?)
 }
 
@@ -67,15 +70,23 @@ pub async fn search_tickers(
 }
 
 /// Economy tab of the symbol search: the series matching `query` (the most
-/// popular for an empty query) within a source agency and / or a category.
+/// popular for an empty query) within a source agency, a category and / or an economy.
 #[tauri::command]
 #[specta::specta]
 pub async fn search_economic(
     query: String,
     source: Option<String>,
     category: Option<String>,
+    country: Option<String>,
 ) -> Result<Vec<SymbolSearchResult>, String> {
-    Ok(core::search_economic(&query, source.as_deref(), category.as_deref()))
+    Ok(core::search_economic(&query, source.as_deref(), category.as_deref(), country.as_deref()))
+}
+
+/// The economies of the economic series catalog (the country panel).
+#[tauri::command]
+#[specta::specta]
+pub async fn economic_countries() -> Result<Vec<opentrader_core::data::market_rest::economics::EconomicCountry>, String> {
+    Ok(core::economic_countries())
 }
 
 /// The source agencies of the economic series catalog, most series first.

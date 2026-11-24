@@ -6,9 +6,11 @@
  * generated commands don't do: routing imported series to ./local-series,
  * retrying a lost connection and sharing one request between callers.
  */
+import { createSignal } from "solid-js";
 import * as gen from "../bindings";
 import { commands, type Candle, type History, type TickerInfo } from "../bindings";
-import { retryTransient } from "./connection";
+import { isTransientError, retryTransient } from "./connection";
+import { isNotFoundError, noteSymbolError } from "./unknown-symbols";
 import { isLocalSymbol, localSnapshot, localTickerInfo } from "./local-series";
 
 export type { TickerInfo } from "../bindings";
@@ -88,28 +90,58 @@ export async function getDailyHistoryBefore(
   return unwrap(commands.getDailyHistoryBefore(symbol, beforeSec, spanDays, adjusted));
 }
 
-/** Reference data changes at most once a day: an answer is reused for an hour. */
+/** Reference data changes at most once a day: an answer is reused for an hour.
+ *  A data plugin's comes from the app's memory, kept until the plugin says it
+ *  changed (#400): asking again costs the plugin nothing. */
 const INFO_TTL_MS = 60 * 60_000;
+
+/** A request the server kept failing (see retryTransient) is not sent again
+ *  for this long: a look at the symbol would start its retries over. */
+const FAILED_TTL_MS = 5 * 60_000;
 
 /** Ticker info requests, one per symbol: every caller waiting out a lost
  *  connection shares one retry loop, and the answer serves every caller for
- *  INFO_TTL_MS. A failure is not kept. */
-const infoCache = new Map<string, { at: number; p: Promise<TickerInfo> }>();
+ *  INFO_TTL_MS. So does "unknown symbol" (a watchlist of uploaded junk would
+ *  ask at every look, #355); a server error, FAILED_TTL_MS; another failure
+ *  is not kept. */
+const infoCache = new Map<string, { at: number; ttl: number; done: boolean; p: Promise<TickerInfo> }>();
+
+/** Bumped when the kept answers are forgotten (see forgetTickerInfo). */
+const [infoEpoch, setInfoEpoch] = createSignal(0);
+export const tickerInfoEpoch = infoEpoch;
 
 /** Reference data of `symbol`; a server that cannot be reached is tried again
- *  until it answers (see ./connection). */
+ *  until it answers (see ./connection). An effect that asks runs again when the
+ *  answers are forgotten. */
 export function getTickerInfo(symbol: string): Promise<TickerInfo> {
+  infoEpoch();
   if (isLocalSymbol(symbol)) return localTickerInfo(symbol);
   const hit = infoCache.get(symbol);
-  if (hit && Date.now() - hit.at < INFO_TTL_MS) return hit.p;
+  if (hit && Date.now() - hit.at < hit.ttl) return hit.p;
   const p = retryTransient(() => unwrap(commands.getTickerInfo(symbol)));
-  const entry = { at: Date.now(), p };
+  const entry = { at: Date.now(), ttl: INFO_TTL_MS, done: false, p };
   infoCache.set(symbol, entry);
   p.then(
-    () => { entry.at = Date.now(); },
-    () => { if (infoCache.get(symbol) === entry) infoCache.delete(symbol); },
+    () => { entry.at = Date.now(); entry.done = true; },
+    (e) => {
+      entry.done = true;
+      if (isNotFoundError(e)) entry.at = Date.now();
+      else if (isTransientError(e)) Object.assign(entry, { at: Date.now(), ttl: FAILED_TTL_MS });
+      else if (infoCache.get(symbol) === entry) infoCache.delete(symbol);
+      noteSymbolError(symbol, e);
+    },
   );
   return p;
+}
+
+/** Forget the answers kept (the data plugins changed, #371): a plugin that was
+ *  starting or waiting for its settings answered "unknown symbol" or a bare
+ *  row, which the plugin now serves in full. With `which`, only those of the
+ *  symbols it names (a plugin reloaded its reference data, #400). A request
+ *  still waiting is kept: it gets the new answer. */
+export function forgetTickerInfo(which?: (symbol: string) => boolean): void {
+  for (const [symbol, entry] of infoCache) if (entry.done && (!which || which(symbol))) infoCache.delete(symbol);
+  setInfoEpoch((n) => n + 1);
 }
 
 /** Latest quote of `symbol`; a server that cannot be reached is tried again

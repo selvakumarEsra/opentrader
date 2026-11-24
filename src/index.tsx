@@ -1,8 +1,18 @@
 /* @refresh reload */
+// An embedded chart swaps the page storage before anything reads it (#338).
+import "./embed/boot";
 import "./styles.css";
 import { hydrateKv } from "./data/kv";
 import { installOverflowTooltip } from "./components/overflow-tooltip";
 import { installBrowserMenuBlock } from "./components/browser-menu";
+import { installErrorReports } from "./data/error-reports";
+import { installNewBuildCheck } from "./data/new-build";
+import { embedConfig } from "./embed/config";
+
+// App errors from the start, startup included; sent once the statistics start.
+installErrorReports();
+// Web: code that no longer loads because a new build is out offers a reload.
+installNewBuildCheck();
 
 // A tooltip on menu labels only when they are cut.
 installOverflowTooltip();
@@ -33,6 +43,22 @@ void hydrateKv().finally(async () => {
     const { ScreenerWindow } = await import("./window/screener/ScreenerWindow");
     render(() => <ScreenerWindow />, document.getElementById("root") as HTMLElement);
     hideSplash();
+    return;
+  }
+  // The OakScript editor's own window (#325, "Open editor ▸ New window") holds the editor only.
+  if (new URLSearchParams(location.search).get("view") === "oakscript") {
+    const { OakScriptWindow } = await import("./window/oakscript/OakScriptWindow");
+    render(() => <OakScriptWindow />, document.getElementById("root") as HTMLElement);
+    hideSplash();
+    return;
+  }
+  // An embedded widget (#339) holds that widget only (index.html shows no splash in an embed).
+  const embed = embedConfig();
+  if (embed && embed.widget !== "chart") {
+    const { EmbedWidget } = await import("./embed/widgets/EmbedWidget");
+    render(() => <EmbedWidget config={embed} />, document.getElementById("root") as HTMLElement);
+    const { initAnalytics } = await import("./data/analytics");
+    initAnalytics();
     return;
   }
   const { default: App } = await import("./App");

@@ -145,3 +145,44 @@ describe("future bars of the time scale (#184)", () => {
     expect(list).toEqual([ny(2026, 11, 27), ny(2026, 11, 30), ny(2026, 12, 1)]);
   });
 });
+
+describe("future bars of a source whose bars ignore the session open (#340)", () => {
+  // A broker terminal's gold: trading 18:01-16:58 New York, bars on the server clock whose day starts at 17:00.
+  const gold = new SessionSpec(NY, "1801-1658:23456");
+  const grid = (sec: number, step: number) => {
+    const day = Math.floor((sec - 5 * 3600) / 86400);
+    let anchor = localToUtc(NY, day, 17 * 60);
+    if (anchor > sec) anchor = localToUtc(NY, day - 1, 17 * 60);
+    return anchor + Math.floor((sec - anchor) / step) * step;
+  };
+
+  it("the next session's bars start on the grid, from the bar that holds its open", () => {
+    // the last 5-minute bar: Tuesday 10/11/2026 16:55, then the 16:58 close; Wednesday's trading day opens at 18:01
+    const times = sessionFutureTimes("5", gold, ny(2026, 11, 10, 16, 55), 3, grid);
+    expect(times).toEqual([ny(2026, 11, 10, 18, 0), ny(2026, 11, 10, 18, 5), ny(2026, 11, 10, 18, 10)]);
+    expect(sessionFutureTimes("5", gold, ny(2026, 11, 10, 16, 55), 1)).toEqual([ny(2026, 11, 10, 18, 1)]);
+  });
+
+  it("two sessions that open inside one grid bar give that bar once", () => {
+    // DE40 at a broker: 00:02-02:15 and 02:16-22:59 Athens, bars on the server clock from midnight
+    const AT = "Europe/Athens";
+    const de40 = new SessionSpec(AT, "0002-0215,0216-2259:23456");
+    const day = dayOf(2026, 11, 17);
+    const at = (h: number) => localToUtc(AT, day, h * 60);
+    const midnight = (sec: number, step: number) => {
+      const anchor = localToUtc(AT, Math.floor((sec + 2 * 3600) / 86400), 0);
+      return anchor + Math.floor((sec - anchor) / step) * step;
+    };
+    const lastMonday = localToUtc(AT, day - 1, 20 * 60);
+    expect(sessionFutureTimes("240", de40, lastMonday, 6, midnight)).toEqual([at(0), at(4), at(8), at(12), at(16), at(20)]);
+    // Monday's 21:00 and 22:00, then Tuesday: the 02:00 bar holds both the 02:15 close and the 02:16 open
+    expect(sessionFutureTimes("60", de40, lastMonday, 6, midnight)).toEqual([at(-3), at(-2), at(0), at(1), at(2), at(3)]);
+  });
+
+  it("a time is drawn on the grid bar that holds it", () => {
+    const axis = sessionFutureAxis("5", gold, gold, grid)!;
+    const last = ny(2026, 11, 10, 16, 55);
+    expect(axis.slots(ny(2026, 11, 10, 18, 7), last)).toBe(2);
+    expect(axis.time(2, last)).toBe(ny(2026, 11, 10, 18, 5));
+  });
+});

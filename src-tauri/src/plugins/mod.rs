@@ -2,18 +2,22 @@
  * Settings > Plugins: the plugins installed on this computer, from the catalog or from a file, and the Plugin API they
  * connect to (`opentrader_core::plugins::hub`, plugins/PROTOCOL.md).
  *
- * A plugin lives in `<app data>/plugins/<id>/` (its package unpacked); its state (enabled, token, settings, the files
- * its installation copied elsewhere) in `plugins.json` of the config folder. While at least one plugin is enabled the
+ * A plugin lives in `<app data>/plugins/<id>/` (its package unpacked) and keeps its own files in
+ * `<app data>/plugin-data/<id>/`; its state (enabled, token, settings, the files its installation copied elsewhere) in
+ * `plugins.json` of the config folder, its password settings in the system's credential store. While at least one
+ * plugin is enabled the
  * API listens on 127.0.0.1. An enabled `process` plugin is started here and started again when it stops; an `external`
  * one runs inside another application and finds the address and its token in the connection file written for it.
  */
 pub mod broker;
 pub mod data;
+pub mod events;
+pub mod fields;
 mod package;
 
 use opentrader_core::files;
 use opentrader_core::plugins::hub::{Allowed, Hub, HubEvent};
-use opentrader_core::plugins::manifest::{self, Manifest, Runtime};
+use opentrader_core::plugins::manifest::{self, Capability, Manifest, Runtime, SettingKind};
 use opentrader_core::plugins::API_VERSION;
 use opentrader_core::sync::LockExt;
 use package::CatalogEntry;
@@ -71,6 +75,8 @@ struct PluginConfig {
     verified: bool,
     /// A broker plugin's tickers for chart symbols, set by the user ("NASDAQ:AAPL" → "AAPL.US").
     symbol_map: BTreeMap<String, String>,
+    /// What the plugin provides that the user turned off (chart data or trading of a plugin that offers both).
+    off: Vec<Capability>,
 }
 
 /// One installed plugin, as Settings shows it.
@@ -89,6 +95,10 @@ pub struct PluginInfo {
     pub settings: BTreeMap<String, String>,
     pub copied: Vec<String>,
     pub symbol_map: BTreeMap<String, String>,
+    /// The password settings that have a value in the credential store (the values never leave the app's backend).
+    pub saved_secrets: Vec<String>,
+    /// What the user turned off of what the manifest provides.
+    pub off: Vec<Capability>,
     /// Runs on this computer.
     pub supported: bool,
 }
@@ -118,9 +128,65 @@ pub struct PackagePreview {
 #[derive(Clone, Serialize, Deserialize, specta::Type, Event)]
 pub struct PluginsChanged;
 
+/// A plugin asks the user something, or shows a message until it sends `PluginPromptDone` (`plugin.prompt`).
+#[derive(Clone, Serialize, Deserialize, specta::Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginPrompt {
+    pub plugin: String,
+    /// The plugin's name, for the dialog.
+    pub plugin_name: String,
+    pub id: String,
+    pub title: String,
+    pub message: String,
+    /// "text" or "password": the field of the answer; none for a message alone.
+    pub input: Option<String>,
+    /// A PNG picture, base64.
+    pub image: Option<String>,
+}
+
+/// A plugin's short message that goes away by itself (`plugin.toast`).
+#[derive(Clone, Serialize, Deserialize, specta::Type, Event)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginToast {
+    pub plugin: String,
+    /// The plugin's name, the toast's title.
+    pub plugin_name: String,
+    /// "info", "warn" or "error".
+    pub level: String,
+    pub message: String,
+    /// Play the notification sound.
+    pub sound: bool,
+}
+
+/// The toast of a `plugin.toast`: none without a message. Unknown levels read as info; a long text is cut, a toast is
+/// a short message.
+fn plugin_toast(plugin: String, plugin_name: String, params: &serde_json::Value) -> Option<PluginToast> {
+    const MAX_CHARS: usize = 300;
+    let message = params.get("message").and_then(|v| v.as_str()).map(str::trim).filter(|m| !m.is_empty())?;
+    let message = match message.char_indices().nth(MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &message[..cut]),
+        None => message.to_string(),
+    };
+    let level = match params.get("level").and_then(|v| v.as_str()) {
+        Some(l @ ("warn" | "error")) => l,
+        _ => "info",
+    };
+    let sound = params.get("sound").and_then(|v| v.as_bool()).unwrap_or(false);
+    Some(PluginToast { plugin, plugin_name, level: level.to_string(), message, sound })
+}
+
+/// The plugin closed its prompt (`plugin.promptDone`).
+#[derive(Clone, Serialize, Deserialize, specta::Type, Event)]
+pub struct PluginPromptDone {
+    pub plugin: String,
+    pub id: String,
+}
+
 pub struct Plugins {
     pub hub: Hub,
     pub data: data::PluginData,
+    pub events: events::PluginEvents,
+    pub fields: fields::PluginFields,
     pub broker: broker::PluginBroker,
     config: Mutex<Config>,
     error: Mutex<Option<String>>,
@@ -135,6 +201,38 @@ pub struct Plugins {
 
 fn plugins_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path().app_data_dir().map(|d| d.join("plugins")).map_err(|e| e.to_string())
+}
+
+/// The plugin's own files (`OPENTRADER_PLUGIN_DATA`), kept across updates and removed with the plugin.
+fn data_dir(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
+    app.path().app_data_dir().map(|d| d.join("plugin-data").join(id)).map_err(|e| e.to_string())
+}
+
+fn secret(app: &AppHandle, id: &str, key: &str) -> keyring::Result<keyring::Entry> {
+    keyring::Entry::new(&app.config().identifier, &format!("plugin:{id}:{key}"))
+}
+
+fn read_secret(app: &AppHandle, id: &str, key: &str) -> Option<String> {
+    match secret(app, id, key).and_then(|e| e.get_password()) {
+        Ok(v) => Some(v),
+        Err(keyring::Error::NoEntry) => None,
+        Err(e) => {
+            log(app, id, format!("Could not read the setting {key} from the credential store: {e}"));
+            None
+        }
+    }
+}
+
+fn forget_secret(app: &AppHandle, id: &str, key: &str) -> Result<(), String> {
+    match secret(app, id, key).and_then(|e| e.delete_credential()) {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("The credential store refused: {e}")),
+    }
+}
+
+/// The manifest's password settings.
+fn secret_keys(m: &Manifest) -> Vec<String> {
+    m.settings.iter().filter(|f| f.kind == SettingKind::Password).map(|f| f.key.clone()).collect()
 }
 
 fn read_config(app: &AppHandle) -> Config {
@@ -170,6 +268,17 @@ pub fn installed_manifest(app: &AppHandle, id: &str) -> Option<Manifest> {
     installed(app).into_iter().find(|m| m.id == id)
 }
 
+/// What the plugin provides and the user left on.
+fn in_use(m: &Manifest, off: &[Capability]) -> Vec<Capability> {
+    m.provides.iter().copied().filter(|c| !off.contains(c)).collect()
+}
+
+/// The plugin provides `c` and the user left it on.
+pub fn uses(app: &AppHandle, m: &Manifest, c: Capability) -> bool {
+    let off = app.state::<Plugins>().config.locked().plugins.get(&m.id).map(|p| p.off.clone()).unwrap_or_default();
+    in_use(m, &off).contains(&c)
+}
+
 fn log(app: &AppHandle, id: &str, line: impl Into<String>) {
     let state = app.state::<Plugins>();
     let mut logs = state.logs.locked();
@@ -194,7 +303,10 @@ fn status(app: &AppHandle) -> PluginsStatus {
         .map(|m| {
             let c = config.plugins.get(&m.id).cloned().unwrap_or_default();
             let hello = state.hub.connected(&m.id);
+            let saved_secrets = secret_keys(&m).into_iter().filter(|k| read_secret(app, &m.id, k).is_some()).collect();
             PluginInfo {
+                saved_secrets,
+                off: c.off.clone(),
                 verified: c.verified,
                 enabled: c.enabled,
                 connected: hello.is_some(),
@@ -216,6 +328,8 @@ pub fn init(app: &AppHandle) {
     app.manage(Plugins {
         hub: Hub::new(),
         data: Default::default(),
+        events: Default::default(),
+        fields: Default::default(),
         broker: Default::default(),
         config: Mutex::new(read_config(app)),
         error: Mutex::new(None),
@@ -232,12 +346,47 @@ pub fn init(app: &AppHandle) {
             match events.recv().await {
                 Ok(HubEvent::Connected { plugin, hello }) => {
                     log(&handle, &plugin, format!("Connected (version {}, API {})", hello.version, hello.api));
+                    // The settings go first: a plugin may only know its symbols once it has them (#371: the
+                    // OpenAlgo plugin dropped a watchlist subscription that came before its exchanges). The
+                    // subscriptions follow from this same task, so they reach the plugin in this order.
                     configure(&handle, &plugin);
+                    data::connected(&handle, &plugin);
+                    broker::connected(&handle, &plugin);
                     changed(&handle);
                 }
                 Ok(HubEvent::Disconnected { plugin }) => {
                     log(&handle, &plugin, "Disconnected");
                     changed(&handle);
+                }
+                Ok(HubEvent::Notification { plugin, method, params }) if method == "plugin.prompt" => {
+                    let text = |k: &str| params.get(k).and_then(|v| v.as_str()).map(str::to_string);
+                    let Some(id) = text("id") else { continue };
+                    let plugin_name = installed_manifest(&handle, &plugin).map(|m| m.name).unwrap_or_else(|| plugin.clone());
+                    let _ = PluginPrompt {
+                        input: text("input").filter(|i| i == "text" || i == "password"),
+                        title: text("title").unwrap_or_default(),
+                        message: text("message").unwrap_or_default(),
+                        image: text("image"),
+                        plugin,
+                        plugin_name,
+                        id,
+                    }
+                    .emit(&handle);
+                }
+                Ok(HubEvent::Notification { plugin, method, params }) if method == "plugin.promptDone" => {
+                    if let Some(id) = params.get("id").and_then(|v| v.as_str()) {
+                        let _ = PluginPromptDone { plugin, id: id.to_string() }.emit(&handle);
+                    }
+                }
+                Ok(HubEvent::Notification { plugin, method, params }) if method == "plugin.toast" => {
+                    let plugin_name = installed_manifest(&handle, &plugin).map(|m| m.name).unwrap_or_else(|| plugin.clone());
+                    match plugin_toast(plugin.clone(), plugin_name, &params) {
+                        Some(t) => {
+                            log(&handle, &plugin, format!("[toast {}] {}", t.level, t.message));
+                            let _ = t.emit(&handle);
+                        }
+                        None => log(&handle, &plugin, "[error] plugin.toast: no message"),
+                    }
                 }
                 Ok(HubEvent::Notification { plugin, method, params }) if method == "log" => {
                     let level = params.get("level").and_then(|v| v.as_str()).unwrap_or("info");
@@ -255,16 +404,21 @@ pub fn init(app: &AppHandle) {
     apply(app);
 }
 
-/// Send the plugin its settings (`plugin.configure`).
+/// Send the plugin its settings and what it is used for (`plugin.configure`).
 fn configure(app: &AppHandle, id: &str) {
     let state = app.state::<Plugins>();
-    let settings = state.config.locked().plugins.get(id).map(|c| c.settings.clone()).unwrap_or_default();
+    let (settings, off) = state.config.locked().plugins.get(id).map(|c| (c.settings.clone(), c.off.clone())).unwrap_or_default();
     let defaults: BTreeMap<String, String> = installed_manifest(app, id)
         .map(|m| m.settings.into_iter().filter_map(|f| f.default.map(|d| (f.key, d))).collect())
         .unwrap_or_default();
     let mut all = defaults;
     all.extend(settings);
-    let _ = state.hub.notify(id, "plugin.configure", serde_json::json!({ "settings": all }));
+    for key in installed_manifest(app, id).map(|m| secret_keys(&m)).unwrap_or_default() {
+        let value = read_secret(app, id, &key).unwrap_or_default();
+        all.insert(key, value);
+    }
+    let provides = installed_manifest(app, id).map(|m| in_use(&m, &off)).unwrap_or_default();
+    let _ = state.hub.notify(id, "plugin.configure", serde_json::json!({ "settings": all, "provides": provides }));
 }
 
 /// Make the running state follow the config: the plugins allowed in, the API listening or not, the connection files,
@@ -278,16 +432,18 @@ fn apply(app: &AppHandle) {
         .filter(|m| m.supported_here() && config.plugins.get(&m.id).is_some_and(|c| c.enabled && !c.token.is_empty()))
         .collect();
     // The exchanges of the enabled data plugins: their symbols go to them (`data::route`).
-    let feeds: Vec<&&Manifest> = enabled.iter().filter(|m| m.provides(manifest::Capability::Datafeed)).collect();
+    let off = |id: &str| config.plugins.get(id).map(|p| p.off.clone()).unwrap_or_default();
+    let feeds: Vec<&&Manifest> = enabled.iter().filter(|m| in_use(m, &off(&m.id)).contains(&Capability::Datafeed)).collect();
     data::set_exchanges(
         app,
         feeds.iter().flat_map(|m| m.data_exchanges().into_iter().map(|e| (e, m.id.clone()))).collect(),
         feeds.iter().filter(|m| m.whole_symbols()).map(|m| m.id.clone()).collect(),
+        manifests.iter().filter(|m| m.provides.contains(&Capability::Datafeed)).flat_map(|m| m.data_exchanges()).collect(),
     );
     state.hub.set_allowed(
         enabled
             .iter()
-            .map(|m| Allowed { id: m.id.clone(), token: config.plugins[&m.id].token.clone(), provides: m.provides.clone() })
+            .map(|m| Allowed { id: m.id.clone(), token: config.plugins[&m.id].token.clone(), provides: in_use(m, &off(&m.id)) })
             .collect(),
     );
     if enabled.is_empty() {
@@ -359,6 +515,10 @@ fn stop_process(app: &AppHandle, id: &str) {
 /// stopped.
 fn start_process(app: &AppHandle, m: &Manifest, entry: &str, args: &[String], port: u16, token: &str) {
     let Ok(dir) = plugins_dir(app).map(|d| d.join(&m.id)) else { return };
+    let Ok(data) = data_dir(app, &m.id) else { return };
+    if let Err(e) = std::fs::create_dir_all(&data) {
+        log(app, &m.id, format!("Could not create {}: {e}", data.display()));
+    }
     let exe = dir.join(entry);
     let (tx, mut stop) = oneshot::channel::<()>();
     app.state::<Plugins>().processes.locked().insert(m.id.clone(), tx);
@@ -372,6 +532,7 @@ fn start_process(app: &AppHandle, m: &Manifest, entry: &str, args: &[String], po
                 .env("OPENTRADER_PLUGIN_ADDR", format!("127.0.0.1:{port}"))
                 .env("OPENTRADER_PLUGIN_ID", &id)
                 .env("OPENTRADER_PLUGIN_TOKEN", &token)
+                .env("OPENTRADER_PLUGIN_DATA", &data)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -486,7 +647,16 @@ fn install(app: &AppHandle, bytes: &[u8], verified: bool) -> Result<Manifest, St
     let dir = plugins_dir(app)?.join(&m.id);
     // A running program holds its files: stop it while they are replaced.
     stop_process(app, &m.id);
-    package::unpack(bytes, &dir)?;
+    // The program takes a moment to exit and let go of its files: an update tried at once found them in use.
+    let mut unpacked = package::unpack(bytes, &dir);
+    for _ in 0..20 {
+        if unpacked.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        unpacked = package::unpack(bytes, &dir);
+    }
+    unpacked?;
     let state = app.state::<Plugins>();
     // An update refreshes the files its installation copied elsewhere (same names, same folders).
     let copied = state.config.locked().plugins.get(&m.id).map(|p| p.copied.clone()).unwrap_or_default();
@@ -654,15 +824,68 @@ pub fn plugin_set_enabled(app: AppHandle, id: String, enabled: bool) -> Result<P
     Ok(status(&app))
 }
 
-/// The plugin's settings (its manifest's fields); a connected plugin gets them at once.
+/// The plugin's settings (its manifest's fields); a connected plugin gets them at once. A password setting goes to
+/// the credential store; left empty, the saved one is kept.
 #[tauri::command]
 #[specta::specta]
 pub fn plugin_set_settings(app: AppHandle, id: String, settings: BTreeMap<String, String>) -> Result<PluginsStatus, String> {
     let m = installed_manifest(&app, &id).ok_or_else(|| format!("{id} is not installed"))?;
-    let settings = settings.into_iter().filter(|(k, _)| m.settings.iter().any(|f| &f.key == k)).collect();
-    update_plugin(&app, &id, |p| p.settings = settings)?;
+    let secrets = secret_keys(&m);
+    let mut plain = BTreeMap::new();
+    for (k, v) in settings.into_iter().filter(|(k, _)| m.settings.iter().any(|f| &f.key == k)) {
+        if !secrets.contains(&k) {
+            plain.insert(k, v);
+        } else if !v.is_empty() {
+            secret(&app, &id, &k)
+                .and_then(|e| e.set_password(&v))
+                .map_err(|e| format!("The credential store refused the password: {e}"))?;
+        }
+    }
+    update_plugin(&app, &id, |p| p.settings = plain)?;
     configure(&app, &id);
     Ok(status(&app))
+}
+
+/// Turn chart data or trading of a plugin that provides both on or off. One stays on: disable the plugin instead.
+#[tauri::command]
+#[specta::specta]
+pub fn plugin_set_capability(app: AppHandle, id: String, capability: Capability, on: bool) -> Result<PluginsStatus, String> {
+    let m = installed_manifest(&app, &id).ok_or_else(|| format!("{id} is not installed"))?;
+    let state = app.state::<Plugins>();
+    let mut off = state.config.locked().plugins.get(&id).map(|p| p.off.clone()).unwrap_or_default();
+    off.retain(|c| *c != capability);
+    if !on {
+        off.push(capability);
+    }
+    if in_use(&m, &off).is_empty() {
+        return Err("Keep chart data or trading on, or disable the plugin".into());
+    }
+    update_plugin(&app, &id, |p| p.off = off)?;
+    log(&app, &id, format!("{capability:?} {}", if on { "on" } else { "off" }));
+    apply(&app);
+    // As on connection: the settings first, then what the app subscribes to (only to what is on).
+    configure(&app, &id);
+    if on {
+        data::connected(&app, &id);
+        broker::connected(&app, &id);
+    }
+    Ok(status(&app))
+}
+
+/// Forget a saved password setting.
+#[tauri::command]
+#[specta::specta]
+pub fn plugin_forget_secret(app: AppHandle, id: String, key: String) -> Result<PluginsStatus, String> {
+    forget_secret(&app, &id, &key)?;
+    configure(&app, &id);
+    Ok(status(&app))
+}
+
+/// The user's answer to a plugin's prompt; None: they cancelled.
+#[tauri::command]
+#[specta::specta]
+pub fn plugin_prompt_answer(app: AppHandle, plugin: String, id: String, value: Option<String>) {
+    let _ = app.state::<Plugins>().hub.notify(&plugin, "plugin.promptAnswer", serde_json::json!({ "id": id, "value": value }));
 }
 
 /// A new token: the plugin is disconnected and must connect with the new one (its connection file is rewritten).
@@ -692,6 +915,12 @@ pub async fn plugin_remove(app: AppHandle, id: String) -> Result<PluginsStatus, 
     }
     for f in removed.map(|p| p.copied).unwrap_or_default() {
         let _ = std::fs::remove_file(f);
+    }
+    for key in secret_keys(&m) {
+        let _ = forget_secret(&app, &id, &key);
+    }
+    if let Ok(data) = data_dir(&app, &id) {
+        let _ = std::fs::remove_dir_all(data);
     }
     let dir = plugins_dir(&app)?.join(&id);
     // The program may take a moment to let go of its files.
@@ -781,5 +1010,28 @@ mod tests {
         let updater = serde_json::json!({ "endpoints": ["https://github.com/o/r/releases/latest/download/latest.json"] });
         assert_eq!(catalog_url_of(Some(&updater)).as_deref(), Some("https://github.com/o/r/releases/latest/download/catalog.json"));
         assert_eq!(catalog_url_of(None), None);
+    }
+
+    use serde_json::json;
+
+    fn toast(params: serde_json::Value) -> Option<PluginToast> {
+        plugin_toast("p".into(), "P".into(), &params)
+    }
+
+    #[test]
+    fn toast_reads_level_message_and_sound() {
+        let t = toast(json!({"level":"error","message":" Halted ","sound":true})).unwrap();
+        assert_eq!((t.level.as_str(), t.message.as_str(), t.sound, t.plugin_name.as_str()), ("error", "Halted", true, "P"));
+        let t = toast(json!({"level":"loud","message":"x"})).unwrap();
+        assert_eq!((t.level.as_str(), t.sound), ("info", false));
+    }
+
+    #[test]
+    fn toast_needs_a_message_and_cuts_a_long_one() {
+        assert!(toast(json!({"level":"info"})).is_none());
+        assert!(toast(json!({"message":"   "})).is_none());
+        let t = toast(json!({"message":"é".repeat(400)})).unwrap();
+        assert_eq!(t.message.chars().count(), 301);
+        assert!(t.message.ends_with('…'));
     }
 }

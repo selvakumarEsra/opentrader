@@ -75,9 +75,11 @@ import { ScriptScreener } from "./ScriptScreener";
 import { scriptScreenStore } from "../../data/script-screen-store";
 import { bareTicker, type ScriptColumn, type ScriptRow } from "../../data/script-screen";
 import { watchlistStore } from "../../data/watchlist-store";
+import { MAX_LIST_ITEMS, listFull } from "../../data/watchlist-limit";
 import { promptNewWatchlist } from "../right-rail/watchlist-prompts";
 import { scriptResultsCsv } from "./script-csv";
-import { csvFileName, downloadText } from "./screener-csv";
+import { csvFileName } from "./screener-csv";
+import { saveFile } from "../../data/save-file";
 import { showConfirm, showNotice, showRename } from "../../components/Dialogs";
 import { translateWith } from "../../i18n/translator";
 
@@ -130,7 +132,7 @@ export function ScreenerPanel(props: Props) {
   let scriptNames: () => ReadonlyMap<string, string> = () => new Map();
   const downloadCsv = () => {
     trackScreener("screener_exported", { screener: "script", to: "csv" });
-    downloadText(csvFileName(scriptScreenStore.current()?.name ?? "Script screener"), scriptResultsCsv(scriptRows(), scriptColumns(), scriptNames()));
+    void saveFile(csvFileName(scriptScreenStore.current()?.name ?? "Script screener"), scriptResultsCsv(scriptRows(), scriptColumns(), scriptNames()));
   };
   /** Move the screener: the main window shows it in its new place (App opens its own window for "window"). From its
    *  own window: the main window is told (event), then the window closes. */
@@ -187,6 +189,8 @@ export function ScreenerPanel(props: Props) {
   const saveAsWatchlist = () => {
     trackScreener("screener_exported", { screener: "script", to: "watchlist" });
     const rows = scriptRows().filter((r) => !r.error);
+    // Too many results for one list: the warning before the name is asked.
+    if (rows.length > MAX_LIST_ITEMS) return listFull();
     promptNewWatchlist((name) =>
       watchlistStore.createListWith(
         rows.map((r) => ({ ticker: r.symbol, short: bareTicker(r.symbol), last: "—", changePercent: "0.00%", prePostChange: "0.00%", flag: null })),

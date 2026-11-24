@@ -95,6 +95,48 @@ pub struct BrokerCapabilities {
     pub position_brackets: bool,
     pub partial_close: bool,
     pub modify_orders: bool,
+    /// The times in force the order ticket offers.
+    pub durations: Vec<OrderDuration>,
+    /// The broker's own choices with each order (trading outside regular hours).
+    pub ticket_fields: Vec<TicketField>,
+    /// The order ticket asks `broker.previewOrder` (a what-if order) before sending an order.
+    pub order_preview: bool,
+}
+
+/// A choice of the order ticket's Extra settings (`capabilities.ticketFields`): a checkbox here, "true" / "false".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketField {
+    pub id: String,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// A selector's choices (the routes), none for a checkbox.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub options: Vec<FieldOption>,
+    /// The value picked at first.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub default: Option<String>,
+    /// The order types it applies to; all of them when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub order_types: Vec<OrderType>,
+    /// "takeProfit" / "stopLoss": shown and sent only while the order has that exit.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub exit: Option<String>,
+}
+
+/// A time in force (`capabilities.durations`): the id the order carries and `orders[].duration` reports.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderDuration {
+    pub id: String,
+    pub label: String,
+    /// The order types it applies to; all of them when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub order_types: Vec<OrderType>,
+    /// The one picked at first.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub default: bool,
 }
 
 impl Default for BrokerCapabilities {
@@ -105,6 +147,9 @@ impl Default for BrokerCapabilities {
             position_brackets: true,
             partial_close: true,
             modify_orders: true,
+            durations: crate::orders::durations(),
+            ticket_fields: crate::orders::ticket_fields(),
+            order_preview: true,
         }
     }
 }
@@ -204,4 +249,32 @@ pub struct OrderTicket {
     pub take_profit: Option<f64>,
     #[serde(default)]
     pub stop_loss: Option<f64>,
+    /// The time in force picked (a `durations` id); left out by an app that has none to offer.
+    #[serde(default)]
+    pub duration: Option<String>,
+    /// The ticket fields' values (`ticketFields`): "outsideRth", "tpOutsideRth", "slOutsideRth" = "true" / "false".
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// How a ticker trades (`broker.instrument`): quantities in units, and the money one unit makes per price point.
+/// A field IB doesn't give is left out.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Instrument {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qty_min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qty_step: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_value: Option<f64>,
+    /// This ticker's choices, in place of the capabilities' (its routes, then the Outside RTH boxes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_fields: Option<Vec<TicketField>>,
 }

@@ -95,6 +95,7 @@ impl ReferenceProvider for GatewayProvider {
         if economics::is_economic(sym.exchange()) {
             return economic_info(sym).await;
         }
+        ticker_shape(sym, "ticker details")?;
         // Answered under the app's name, not the source's spelling.
         let mut info = market_rest::fetch_ticker_info(&ticker_case::to_source(sym.ticker())).await?;
         info.ticker = sym.ticker().to_string();
@@ -114,6 +115,7 @@ impl ReferenceProvider for GatewayProvider {
         if economics::is_economic(sym.exchange()) {
             return economic_snapshot(sym).await;
         }
+        ticker_shape(sym, "snapshot")?;
         let mut snapshot = market_rest::fetch_ticker_snapshot(&ticker_case::to_source(sym.ticker())).await?;
         snapshot.ticker = sym.ticker().to_string();
         Ok(snapshot)
@@ -126,19 +128,19 @@ impl ReferenceProvider for GatewayProvider {
         market_rest::search_tickers(query, type_filter).await
     }
     async fn dividends(&self, sym: &Symbol) -> Result<Vec<DividendEvent>> {
-        if economics::is_economic(sym.exchange()) {
+        if economics::is_economic(sym.exchange()) || !sym.could_be_ticker() {
             return Ok(Vec::new());
         }
         Ok(market_rest::dividend_events(&ticker_case::to_source(sym.ticker())).await?)
     }
     async fn splits(&self, sym: &Symbol) -> Result<Vec<SplitEvent>> {
-        if economics::is_economic(sym.exchange()) {
+        if economics::is_economic(sym.exchange()) || !sym.could_be_ticker() {
             return Ok(Vec::new());
         }
         Ok(market_rest::split_events(&ticker_case::to_source(sym.ticker())).await?)
     }
     async fn latest_news(&self, sym: &Symbol, limit: u32) -> Vec<NewsItem> {
-        if economics::is_economic(sym.exchange()) {
+        if economics::is_economic(sym.exchange()) || !sym.could_be_ticker() {
             return Vec::new();
         }
         market_rest::latest_news(&ticker_case::to_source(sym.ticker()), limit).await
@@ -150,25 +152,39 @@ impl ReferenceProvider for GatewayProvider {
         if economics::is_economic(sym.exchange()) {
             anyhow::bail!("an economic series has no fundamentals");
         }
+        ticker_shape(sym, "fundamentals")?;
         Ok(market_rest::fetch_fundamentals(&ticker_case::to_source(sym.ticker())).await?)
     }
     async fn filings(&self, sym: &Symbol, q: &FilingQuery) -> Result<FilingList> {
         if economics::is_economic(sym.exchange()) {
             anyhow::bail!("an economic series has no filings");
         }
+        ticker_shape(sym, "filings")?;
         Ok(market_rest::fetch_filings(&ticker_case::to_source(sym.ticker()), q).await?)
     }
     async fn filing_text(&self, sym: &Symbol, accn: &str, section: Option<&str>, offset: u32) -> Result<FilingText> {
         if economics::is_economic(sym.exchange()) {
             anyhow::bail!("an economic series has no filings");
         }
+        ticker_shape(sym, "filing")?;
         Ok(market_rest::fetch_filing_text(&ticker_case::to_source(sym.ticker()), accn, section, offset).await?)
     }
     async fn revenue_breakdown(&self, sym: &Symbol) -> Result<RevenueBreakdown> {
         if economics::is_economic(sym.exchange()) {
             anyhow::bail!("an economic series has no revenue breakdown");
         }
+        ticker_shape(sym, "revenue breakdown")?;
         Ok(market_rest::fetch_revenue_breakdown(&ticker_case::to_source(sym.ticker())).await?)
+    }
+}
+
+/// A symbol that cannot name a security is answered "unknown" without asking
+/// the gateway (#355).
+fn ticker_shape(sym: &Symbol, what: &'static str) -> Result<()> {
+    if sym.could_be_ticker() {
+        Ok(())
+    } else {
+        Err(gateway::ApiError::unknown_symbol(what).into())
     }
 }
 
@@ -221,6 +237,8 @@ fn us_equity_session() -> SymbolSession {
                 holidays: trading_calendar::holidays_spec(from, to),
                 corrections: format!("0930-1300:{early}"),
                 intervals: Vec::new(),
+                bar_origin: None,
+                point_value: None,
             }
         })
         .clone()
@@ -287,6 +305,8 @@ async fn economic_session(sym: &Symbol) -> Result<SymbolSession> {
         minmov: 1,
         variable_tick_size: String::new(),
         intervals: Vec::new(),
+        bar_origin: None,
+        point_value: None,
     })
 }
 

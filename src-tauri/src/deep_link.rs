@@ -1,7 +1,9 @@
 /*
  * Deep links (#233): `opentrader://post/<id>` from the Community website
  * ("Open in OpenTrader" on a post's chart) brings the app forward and opens
- * the post in the Community panel, its shared chart on the active chart.
+ * the post in the Community panel, its shared chart on the active chart;
+ * `opentrader://chart?symbol=…&interval=…` (#350) opens a new chart tab
+ * (src/data/deep-link.ts reads them).
  *
  *  - One app at a time (single-instance plugin): a link clicked while the
  *    app runs reaches the running app instead of starting a second one, and
@@ -36,9 +38,14 @@ pub fn ours<'a>(urls: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     urls.into_iter().filter(|u| u.starts_with(&format!("{SCHEME}://"))).map(str::to_string).collect()
 }
 
-/// The window links go to: main, or the first window when main was closed.
+/// The window links go to: main, or the first chart window when main was closed.
 fn target(app: &AppHandle) -> Option<tauri::WebviewWindow> {
-    app.get_webview_window("main").or_else(|| app.webview_windows().into_values().next())
+    app.get_webview_window("main").or_else(|| {
+        app.webview_windows()
+            .into_iter()
+            .find(|(label, _)| !crate::window_session::is_aux_window(label))
+            .map(|(_, w)| w)
+    })
 }
 
 /// Brings the app's window forward (a link, or a second launch).

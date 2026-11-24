@@ -1,12 +1,13 @@
 /*
  * Settings > About: version, update status and notices.
  */
-import { createSignal, onMount, Show, type JSX } from "solid-js";
+import { createSignal, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { Icon } from "../../../components/Icon";
 import { appUpdateStatus, buildInfo, checkForUpdates, installUpdate } from "../../../data/app-update";
-import type { BuildInfo } from "../../../bindings";
+import type { BuildInfo, UpdateFailure } from "../../../bindings";
 import { COMMUNITY_ENABLED, COMMUNITY_URL } from "../../../data/community/api";
 import { ECONOMIC_DATA_NOTICE, ECONOMIC_DATA_TERMS_URL } from "../../../data/economic-notice";
+import { diagnosticsText } from "../../../data/diagnostics";
 import { openLink } from "./io";
 import { translateWith } from "../../../i18n/translator";
 
@@ -30,6 +31,7 @@ export function AboutTab() {
         <UpdateAppBlock />
       </Show>
       <div class="app-settings-about-copyright">Copyright © 2026 OpenTrader</div>
+      <ReportProblem version={info()?.version} />
       <Show when={COMMUNITY_ENABLED}>
         <SuggestLink />
       </Show>
@@ -49,6 +51,46 @@ function EconomicDataNotice() {
           FRED® API Terms of Use
         </a>
         .
+      </div>
+    </div>
+  );
+}
+
+const NEW_BUG = "https://github.com/deepentropy/opentrader/issues/new?template=bug_report.yml";
+/** GitHub reads a form field's value from the address; past this length it refuses the page. */
+const MAX_URL = 7500;
+
+/** A bug report with what a fix needs to reproduce it: the issue form opened with the diagnostic info filled in, or
+ *  the info copied to paste (in an issue, or for a coding agent writing one: its get_diagnostics tool gives the same). */
+function ReportProblem(props: { version?: string }) {
+  const [copied, setCopied] = createSignal(false);
+  let timer: number | undefined;
+  onCleanup(() => window.clearTimeout(timer));
+  const copy = () =>
+    void diagnosticsText()
+      .then((text) => navigator.clipboard.writeText(text))
+      .then(() => {
+        setCopied(true);
+        window.clearTimeout(timer);
+        timer = window.setTimeout(() => setCopied(false), 2000);
+      })
+      .catch((e) => console.warn("[about] copy diagnostic info failed", e));
+  const report = () =>
+    void diagnosticsText().then((text) => {
+      let url = `${NEW_BUG}&diagnostics=${encodeURIComponent(text)}`;
+      if (props.version) url += `&version=${encodeURIComponent(props.version)}`;
+      openLink(url.length > MAX_URL ? NEW_BUG : url, "bug report");
+    });
+  return (
+    <div class="app-settings-about-report">
+      <span class="app-settings-about-notice">Found a bug? The report opens with the diagnostic info of this window filled in: check it before posting.</span>
+      <div class="app-settings-about-report-buttons">
+        <button type="button" class="app-settings-btn" onClick={report}>
+          Report a bug
+        </button>
+        <button type="button" class="app-settings-btn" onClick={copy}>
+          {copied() ? "Copied" : "Copy diagnostic info"}
+        </button>
       </div>
     </div>
   );
@@ -76,11 +118,20 @@ function SuggestLink() {
   );
 }
 
+/** Why the update check failed, under "Couldn't check for updates" (not in the reference app: a
+ *  proxy that the update can't use was invisible, #399). Other: the error itself. */
+const FAILURE_TEXT: Record<Exclude<UpdateFailure, "other">, string> = {
+  proxy: "The proxy of Settings > Network couldn't reach the update server",
+  connection: "No connection to the update server",
+  timeout: "The update server didn't answer in time",
+  server: "The update server didn't send the update",
+};
+
 /** The reference app's About update status block (`update-app`): one row per update state,
- *  "Relaunch" once the new version is downloaded. Error shows as up to date,
- *  like the reference app. */
+ *  "Relaunch" once the new version is downloaded. */
 function UpdateAppBlock() {
   const state = () => appUpdateStatus().state;
+  const failure = () => (state() === "error" ? appUpdateStatus().error : null);
   const view = (): { text: string; icon: JSX.Element } => {
     switch (state()) {
       case "checking":
@@ -103,7 +154,16 @@ function UpdateAppBlock() {
     <div class={`update-app ${state()}`}>
       <div class="update-app-text-container">
         <div class="update-app-status-icon">{view().icon}</div>
-        <span class="update-app-status-text">{view().text}</span>
+        <div class="update-app-status">
+          <span class="update-app-status-text">{view().text}</span>
+          <Show when={failure()}>
+            {(f) => (
+              <Show when={f().reason !== "other"} fallback={<span class="update-app-status-reason" data-no-translate>{f().detail}</span>}>
+                <span class="update-app-status-reason">{FAILURE_TEXT[f().reason as keyof typeof FAILURE_TEXT]}</span>
+              </Show>
+            )}
+          </Show>
+        </div>
       </div>
       <Show when={state() === "installing"}>
         <UpdateSpinner />

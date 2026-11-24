@@ -18,8 +18,16 @@ pub struct Symbol {
     ticker: String,
 }
 
+/// See `Symbol::could_be_ticker`; also takes the source's spelling ("BACpB").
+pub fn could_be_ticker(t: &str) -> bool {
+    t.len() <= 20
+        && t.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && t.chars().any(|c| c.is_ascii_alphabetic())
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '/'))
+}
+
 impl Symbol {
-    /// "NASDAQ:AAPL" → (NASDAQ, AAPL); a bare "AAPL" → ("", AAPL).
+    /// "NASDAQ:AAPL" → (NASDAQ, AAPL); a bare "AAPL" → ("", AAPL). Uppercased.
     pub fn parse(symbol: &str) -> Self {
         let s = symbol.trim().to_uppercase();
         match s.split_once(':') {
@@ -39,6 +47,14 @@ impl Symbol {
 
     pub fn ticker(&self) -> &str {
         &self.ticker
+    }
+
+    /// The ticker can name a listed security: letters, digits and `.` `-` `/`
+    /// (share classes, preferreds, units), starting with a letter or a digit
+    /// and holding a letter. A word with a space or a quote, or a number (a
+    /// table's cells uploaded as a watchlist, #355), is never asked for.
+    pub fn could_be_ticker(&self) -> bool {
+        could_be_ticker(&self.ticker)
     }
 }
 
@@ -90,5 +106,15 @@ mod tests {
     fn another_ticker_keeps_the_exchange() {
         let s = Symbol::parse("NASDAQ:META").with_ticker(" fb");
         assert_eq!(s.to_string(), "NASDAQ:FB");
+    }
+
+    #[test]
+    fn tells_tickers_from_table_cells() {
+        for t in ["AAPL", "BRK.B", "BAC/PB", "NASDAQ:MSFT", "X:BTCUSD", "C3IS", "DE40", "4DS"] {
+            assert!(Symbol::parse(t).could_be_ticker(), "{t}");
+        }
+        for t in ["-2.5939832", "-", "7103565945", "\"PRICE", "AMERICAN DEPOSITARY SHARES", "(1)", "%", "", "SHARE)"] {
+            assert!(!Symbol::parse(t).could_be_ticker(), "{t}");
+        }
     }
 }

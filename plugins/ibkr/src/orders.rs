@@ -3,7 +3,8 @@
  * (a bracket when it carries a take profit or stop loss), the exit orders of a position, and reading the broker's
  * order types, statuses and times back.
  */
-use crate::wire::{OrderStatus, OrderTicket, OrderType, Side};
+use crate::wire::{OrderDuration, OrderStatus, OrderTicket, OrderType, Side, TicketField};
+use ibapi::orders::OrderState;
 use ibapi::orders::{Action, OcaType, Order as IbOrder, OrderStatusKind, TimeInForce};
 
 /// Prefix of the one-cancels-all groups this plugin gives a position's exit orders, so they are found again as the
@@ -79,7 +80,135 @@ pub fn side_of(a: &Action) -> Side {
     }
 }
 
-/// The broker's order for a ticket. Market orders last the day; the others stay until cancelled, as on the chart.
+/// The times in force the order ticket offers (`capabilities.durations`): the day by default; at the opening and
+/// immediate or cancel for market and limit orders only, as the broker takes them.
+pub fn durations() -> Vec<OrderDuration> {
+    let d = |id: &str, label: &str, order_types: Vec<OrderType>, default: bool| OrderDuration { id: id.into(), label: label.into(), order_types, default };
+    let market_limit = || vec![OrderType::Market, OrderType::Limit];
+    vec![
+        d("day", "Day", vec![], true),
+        d("gtc", "Good Till Cancel", vec![], false),
+        d("opg", "At The Opening", market_limit(), false),
+        d("ioc", "Immediate or Cancel", market_limit(), false),
+    ]
+}
+
+/// The order ticket's Extra settings (reference: Outside RTH, and the same for the take profit and the stop loss): a
+/// market order never fills outside regular hours, so it has none.
+pub fn ticket_fields() -> Vec<TicketField> {
+    let check = |id: &str, label: &str, order_types: Vec<OrderType>, exit: Option<&str>| TicketField {
+        id: id.into(),
+        label: label.into(),
+        kind: "checkbox".into(),
+        options: Vec::new(),
+        default: None,
+        order_types,
+        exit: exit.map(String::from),
+    };
+    vec![
+        check("outsideRth", "Outside RTH", vec![OrderType::Limit, OrderType::Stop, OrderType::StopLimit], None),
+        check("tpOutsideRth", "Outside RTH Take Profit", vec![], Some("takeProfit")),
+        check("slOutsideRth", "Outside RTH Stop Loss", vec![], Some("stopLoss")),
+    ]
+}
+
+/// The venues IB lists for a contract that an order may be routed to (reference: its algo and internal venues left
+/// out), SMART first; one or none: no choice to make.
+pub fn routes(valid: &[String]) -> Vec<String> {
+    const SKIP: [&str; 8] = ["QBALGO", "IBEOS", "OVERNIGHT", "TPLUS0", "IBKRATS", "IBOPT", "JEFFALGO", "CSFBALGO"];
+    let mut out: Vec<String> = Vec::new();
+    for e in valid.iter().flat_map(|v| v.split(',')).map(|e| e.trim().to_ascii_uppercase()) {
+        if !e.is_empty() && !SKIP.contains(&e.as_str()) && !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    if let Some(i) = out.iter().position(|e| e == "SMART") {
+        let smart = out.remove(i);
+        out.insert(0, smart);
+    }
+    out
+}
+
+/// The ticket's "Routing" selector (reference: SMART when listed, else the first venue).
+pub fn routing_field(routes: &[String]) -> TicketField {
+    TicketField {
+        id: "route".into(),
+        label: "Routing".into(),
+        kind: "select".into(),
+        options: routes.iter().map(|r| crate::wire::FieldOption { value: r.clone(), label: r.clone() }).collect(),
+        default: routes.first().cloned(),
+        order_types: Vec::new(),
+        exit: None,
+    }
+}
+
+/// The venue an order picked, when the contract lists it; else none (SMART).
+pub fn route_of<'a>(t: &'a OrderTicket, routes: &[String]) -> Option<&'a str> {
+    t.fields.get("route").map(String::as_str).filter(|r| routes.iter().any(|x| x == r))
+}
+
+/// A ticket field ticked.
+fn ticked(t: &OrderTicket, id: &str) -> bool {
+    t.fields.get(id).is_some_and(|v| v == "true")
+}
+
+/// Some part of the order may fill outside regular trading hours.
+pub fn outside_rth_any(t: &OrderTicket) -> bool {
+    (ticked(t, "outsideRth") && t.order_type != OrderType::Market)
+        || (ticked(t, "tpOutsideRth") && t.take_profit.is_some())
+        || (ticked(t, "slOutsideRth") && t.stop_loss.is_some())
+}
+
+/// The preview's tables from a what-if answer (reference: commission, then equity with loan, initial and maintenance
+/// margin as current / change / after).
+pub fn preview_of(s: &OrderState, warnings: Vec<String>) -> serde_json::Value {
+    let money = |v: Option<f64>| finite(v).map(|x| format!("{x:.2}"));
+    let ccy = |c: &str| (!c.trim().is_empty()).then(|| c.trim().to_string());
+    let row = |label: &str, v: Option<String>, c: Option<String>| v.map(|value| serde_json::json!({ "label": label, "value": value, "currency": c }));
+    let mut sections = Vec::new();
+    let fee = ccy(&s.commission_currency);
+    let commission = match (finite(s.minimum_commission), finite(s.maximum_commission)) {
+        // A range when the broker can't tell yet (the fill splits the order).
+        (Some(lo), Some(hi)) if (hi - lo).abs() > 1e-9 && finite(s.commission).is_none() => Some(format!("{lo:.2} – {hi:.2}")),
+        _ => money(s.commission),
+    };
+    let first: Vec<_> = [row("Commission", commission, fee)].into_iter().flatten().collect();
+    if !first.is_empty() {
+        sections.push(serde_json::json!({ "rows": first }));
+    }
+    let margin = ccy(&s.margin_currency);
+    for (title, before, change, after) in [
+        ("Equity with loan", s.equity_with_loan_before, s.equity_with_loan_change, s.equity_with_loan_after),
+        ("Initial margin", s.initial_margin_before, s.initial_margin_change, s.initial_margin_after),
+        ("Maintenance margin", s.maintenance_margin_before, s.maintenance_margin_change, s.maintenance_margin_after),
+    ] {
+        let rows: Vec<_> = [("Current", before), ("Change", change), ("After", after)].into_iter().filter_map(|(l, v)| row(l, money(v), margin.clone())).collect();
+        if !rows.is_empty() {
+            sections.push(serde_json::json!({ "title": title, "rows": rows }));
+        }
+    }
+    let mut warnings = warnings;
+    if !s.warning_text.trim().is_empty() {
+        warnings.push(s.warning_text.trim().to_string());
+    }
+    let errors: Vec<String> = (!s.reject_reason.trim().is_empty()).then(|| s.reject_reason.trim().to_string()).into_iter().collect();
+    serde_json::json!({ "sections": sections, "warnings": warnings, "errors": errors })
+}
+
+/// The time in force of a ticket: the duration picked; without one (an app that offers none), market orders last the
+/// day and the others stay until cancelled, as on the chart.
+pub fn tif_of(t: &OrderTicket) -> TimeInForce {
+    match t.duration.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("day") => TimeInForce::Day,
+        Some("gtc") => TimeInForce::GoodTillCanceled,
+        Some("opg") => TimeInForce::OnOpen,
+        Some("ioc") => TimeInForce::ImmediateOrCancel,
+        _ if t.order_type == OrderType::Market => TimeInForce::Day,
+        _ => TimeInForce::GoodTillCanceled,
+    }
+}
+
+/// The broker's order for a ticket.
 pub fn build_order(t: &OrderTicket, account: &str) -> IbOrder {
     let (order_type, limit, stop) = match t.order_type {
         OrderType::Market => ("MKT", None, None),
@@ -93,7 +222,9 @@ pub fn build_order(t: &OrderTicket, account: &str) -> IbOrder {
         order_type: order_type.into(),
         limit_price: limit,
         aux_price: stop,
-        tif: if t.order_type == OrderType::Market { TimeInForce::Day } else { TimeInForce::GoodTillCanceled },
+        tif: tif_of(t),
+        // A market order never fills outside regular hours: the box is for the others.
+        outside_rth: ticked(t, "outsideRth") && t.order_type != OrderType::Market,
         account: account.to_string(),
         transmit: true,
         ..Default::default()
@@ -126,6 +257,11 @@ pub fn grouped_exit(leg: Leg, exit: Side, qty: f64, price: f64, account: &str, g
     IbOrder { oca_group: group.to_string(), oca_type: OcaType::ReduceWithBlock, ..exit_order(leg, exit, qty, price, account) }
 }
 
+/// The number of orders `bracket` makes of a ticket.
+pub fn bracket_size(t: &OrderTicket) -> usize {
+    1 + usize::from(t.take_profit.is_some()) + usize::from(t.stop_loss.is_some())
+}
+
 /// The orders of a ticket: the order itself, then its take profit and stop loss as child orders. The broker holds
 /// the children until the parent fills and cancels the other when one fills. Only the last one is transmitted, so
 /// the broker receives the bracket whole. `next_id` hands out order ids.
@@ -138,6 +274,7 @@ pub fn bracket(t: &OrderTicket, account: &str, mut next_id: impl FnMut() -> i32)
     for (leg, price) in [(Leg::TakeProfit, t.take_profit), (Leg::StopLoss, t.stop_loss)] {
         if let Some(p) = price {
             let mut child = exit_order(leg, exit, t.qty, p, account);
+            child.outside_rth = ticked(t, if leg == Leg::TakeProfit { "tpOutsideRth" } else { "slOutsideRth" });
             child.order_id = next_id();
             child.parent_id = parent_id;
             legs.push(child);
@@ -245,7 +382,29 @@ mod tests {
             stop_price: stop,
             take_profit: None,
             stop_loss: None,
+            duration: None,
+            fields: Default::default(),
         }
+    }
+
+    #[test]
+    fn the_duration_picked_is_the_time_in_force() {
+        let with = |d: &str, t: OrderType| tif_of(&OrderTicket { duration: Some(d.into()), ..ticket(t, Some(100.0), None) });
+        assert_eq!(with("day", OrderType::Limit), TimeInForce::Day);
+        assert_eq!(with("gtc", OrderType::Market), TimeInForce::GoodTillCanceled);
+        assert_eq!(with("opg", OrderType::Limit), TimeInForce::OnOpen);
+        assert_eq!(with("IOC", OrderType::Market), TimeInForce::ImmediateOrCancel);
+        // None picked (an older app): the day for a market order, until cancelled for the others.
+        assert_eq!(tif_of(&ticket(OrderType::Market, None, None)), TimeInForce::Day);
+        assert_eq!(tif_of(&ticket(OrderType::Stop, None, Some(1.0))), TimeInForce::GoodTillCanceled);
+        // Each one declared reads back from the broker's order as its id; the day is the default.
+        for d in durations() {
+            assert_eq!(tif_word(&with(&d.id, OrderType::Limit)), d.id);
+        }
+        assert_eq!(durations().iter().filter(|d| d.default).map(|d| d.id.as_str()).collect::<Vec<_>>(), ["day"]);
+        let caps = serde_json::to_value(crate::wire::BrokerCapabilities::default()).unwrap();
+        assert_eq!(caps["durations"][2], serde_json::json!({ "id": "opg", "label": "At The Opening", "orderTypes": ["market", "limit"] }));
+        assert_eq!(caps["durations"][0], serde_json::json!({ "id": "day", "label": "Day", "default": true }));
     }
 
     #[test]
@@ -307,6 +466,62 @@ mod tests {
         assert_eq!(legs.len(), 2);
         assert_eq!((legs[1].action, legs[1].order_type.as_str(), legs[1].aux_price), (Action::Buy, "STP", Some(110.0)));
         assert!(!legs[0].transmit && legs[1].transmit);
+    }
+
+    #[test]
+    fn outside_rth_boxes_go_to_their_orders() {
+        let tick = |ids: &[&str]| ids.iter().map(|i| (i.to_string(), "true".to_string())).collect();
+        let t = OrderTicket { take_profit: Some(120.0), stop_loss: Some(90.0), fields: tick(&["outsideRth", "tpOutsideRth"]), ..ticket(OrderType::Limit, Some(100.0), None) };
+        let mut ids = 1..;
+        let legs = bracket(&t, "DU1", || ids.next().unwrap());
+        assert_eq!(legs.iter().map(|o| o.outside_rth).collect::<Vec<_>>(), [true, true, false]);
+        assert!(outside_rth_any(&t));
+        // A market order never fills outside regular hours; an exit's box alone counts only with that exit.
+        let m = OrderTicket { fields: tick(&["outsideRth", "slOutsideRth"]), ..ticket(OrderType::Market, None, None) };
+        assert!(!build_order(&m, "DU1").outside_rth && !outside_rth_any(&m));
+        let caps = serde_json::to_value(crate::wire::BrokerCapabilities::default()).unwrap();
+        assert_eq!(caps["orderPreview"], true);
+        assert_eq!(caps["ticketFields"][0], serde_json::json!({ "id": "outsideRth", "label": "Outside RTH", "type": "checkbox", "orderTypes": ["limit", "stop", "stopLimit"] }));
+        assert_eq!(caps["ticketFields"][1]["exit"], "takeProfit");
+    }
+
+    #[test]
+    fn routes_and_the_routing_field() {
+        let r = routes(&["ARCA,SMART,NYSE,IBEOS,OVERNIGHT,arca".to_string()]);
+        assert_eq!(r, ["SMART", "ARCA", "NYSE"]);
+        let f = serde_json::to_value(routing_field(&r)).unwrap();
+        assert_eq!(f, serde_json::json!({ "id": "route", "label": "Routing", "type": "select", "default": "SMART",
+            "options": [{ "value": "SMART", "label": "SMART" }, { "value": "ARCA", "label": "ARCA" }, { "value": "NYSE", "label": "NYSE" }] }));
+        let mut t = ticket(OrderType::Limit, Some(1.0), None);
+        t.fields.insert("route".into(), "ARCA".into());
+        assert_eq!(route_of(&t, &r), Some("ARCA"));
+        t.fields.insert("route".into(), "NOPE".into());
+        assert_eq!(route_of(&t, &r), None);
+        assert!(routes(&[]).is_empty());
+    }
+
+    #[test]
+    fn what_if_answers_read_as_preview_tables() {
+        let s = OrderState {
+            commission: Some(1.0),
+            commission_currency: "USD".into(),
+            initial_margin_before: Some(0.0),
+            initial_margin_change: Some(262.38),
+            initial_margin_after: Some(262.38),
+            equity_with_loan_after: Some(f64::MAX),
+            margin_currency: "USD".into(),
+            warning_text: "Outside hours".into(),
+            ..Default::default()
+        };
+        let p = preview_of(&s, vec!["Order can be executed outside regular trading hours.".into()]);
+        assert_eq!(p["sections"][0]["rows"][0], serde_json::json!({ "label": "Commission", "value": "1.00", "currency": "USD" }));
+        // An unset figure (f64::MAX) leaves its row out; a table without rows is left out.
+        assert_eq!(p["sections"][1]["title"], "Initial margin");
+        assert_eq!(p["sections"][1]["rows"][1]["value"], "262.38");
+        assert_eq!(p["sections"].as_array().unwrap().len(), 2);
+        assert_eq!(p["warnings"].as_array().unwrap().len(), 2);
+        let refused = preview_of(&OrderState { reject_reason: "Insufficient buying power".into(), ..Default::default() }, vec![]);
+        assert_eq!(refused["errors"][0], "Insufficient buying power");
     }
 
     #[test]

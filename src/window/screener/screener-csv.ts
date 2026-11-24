@@ -10,7 +10,7 @@ import { COLUMN_BY_ID, configuredLong, type ColumnRef } from "../../data/screene
 
 export const MAX_ROWS = 30_000;
 
-const MONEY = new Set(["price", "signedPrice", "money"]);
+const MONEY = new Set(["price", "signedPrice", "money", "signedMoney"]);
 
 export const csvField = (s: string): string => (/[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
 
@@ -43,13 +43,4 @@ export function screenCsv(rows: readonly ScanRow[], columns: readonly ColumnRef[
 export function csvFileName(name: string, now = new Date()): string {
   const d = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   return `${name.replace(/[\\/:*?"<>|]/g, "_")}_${d}.csv`;
-}
-
-/** Save a text file through the browser download (as the app's other exports). */
-export function downloadText(name: string, text: string): void {
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([text], { type: "text/csv" }));
-  a.download = name;
-  a.click();
-  URL.revokeObjectURL(a.href);
 }
