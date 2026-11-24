@@ -33,6 +33,7 @@ import { OtherSymbolBars } from "../window/chart/indicators/other-symbols";
 import { USER_INDICATOR_PREFIX, isUserIndicatorId } from "../window/chart/indicators/user-scripts";
 import { getOakEngine, OakEngineError } from "../window/oakscript/engine";
 import { scriptBars, type OtherSymbolData } from "../backtester/oakscript";
+import { canCalculateHere, loadIndicatorCode } from "../window/chart/indicators/registry";
 import { localDay } from "./session/zone";
 import {
   MAX_BARS,
@@ -238,6 +239,8 @@ async function scanSymbol(
 
 /** A built-in: calculated here; a run that needs bars of another symbol not loaded yet waits for them (a few times). */
 async function runBuiltIn(spec: ScanSpec, given: Bar[], context: object, others: OtherSymbolBars, arrivals: Arrivals, ev: ScanEvents): Promise<unknown> {
+  // A library study calculates here: its code first (the chart's studies calculate in the study worker).
+  if (!canCalculateHere(spec.entry)) await loadIndicatorCode();
   const chart = {
     ...context,
     bars: (s: string, tf: string) => others.bars(s, tf, spec.interval),

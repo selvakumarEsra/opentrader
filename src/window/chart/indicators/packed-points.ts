@@ -76,13 +76,13 @@ function sameAt(a: PackedColumns, b: PackedColumns, k: number, fields: readonly 
 /**
  * How many first points of `next` equal those of `prev` (up to `n`), or null when `prev` is not packed. Compares
  * the columns (both packed) or each plain point with the columns: no point object is made (a worker compares every
- * update's result with the one it sent).
+ * update's result with the one it sent). `start`: the points before it are known to be equal (not compared).
  */
-export function packedPrefix(next: readonly unknown[], prev: unknown, n: number): number | null {
+export function packedPrefix(next: readonly unknown[], prev: unknown, n: number, start = 0): number | null {
   const cols = packedColumns(prev);
   if (!cols) return null;
   const nc = packedColumns(next);
-  let k = 0;
+  let k = Math.min(start, n);
   if (nc) {
     const fields = [...new Set([...Object.keys(nc.extra), ...Object.keys(cols.extra)])];
     while (k < n && sameAt(nc, cols, k, fields)) k++;
@@ -112,6 +112,12 @@ export function packedPrefix(next: readonly unknown[], prev: unknown, n: number)
 
 /** True when no point of `list` has a finite value (read from the value column of a packed list). */
 export function noValue(list: readonly unknown[]): boolean {
+  // A plot with values has one among its first points, mostly: read without making the columns of a packed list.
+  const head = Math.min(list.length, 256);
+  for (let i = 0; i < head; i++) {
+    const v = (list[i] as { value?: unknown } | null)?.value;
+    if (typeof v === "number" && Number.isFinite(v)) return false;
+  }
   const cols = packedColumns(list);
   if (cols) {
     for (let i = 0; i < cols.n; i++) if (Number.isFinite(cols.value[i])) return false;
@@ -128,7 +134,7 @@ const POSTED = "\u0000packed";
 
 /** `v` with its packed lists (down to `depth` levels) as their columns, or as plain arrays when they hold other
  *  values than whole points: a message can carry it. */
-export function forPost(v: unknown, depth = 4): unknown {
+export function forPost(v: unknown, depth = 8): unknown {
   if (v === null || typeof v !== "object") return v;
   if (isPacked(v)) {
     const cols = packedColumns(v);
@@ -144,7 +150,7 @@ export function forPost(v: unknown, depth = 4): unknown {
 }
 
 /** A message's packed lists (forPost) back as packed lists, in place. */
-export function fromPost(v: unknown, depth = 4): unknown {
+export function fromPost(v: unknown, depth = 8): unknown {
   if (v === null || typeof v !== "object") return v;
   const posted = (v as Record<string, unknown>)[POSTED] as PackedColumns | undefined;
   if (posted) return packedFromColumns(posted);

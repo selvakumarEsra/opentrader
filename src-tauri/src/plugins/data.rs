@@ -17,6 +17,7 @@
  * Its scripts too (`data.scripts`, #402): OakScript studies and strategies with their source, listed in the Indicators
  * dialog under the plugin's name and run like the user's own.
  */
+use super::quote_batch::{self, QuoteBatch};
 use super::Plugins;
 use crate::data::calendar::SessionCalendar;
 use crate::data::interval::{BarUnit, Interval};
@@ -231,6 +232,17 @@ pub struct PluginData {
     watchlists: Mutex<BTreeMap<String, Vec<PluginWatchlist>>>,
     /// Each data plugin's scripts, as it last sent them (kept while it reconnects).
     scripts: Mutex<BTreeMap<String, Vec<PluginScript>>>,
+    /// The quotes since the last flush (specs/performance.md REQ-PERF-003).
+    batch: Mutex<QuoteBatch>,
+}
+
+/// The windows whose charts show `symbol`.
+fn chart_windows_of(app: &AppHandle, symbol: &str) -> BTreeSet<String> {
+    quote_batch::chart_windows(&state(app).subs.locked().charts, symbol)
+}
+
+fn flush_quotes(app: &AppHandle) {
+    quote_batch::flush(app, &state(app).batch, |symbol| chart_windows_of(app, symbol));
 }
 
 /// A plugin symbol: the plugin, the full symbol and its ticker.
@@ -340,6 +352,7 @@ pub fn symbol_of_plugin(app: &AppHandle, plugin: &str, ticker: &str) -> Option<S
 
 pub fn init(app: &AppHandle) {
     let mut events = app.state::<Plugins>().hub.subscribe();
+    quote_batch::spawn_flusher(app, flush_quotes);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         loop {
@@ -959,13 +972,12 @@ fn on_quote(app: &AppHandle, plugin: &str, params: Value) {
     let minute = q.minute.map(candle);
     let time = q.time.unwrap_or_else(now);
     state(app).quoted.locked().insert(symbol.clone(), time);
-    if let Some(m) = &minute {
+    let bar = minute.as_ref().map(|m| {
         let day = q.day.map(|d| Candle { time, ..candle(d) });
-        let _ = ChartAggregate { symbol: symbol.clone(), time: m.time, open: m.open, high: m.high, low: m.low, close: m.close, volume: m.volume, day }
-            .emit(app);
-    }
+        ChartAggregate { symbol: symbol.clone(), time: m.time, open: m.open, high: m.high, low: m.low, close: m.close, volume: m.volume, day }
+    });
     let prev = q.prev_close.filter(|p| *p != 0.0);
-    let _ = TradeTick {
+    let trade = TradeTick {
         symbol: symbol.clone(),
         price: price,
         change: prev.map(|p| price - p),
@@ -979,9 +991,13 @@ fn on_quote(app: &AppHandle, plugin: &str, params: Value) {
         trade_low: minute.as_ref().map(|m| m.low),
         day_high: q.day.map(|d| d[2]),
         day_low: q.day.map(|d| d[3]),
+    };
+    // The views get the newest per flush (flush_quotes); a bar this quote closes goes now.
+    let closed = state(app).batch.locked().add(bar, trade);
+    if let Some(bar) = closed {
+        quote_batch::send_bar(app, &bar, chart_windows_of(app, &bar.symbol));
     }
-    .emit(app);
-    // The desktop alert engine reads the quotes the host gets.
+    // The desktop alert engine reads every quote the host gets.
     if let Some(host) = app.try_state::<HostRef>() {
         host.on_quote(&symbol, price, minute.as_ref());
     }

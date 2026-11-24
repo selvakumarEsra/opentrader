@@ -145,6 +145,30 @@ describe("user scripts on live updates", () => {
       expect(got.reason).toMatch(/calculate\(\)/);
     }
   });
+
+  // specs/performance.md REQ-PERF-002.A3
+  for (const [label, chart, bars, restamp] of [
+    ["intraday", CHART, BARS, false],
+    ["daily, restamped", { timeframe: "1D", timezone: "America/New_York", session: "0930-1600" }, dailySeries().slice(0, 1_400), true],
+  ] as const) {
+    it(`a calculate() module with createRun (a copy of a built-in), ${label}: resumed, the results of full calculations`, async () => {
+      const { loadIndicator } = await import("lightweight-charts-indicators/loader");
+      for (const id of ["rsi", "macd", "ichimoku"]) {
+        const lib = (await loadIndicator(id)) as unknown as { calculate: (b: unknown[], i?: object, c?: unknown) => unknown; createRun: (i?: object, c?: unknown) => never };
+        const mod = { calculate: lib.calculate, createRun: lib.createRun };
+        const ch = new ScriptChannel();
+        let k = 0;
+        for (const given of liveFeed(bars, 1_300, 4)) {
+          const got = ch.update({ kind: "convention", mod }, `chart|${id}`, given, {}, chart, restamp);
+          const seen = restamp ? scriptBars(given.map((b) => ({ ...b })), chart) : given;
+          const want = structuredClone(lib.calculate(seen, {}, chart));
+          if (restamp) restoreTimes(want, seen, given);
+          expect(JSON.parse(JSON.stringify(got.result))).toEqual(JSON.parse(JSON.stringify(want)));
+          if (k++ > 0) expect(got.reason).toBeNull();
+        }
+      }
+    });
+  }
 });
 
 describe("strategies on live updates", () => {
@@ -161,18 +185,59 @@ describe("strategies on live updates", () => {
     plot(slow, "Slow");
   };
 
-  it("orders over ticks and new bars: the full runs' reports, trades and plots", () => {
+  for (const [label, properties] of [
+    ["", undefined],
+    // Margin points of a fill time change the last one in place (REQ-PERF-002.A5).
+    [", on margin", { marginLong: 25, marginShort: 25 }],
+  ] as const)
+  it(`orders over ticks and new bars${label}: the full runs' reports, trades and plots`, () => {
     const host = new SentRuns();
     const worker = new KeptRuns<KeptStrategy | null>();
-    const opts: OakScriptRunOptions = { chart: CHART };
+    const opts: OakScriptRunOptions = { chart: CHART, properties };
+    const reportBytes: number[] = [];
     for (const bars of liveFeed(BARS, 1_300, 40)) {
       const sent = host.request("chart|strategy", bars);
       const out = structuredClone(updateLiveStrategy(worker, structuredClone(sent.live), body, structuredClone(sent.bars), opts)!);
-      const visuals = host.received("chart|strategy", out.visuals, out.live);
+      // The report and the drawn outputs come as their changes (specs/performance.md REQ-PERF-002.A4).
+      const { visuals, report } = host.received("chart|strategy", { visuals: out.visuals, report: out.report }, out.live) as { visuals: unknown; report: typeof out.report };
       expect(out.live.fullRunReason).toBeNull();
       const full = runOakScriptStrategy(body, bars, opts);
-      expect({ ...out.report!, elapsedMs: 0 }).toEqual(structuredClone({ ...full.report!, elapsedMs: 0 }));
+      expect({ ...report!, elapsedMs: 0 }).toEqual(structuredClone({ ...full.report!, elapsedMs: 0 }));
       expect(visuals).toEqual(structuredClone(full.script.result));
+      if (out.live.delta) reportBytes.push(JSON.stringify(out.report).length / JSON.stringify(full.report).length);
     }
+    // A tick's report is a small part of the whole report.
+    expect(Math.max(...reportBytes)).toBeLessThan(0.2);
   });
+
+  // specs/performance.md REQ-PERF-002.A5, A6: the broker state restored on every tick, the long lists of markers and
+  // background colours of several calls sent as their new points.
+  for (const [label, bars, chart] of [
+    ["intraday", intradaySeries().slice(0, 3_000), CHART],
+    ["daily", dailySeries().slice(0, 1_500), { timeframe: "1D", timezone: "America/New_York", session: "0930-1600" }],
+  ] as const) {
+    it(`shipped strategies with many marks, ${label}: the full runs' reports and drawn outputs, small ticks`, async () => {
+      const { rsiMeanReversion } = await import("../../../backtester/scripts/rsi-mean-reversion");
+      const { utBotV2 } = await import("../../../backtester/scripts/ut-bot-v2");
+      for (const s of [rsiMeanReversion, utBotV2]) {
+        const host = new SentRuns();
+        const worker = new KeptRuns<KeptStrategy | null>();
+        const opts: OakScriptRunOptions = { chart };
+        let biggest = 0;
+        let whole = 0;
+        for (const given of liveFeed(bars, bars.length - 6, 5)) {
+          const sent = host.request(`chart|${s.key}`, given);
+          const out = structuredClone(updateLiveStrategy(worker, structuredClone(sent.live), s.body, structuredClone(sent.bars), opts)!);
+          const got = host.received(`chart|${s.key}`, { visuals: out.visuals, report: out.report }, out.live) as { visuals: unknown; report: typeof out.report };
+          const full = structuredClone(runOakScriptStrategy(s.body, given, opts));
+          expect({ ...got.report!, elapsedMs: 0 }).toEqual({ ...full.report!, elapsedMs: 0 });
+          expect(got.visuals).toEqual(full.script.drawingKinds.length ? { ...full.script.result, drawingKinds: full.script.drawingKinds } : full.script.result);
+          const size = JSON.stringify({ visuals: out.visuals, report: out.report }).length;
+          if (out.live.delta) biggest = Math.max(biggest, size);
+          else whole = size;
+        }
+        expect(biggest).toBeLessThan(whole / 10);
+      }
+    }, 120_000);
+  }
 });

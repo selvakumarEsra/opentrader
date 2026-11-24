@@ -60,7 +60,11 @@ export class BacktestClient {
       const res = e.data;
       if (res.ok) {
         if (!res.live) p.resolve({ report: res.report, visuals: res.visuals });
-        else p.resolve({ report: res.report, visuals: this.live.received(p.channel, res.visuals, res.live), fullRunReason: res.live.fullRunReason });
+        else {
+          // A live reply's report and drawn outputs are the changes from the ones received before.
+          const got = this.live.received(p.channel, { visuals: res.visuals, report: res.report }, res.live) as { visuals: unknown; report: BacktestOutput['report'] };
+          p.resolve({ report: got.report, visuals: got.visuals, fullRunReason: res.live.fullRunReason });
+        }
       } else if ('resend' in res && p.resend) {
         p.resend();
       } else {

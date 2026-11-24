@@ -50,7 +50,7 @@ import { studyScaleFormat } from '../price-format';
 import { cachedSymbolSessions } from '../../../data/session';
 import { sessionFutureSlots } from './future-slots';
 import { applyStyleOverrides, type StyleEntry } from './style-outputs';
-import { isLibraryEntry } from './registry';
+import { canCalculateHere, isLibraryEntry } from './registry';
 import { translatedPlotConfig, translatedStudyResult } from '../../../i18n/study-text';
 import { isUserIndicatorId } from './user-scripts';
 import { calculateInWorker, studyWorkersAvailable } from './study-worker-host';
@@ -858,6 +858,10 @@ export class IndicatorLayer {
             return null;
           }
           result = off.result;
+        } else if (!canCalculateHere(entry)) {
+          // A library study's code is not on this thread (its studies calculate in the worker): it loads now.
+          this.loading = true;
+          return null;
         } else {
           result = (entry.calculate as (b: Bar[], i: Record<string, unknown>, ctx: StudyCalcContext) => unknown)(seen, inputs, ctx);
         }

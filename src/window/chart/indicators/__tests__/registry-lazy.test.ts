@@ -27,6 +27,11 @@ describe("indicator registry: the library loads on first use", () => {
     expect(getIndicatorEntry("rsi")).toBeUndefined();
     await loadIndicatorLibrary();
     expect(indicatorLibraryLoaded()).toBe(true);
-    expect(getIndicatorEntry("rsi#3")).toBe(indicatorRegistry.find((e) => e.id === "rsi"));
+    // The window has no workers here: the entries come with their code.
+    const lib = indicatorRegistry.find((e) => e.id === "rsi")!;
+    const rsi = getIndicatorEntry("rsi#3")!;
+    expect(rsi.calculate).toBe(lib.calculate);
+    expect(rsi.plotConfig).toEqual(lib.plotConfig);
+    expect(getIndicatorEntry("rsi")).toBe(rsi);
   });
 });

@@ -41,6 +41,7 @@ import {
 } from 'oakscriptjs/script';
 import { isPackedSeries } from 'lightweight-charts-indicators/helpers';
 import { Broker } from './broker';
+import { restoreEngineState, saveEngineState } from './live-broker-state';
 import { backtestReport, binIntrabars, heikinAshiBars } from './run';
 import { SessionSpec } from '../data/session/spec';
 import { localDay, localToUtc } from '../data/session/zone';
@@ -108,9 +109,6 @@ function tradeInfo(t: Trade): StrategyTrade {
 
 /** Broker fields that are its setup, not its state: the engine a state is restored on has its own. */
 const BROKER_SETUP = new Set(['bars', 'props', 'sym', 'intrabars', 'onIntrabar', 'long', 'short']);
-
-/** What BrokerEngine.save() gives: the broker state (orders, trades, position, report records) and the equity. */
-type EngineState = { broker: Record<string, unknown>; equity: number[] };
 
 /** oakscriptjs StrategyEngine on the OpenTrader Broker. `equity` holds the equity at each bar close. */
 export class BrokerEngine implements StrategyEngine {
@@ -293,18 +291,13 @@ export class BrokerEngine implements StrategyEngine {
    * trade once restored).
    */
   save(): unknown {
-    const broker: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(this.broker)) if (!BROKER_SETUP.has(k)) broker[k] = v;
-    return structuredClone({ broker, equity: this.equity } satisfies EngineState);
+    return saveEngineState(this.broker, BROKER_SETUP, this.equity);
   }
 
   /** Puts back a state of save() on this engine (same script and properties, the bars it was saved on and newer
    *  ones). Copied again: the state is restored on each update until the next bar closes. */
   restore(state: unknown): void {
-    const s = structuredClone(state as EngineState);
-    Object.assign(this.broker, s.broker);
-    const n = Math.min(s.equity.length, this.equity.length);
-    for (let i = 0; i < n; i++) this.equity[i] = s.equity[i];
+    restoreEngineState(state, this.broker, this.equity);
   }
 }
 
@@ -609,8 +602,9 @@ export function runOakScriptStrategy(body: () => void, bars: Bar[], opts: OakScr
 
 /** A run of runOakScriptStrategy on each update of the chart bars (see createStrategyRun). */
 export interface OakScriptStrategyRun {
-  /** The strategy on `bars`, with why it calculated every bar (null: the newest bars only). */
-  update(bars: Bar[], opts?: OakScriptRunOptions): OakScriptRunResult & { fullRunReason: string | null };
+  /** The strategy on `bars`, with why it calculated every bar (null: the newest bars only) and its first calculated
+   *  bar (`from`, 0: all of them). */
+  update(bars: Bar[], opts?: OakScriptRunOptions): OakScriptRunResult & { fullRunReason: string | null; from?: number };
 }
 
 /** The run of one set of inputs, properties, symbol and lower-timeframe bars. */
@@ -677,7 +671,7 @@ export function createStrategyRun(body: () => void, options: { verify?: number }
       const skipLast = chart.realtime === true && bars.length > 0 && !live.everyTick;
       const runChart = setPass(live.pass, bars, opts, chart, skipLast);
       const script = live.run.update(live.pass.seen, runChart);
-      return { ...strategyResult(live.pass, script, skipLast, t0, true), fullRunReason: live.run.fullRunReason };
+      return { ...strategyResult(live.pass, script, skipLast, t0, true), fullRunReason: live.run.fullRunReason, from: script.from };
     },
   };
 }

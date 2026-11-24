@@ -256,7 +256,9 @@ export class OakEngine {
       }
       if (!sent || sent.live.from === 0 || res.live?.fullRunReason) this.noteCalculation(scriptId, startedAt, BACKTEST_TIMEOUT_MS);
       if (key === null || !res.live) return { report: res.report, visuals: res.visuals };
-      return { report: res.report, visuals: this.live.received(key, res.visuals, res.live), fullRunReason: res.live.fullRunReason };
+      // A live reply's report and drawn outputs are the changes from the ones received before.
+      const got = this.live.received(key, { visuals: res.visuals, report: res.report }, res.live) as { visuals: unknown; report: typeof res.report };
+      return { report: got.report, visuals: got.visuals, fullRunReason: res.live.fullRunReason };
     }
   }
 

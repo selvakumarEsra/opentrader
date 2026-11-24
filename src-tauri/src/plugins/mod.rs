@@ -14,6 +14,7 @@ pub mod data;
 pub mod events;
 pub mod fields;
 mod package;
+mod quote_batch;
 
 use opentrader_core::files;
 use opentrader_core::plugins::hub::{Allowed, Hub, HubEvent};

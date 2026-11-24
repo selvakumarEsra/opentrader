@@ -6,7 +6,8 @@
  *
  * Host side: `SentRuns` (what was sent for each key). Worker side: `KeptRuns` (the bars and runs kept).
  */
-import { applyDelta, encodeDelta } from '../window/chart/indicators/study-worker-types';
+import { applyDelta, encodeDelta, type DeltaBound } from '../window/chart/indicators/study-worker-types';
+import { listsCopied, resumedBound } from './live-broker-state';
 import { createStrategyRun, type OakScriptRunOptions, type OakScriptStrategyRun } from './oakscript';
 import type { BacktestReport, Bar } from './types';
 
@@ -143,11 +144,20 @@ export class KeptRuns<R> {
   }
 
   /** Keeps `run` on `bars` with its `result`: the reply (the changes from the host's result when it has the base). */
-  keep(live: LiveRequest, kept: Kept<R> | undefined, bars: Bar[], run: R, result: unknown, fullRunReason: string | null): { result: unknown; live: LiveReply } {
+  keep(
+    live: LiveRequest,
+    kept: Kept<R> | undefined,
+    bars: Bar[],
+    run: R,
+    result: unknown,
+    fullRunReason: string | null,
+    /** The run calculated the bars from `from` only (encodeDelta's bound). */
+    bound?: DeltaBound,
+  ): { result: unknown; live: LiveReply } {
     const delta = kept !== undefined && live.base !== null && live.base === kept.resultId;
     const id = ++resultSeq;
     this.kept.set(live.key, { bars, run, resultId: id, result });
-    return { result: delta ? encodeDelta(result, kept.result) : result, live: { id, delta, fullRunReason } };
+    return { result: delta ? encodeDelta(result, kept.result, 0, bound) : result, live: { id, delta, fullRunReason } };
   }
 
   /** The run failed: what it changed in place cannot be used again. */
@@ -187,6 +197,13 @@ export function updateLiveStrategy(
     throw err;
   }
   const visuals = out.script.drawingKinds.length ? { ...out.script.result, drawingKinds: out.script.drawingKinds } : out.script.result;
-  const reply = kept.keep(live, got.kept, got.bars, strategy, visuals, out.fullRunReason);
-  return { report: out.report, visuals: reply.result, live: reply.live };
+  // The report rides with the drawn outputs, as its changes too (a long backtest's report is megabytes: its trades,
+  // equity and buy & hold). A copy is kept: the report holds lists the broker goes on changing (its filled orders).
+  const report = out.report ? listsCopied(out.report) : undefined;
+  // A resumed run: what it drew before its first recalculated bar is what it drew before (its output values are new
+  // points every update, compared from that bar's time).
+  const bound = resumedBound(got.bars, out.from);
+  const reply = kept.keep(live, got.kept, got.bars, strategy, { visuals, report }, out.fullRunReason, bound);
+  const sent = reply.result as { visuals: unknown; report?: BacktestReport };
+  return { report: sent.report, visuals: sent.visuals, live: reply.live };
 }
