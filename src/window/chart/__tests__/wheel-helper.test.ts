@@ -20,10 +20,29 @@ describe("WheelHelper", () => {
     expect(new WheelHelper().process(ev({ deltaY: 1, deltaMode: 2, timeStamp: 1000 })).deltaY).toBeCloseTo(1.2, 12);
   });
 
-  it("Shift swaps the axes outside macOS", () => {
-    const out = new WheelHelper().process(ev({ deltaY: 100, shiftKey: true, timeStamp: 1000 }));
+  // The helper reads the platform once, when it loads: each case loads it again on its platform, so the result
+  // does not depend on the computer the tests run on.
+  async function helperOn(platform: string) {
+    vi.resetModules();
+    vi.stubGlobal("navigator", { platform });
+    try {
+      return (await import("../wheel-helper")).WheelHelper;
+    } finally {
+      vi.unstubAllGlobals();
+      vi.stubGlobal("WheelEvent", { DOM_DELTA_PIXEL: 0, DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 });
+    }
+  }
+
+  it("Shift swaps the axes outside macOS", async () => {
+    const Helper = await helperOn("Win32");
+    const out = new Helper().process(ev({ deltaY: 100, shiftKey: true, timeStamp: 1000 }));
     expect(out.deltaX).toBe(-1);
     expect(out.deltaY === 0).toBe(true);
+  });
+
+  it("Shift leaves the axes on macOS (the system swaps them already)", async () => {
+    const Helper = await helperOn("MacIntel");
+    expect(new Helper().process(ev({ deltaY: 100, shiftKey: true, timeStamp: 1000 }))).toEqual({ deltaX: 0, deltaY: 1 });
   });
 
   it("drops the weaker axis when the burst is 3x stronger on the other", () => {
