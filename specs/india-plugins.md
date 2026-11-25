@@ -35,7 +35,7 @@ settings (masked in Settings > Plugins) and never written to the log.
 implementations:
   - plugins/kit/src/totp.rs:code
   - plugins/zerodha/src/auth.rs:login
-  - plugins/dhan/src/auth.rs:login
+  - plugins/dhan/src/auth.rs:generate
 
 ## Acceptance
 <!-- id: REQ-INDIA-001.A1 -->

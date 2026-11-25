@@ -79,7 +79,7 @@ is refused when the arguments are read.
 
 implementations:
   - src-tauri/crates/core/src/history/mod.rs:get_aggregates_before
-  - src-tauri/crates/core/src/commands.rs:args.AggregatesBefore
+  - src-tauri/crates/core/src/commands.rs:AggregatesBefore
 
 ## Acceptance
 <!-- id: REQ-DOMAIN-003.A1 -->

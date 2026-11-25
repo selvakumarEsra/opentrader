@@ -87,7 +87,7 @@ implementations:
   - plugins/moomoo/src/bars.rs:kl_type
   - plugins/moomoo/src/bars.rs:to_bars
   - plugins/moomoo/src/bars.rs:end_stamped
-  - plugins/moomoo/src/pace.rs:Pace
+  - plugins/kit/src/pace.rs:Pace
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-004.A1 -->
@@ -176,10 +176,10 @@ only 100 different stocks per rolling 7 days, so the store also saves quota.
   scan. Bars streamed in a minute reach the store in one batched write.
 
 implementations:
-  - plugins/moomoo/src/store/mod.rs:Series
-  - plugins/moomoo/src/store/mod.rs:Store
-  - plugins/moomoo/src/store/sqlite.rs:Sqlite
-  - plugins/moomoo/src/store/clickhouse.rs:ClickHouse
+  - plugins/kit/src/store/mod.rs:Series
+  - plugins/kit/src/store/mod.rs:Store
+  - plugins/kit/src/store/sqlite.rs:Sqlite
+  - plugins/kit/src/store/clickhouse.rs:ClickHouse
   - plugins/moomoo/src/hours.rs:has_trading
   - plugins/moomoo/src/history.rs:History
   - plugins/moomoo/src/history.rs:History.bars
