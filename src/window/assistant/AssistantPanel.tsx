@@ -6,9 +6,12 @@ import { translate, translateWith } from "../../i18n/translator";
  * Open chat…), the greeting and its suggestions on an empty chat, the messages, then the composer with Send, and the
  * note under it.
  *
- * Unlike the reference, the model is OpenTrader's own and runs on this computer (downloaded once, then offline), so
- * there is no model or effort picker. The chat runs the app's agent tools (src/data/assistant/session.ts).
+ * Unlike the reference, the built-in model is OpenTrader's own and runs on this computer (downloaded once, then
+ * offline); the model menu beside the chat's title can choose instead Claude Code, Codex or Gemini, run through their
+ * SDKs with the user's credentials (specs/assistant-cli-models.md). The chat runs the app's agent tools
+ * (src/data/assistant/session.ts).
  */
+import { date } from "../../community-shared/dates";
 import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { Icon } from "../../components/Icon";
 import { AnswerText, symbolsOf } from "./AnswerText";
@@ -20,6 +23,7 @@ import { AssistantSetup } from "./LocalModel";
 import { trackPanelOpened } from "../../data/assistant/telemetry";
 import { gb, localError, localInfo, localProgress, localState, refreshLocal, removeLocal, setUpdateLater, updateBytes, updateLater, updateLocal } from "../../data/assistant/local";
 import { stepTitle } from "./steps";
+import { activeModel, BUILTIN, chooseModel, chosenModel, cliModels, fellBack, modelName, notReady, refreshModels } from "../../data/assistant/models";
 import "../../styles/screener.css";
 import "../../styles/community.css";
 import "../../styles/assistant.css";
@@ -35,8 +39,12 @@ const suggestions = (ticker: string) => [
 ];
 
 export function AssistantPanel(props: { ticker: string }) {
-  onMount(() => void refreshLocal().then(() => trackPanelOpened(localState(localInfo()))));
-  const ready = () => !!localInfo()?.installed;
+  onMount(() => {
+    void refreshLocal().then(() => trackPanelOpened(localState(localInfo())));
+    void refreshModels();
+  });
+  // The download screen shows only while the built-in model is the one in use and not yet downloaded.
+  const needsDownload = () => activeModel() === BUILTIN && !localInfo()?.installed;
   const overlay = () => assistantPanel.mode() === "overlay";
   const [view, setView] = createSignal<"chat" | "chats">("chat");
 
@@ -98,7 +106,7 @@ export function AssistantPanel(props: { ticker: string }) {
         </header>
         <div class="asst-body">
           <Switch>
-            <Match when={localInfo() && !ready()}>
+            <Match when={localInfo() && needsDownload()}>
               <AssistantSetup />
             </Match>
             <Match when={view() === "chats"}>
@@ -114,8 +122,13 @@ export function AssistantPanel(props: { ticker: string }) {
   );
 }
 
+/** Whether a question can be asked: the SDK model in use is ready (or not yet known not to be), or the built-in one
+ *  is in use and installed. */
+const canAsk = () => (activeModel() === BUILTIN ? !!localInfo()?.installed : !notReady());
+
 function ChatView(props: { ticker: string; onOpenChats: () => void }) {
   const [menuOpen, setMenuOpen] = createSignal(false);
+  const [modelOpen, setModelOpen] = createSignal(false);
   const [draft, setDraft] = createSignal("");
   // Files attached to the message being written (a file of trades to import, read by the tools by id).
   const [files, setFiles] = createSignal<AttachedFile[]>([]);
@@ -165,7 +178,7 @@ function ChatView(props: { ticker: string; onOpenChats: () => void }) {
     if (pinned) queueMicrotask(() => (list.scrollTop = list.scrollHeight));
   });
   const submit = (text = draft()) => {
-    if ((!text.trim() && !files().length) || running() || !localInfo()?.installed) return;
+    if ((!text.trim() && !files().length) || running() || !canAsk()) return;
     const attached = files();
     setDraft("");
     setFiles([]);
@@ -190,13 +203,63 @@ function ChatView(props: { ticker: string; onOpenChats: () => void }) {
             <button type="button" class="asst-menu-item" role="menuitem" disabled={!chats().length} onClick={() => { setMenuOpen(false); props.onOpenChats(); }}>
               Open chat…
             </button>
-            <div class="asst-menu-sep" />
-            <button type="button" class="asst-menu-item" role="menuitem" disabled={running()} onClick={() => { setMenuOpen(false); void removeLocal(); }}>
-              Remove the model from this computer
+            <Show when={localInfo()?.installed}>
+              <div class="asst-menu-sep" />
+              <button type="button" class="asst-menu-item" role="menuitem" disabled={running()} onClick={() => { setMenuOpen(false); void removeLocal(); }}>
+                Remove the built-in model from this computer
+              </button>
+            </Show>
+          </Popup>
+        </Show>
+        <button
+          type="button"
+          class="asst-model"
+          classList={{ "is-open": modelOpen() }}
+          aria-haspopup="menu"
+          title="Model"
+          onClick={() => {
+            if (!modelOpen()) void refreshModels();
+            setModelOpen(!modelOpen());
+          }}
+        >
+          <span data-no-translate={activeModel() !== BUILTIN ? true : undefined}>{modelName(activeModel())}</span>
+          <span class="asst-caret" classList={{ "is-open": modelOpen() }}><Icon name="scr-caret" size={18} /></span>
+        </button>
+        <Show when={modelOpen()}>
+          <Popup onClose={() => setModelOpen(false)} class="asst-chat-menu asst-model-menu">
+            <For each={cliModels()}>
+              {(m) => (
+                <button
+                  type="button"
+                  class="asst-menu-item"
+                  role="menuitemradio"
+                  aria-checked={chosenModel() === m.id}
+                  disabled={!m.ready}
+                  title={m.need ?? undefined}
+                  onClick={() => { setModelOpen(false); chooseModel(m.id); }}
+                >
+                  <span data-no-translate>{m.name}{m.model ? ` · ${m.model}` : ""}</span>
+                  <Show when={m.ready} fallback={<span class="asst-muted">{translateWith("Needs {0}", m.need ?? "")}</span>}>
+                    <span class="asst-muted">{translateWith("With {0}", m.source ?? "")}</span>
+                  </Show>
+                </button>
+              )}
+            </For>
+            <button type="button" class="asst-menu-item" role="menuitemradio" aria-checked={chosenModel() === BUILTIN} onClick={() => { setModelOpen(false); chooseModel(BUILTIN); }}>
+              <span>Built-in</span>
+              <span class="asst-muted">On this computer, offline</span>
             </button>
+            <div class="asst-menu-sep" />
+            <p class="asst-muted asst-menu-note">Tokens and model names: Settings &gt; Coding agents.</p>
           </Popup>
         </Show>
       </div>
+      <Show when={notReady()}>
+        {(m) => <p class="asst-status is-error">{translateWith("{0} is not ready: it needs {1}. Set it up in Settings > Coding agents, or choose another model.", m().name, m().need ?? "")}</p>}
+      </Show>
+      <Show when={fellBack()}>
+        {(m) => <p class="asst-status">{translateWith("{0} is not ready ({1}): the built-in model answers.", m().name, m().need ?? "")}</p>}
+      </Show>
       <UpdateBanner />
       <div
         class="asst-messages"
@@ -210,7 +273,7 @@ function ChatView(props: { ticker: string; onOpenChats: () => void }) {
               <p class="asst-greeting">Hi, I'm your assistant: ask me to work the app for you.</p>
               <For each={suggestions(props.ticker)}>
                 {(s) => (
-                  <button type="button" class="asst-suggestion" disabled={!localInfo()?.installed || running()} onClick={() => submit(s)}>
+                  <button type="button" class="asst-suggestion" disabled={!canAsk() || running()} onClick={() => submit(s)}>
                     <Icon name="ai-sparkle" size={18} />
                     <span>{s}</span>
                   </button>
@@ -280,7 +343,7 @@ function ChatView(props: { ticker: string; onOpenChats: () => void }) {
           <Show
             when={running()}
             fallback={
-              <button type="button" class="asst-send" title="Send message" aria-label="Send message" disabled={(!draft().trim() && !files().length) || !localInfo()?.installed} onClick={() => submit()}>
+              <button type="button" class="asst-send" title="Send message" aria-label="Send message" disabled={(!draft().trim() && !files().length) || !canAsk()} onClick={() => submit()}>
                 <Icon name="ai-send" size={28} class="ot-flip-rtl" />
               </button>
             }
@@ -351,7 +414,7 @@ function UserMessage(props: { message: Extract<ChatMessage, { role: "user" }> })
 /** The model is working with nothing shown yet. */
 function isThinking(ms: ChatMessage[]): boolean {
   const last = ms[ms.length - 1];
-  return !last || last.role === "user" || (!last.text && !(last.tools?.length));
+  return !last || last.role === "user" || (!last.text && !(last.tools?.length) && !last.status);
 }
 
 function Message(props: { message: ChatMessage; known: Map<string, string> }) {
@@ -368,12 +431,18 @@ function Message(props: { message: ChatMessage; known: Map<string, string> }) {
               <div>{m().reasoning}</div>
             </details>
           </Show>
+          <Show when={m().status}>
+            <p class="asst-muted asst-run-status">{m().status}</p>
+          </Show>
           <Show when={m().text}>
             <AnswerText text={m().text} known={props.known} />
           </Show>
           <For each={m().tools ?? []}>{(t) => <Step step={t} />}</For>
           <Show when={m().error}>
             <div class="asst-error">{m().error}</div>
+          </Show>
+          <Show when={m().model && !m().status}>
+            <p class="asst-muted asst-by" data-no-translate>{modelName(m().model!)}</p>
           </Show>
           <Show when={m().trace}>
             {(trace) => (
@@ -451,10 +520,7 @@ function ChatList(props: { onDone: () => void }) {
   const [query, setQuery] = createSignal("");
   const [editing, setEditing] = createSignal<string | null>(null);
   const shown = () => chats().filter((c) => c.title.toLowerCase().includes(query().trim().toLowerCase()));
-  const date = (ms: number) => {
-    const d = new Date(ms);
-    return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
-  };
+  const day = (ms: number) => date(ms / 1000);
   return (
     <div class="asst-column asst-chats">
       <div class="asst-section-head">
@@ -471,7 +537,7 @@ function ChatList(props: { onDone: () => void }) {
                 fallback={
                   <button type="button" class="asst-chat-open" onClick={() => { openChat(c.id); props.onDone(); }}>
                     <span class="asst-chat-row-title">{c.title}</span>
-                    <span class="asst-muted">{date(c.updatedAt)}</span>
+                    <span class="asst-muted">{day(c.updatedAt)}</span>
                   </button>
                 }
               >

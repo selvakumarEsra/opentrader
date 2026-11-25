@@ -64,6 +64,9 @@ pub struct AgentRequest {
     pub window: String,
     pub id: u32,
     pub body: String,
+    /// From a question to the AI assistant's SDK model (assistant_cli.rs): its destructive tools wait for the user's
+    /// Allow in the panel.
+    pub assistant: bool,
 }
 
 pub struct AgentServer {
@@ -74,6 +77,58 @@ pub struct AgentServer {
     seq: AtomicU32,
     /// Windows listening for `AgentRequest` (a window still loading would miss it).
     ready: Mutex<HashSet<String>>,
+    /// The AI assistant's questions under way (assistant_cli.rs): each one's token, and the window that asked. The
+    /// endpoint listens while one runs, even with Coding agents off.
+    runs: Mutex<HashMap<String, String>>,
+    /// The port listened on, while listening.
+    listening: Mutex<Option<u16>>,
+}
+
+/// How long the assistant's tool call may wait for the window: a destructive one waits for the user's Allow.
+const ASSISTANT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Opens the endpoint for a question to the assistant's SDK model, asked from `window`: its URL and the question's
+/// own token (end_run closes it).
+pub fn begin_run(app: &AppHandle, window: &str) -> Result<(String, String), String> {
+    let token = new_token()?;
+    let state = app.state::<AgentServer>();
+    state.runs.locked().insert(token.clone(), window.to_string());
+    settle(app);
+    let Some(port) = *state.listening.locked() else {
+        end_run(app, &token);
+        let why = state.error.locked().clone().unwrap_or_else(|| "it did not start".into());
+        return Err(format!("The app's tools could not be opened to the model: {why}"));
+    };
+    Ok((format!("http://127.0.0.1:{port}/mcp"), token))
+}
+
+/// The question ended: its token no longer opens the endpoint, which stops unless Coding agents is on or another
+/// question runs.
+pub fn end_run(app: &AppHandle, token: &str) {
+    let state = app.state::<AgentServer>();
+    state.runs.locked().remove(token);
+    settle(app);
+}
+
+/// Listens or not as things now are: on while Coding agents is on or a question runs, on the port of Settings. A
+/// running question keeps its port (and its waiting tool calls) until it ends; a new port is taken after it.
+fn settle(app: &AppHandle) {
+    let state = app.state::<AgentServer>();
+    let (enabled, port) = {
+        let c = state.config.locked();
+        (c.enabled, c.port)
+    };
+    let running = !state.runs.locked().is_empty();
+    let listening = *state.listening.locked();
+    match listening {
+        _ if !enabled && !running => {
+            stop(app);
+            *state.error.locked() = None;
+        }
+        Some(p) if p == port => {}
+        Some(_) if running => {}
+        _ => start(app),
+    }
 }
 
 fn read_config(app: &AppHandle) -> Config {
@@ -122,6 +177,8 @@ pub fn init(app: &AppHandle) {
         pending: Mutex::new(HashMap::new()),
         seq: AtomicU32::new(0),
         ready: Mutex::new(HashSet::new()),
+        runs: Mutex::new(HashMap::new()),
+        listening: Mutex::new(None),
     });
     if enabled {
         start(app);
@@ -133,8 +190,28 @@ fn stop(app: &AppHandle) {
     if let Some(tx) = state.stop.locked().take() {
         let _ = tx.send(());
     }
+    *state.listening.locked() = None;
     // Requests still waiting get no answer: their senders drop and the handlers return an error.
     state.pending.locked().clear();
+}
+
+/// The endpoint's listener. A listener just stopped may hold the port a moment longer (it is closing): up to a
+/// second is waited for it.
+fn bind(port: u16) -> std::io::Result<std::net::TcpListener> {
+    let mut tries = 0;
+    loop {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => {
+                l.set_nonblocking(true)?;
+                return Ok(l);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 40 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn start(app: &AppHandle) {
@@ -142,10 +219,7 @@ fn start(app: &AppHandle) {
     let state = app.state::<AgentServer>();
     let port = state.config.locked().port;
     // Bound here (not in the task) so Settings learns at once that the port is taken.
-    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)).and_then(|l| {
-        l.set_nonblocking(true)?;
-        Ok(l)
-    }) {
+    let listener = match bind(port) {
         Ok(l) => l,
         Err(e) => {
             *state.error.locked() = Some(format!("Port {port} is not available: {e}"));
@@ -155,6 +229,7 @@ fn start(app: &AppHandle) {
     *state.error.locked() = None;
     let (tx, rx) = oneshot::channel::<()>();
     *state.stop.locked() = Some(tx);
+    *state.listening.locked() = Some(port);
     let router = Router::new()
         .route("/mcp", post(on_post).get(not_allowed).delete(not_allowed))
         .with_state(app.clone());
@@ -173,6 +248,7 @@ fn start(app: &AppHandle) {
             let state = app.state::<AgentServer>();
             *state.error.locked() = Some(e);
             state.stop.locked().take();
+            state.listening.locked().take();
         }
     });
 }
@@ -207,27 +283,32 @@ async fn on_post(AxState(app): AxState<AppHandle>, headers: HeaderMap, body: Str
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
     }
     let state = app.state::<AgentServer>();
-    let expected = format!("Bearer {}", state.config.locked().token);
     let given = headers.get(header::AUTHORIZATION).map(|v| v.as_bytes()).unwrap_or_default();
-    if !same(given, expected.as_bytes()) {
-        return (StatusCode::UNAUTHORIZED, "Missing or wrong token (Settings > Coding agents)").into_response();
+    // The assistant's question (its window), else a coding agent with the Settings token while Coding agents is on.
+    let run_window = state.runs.locked().iter().find(|(t, _)| same(given, format!("Bearer {t}").as_bytes())).map(|(_, w)| w.clone());
+    let assistant = run_window.is_some();
+    if !assistant {
+        let config = state.config.locked().clone();
+        if !config.enabled || !same(given, format!("Bearer {}", config.token).as_bytes()) {
+            return (StatusCode::UNAUTHORIZED, "Missing or wrong token (Settings > Coding agents)").into_response();
+        }
     }
     let parsed: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(_) => return rpc_error(&serde_json::Value::Null, -32700, "Parse error"),
     };
     let id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let Some(window) = target_window(&app) else {
+    let Some(window) = run_window.filter(|w| app.webview_windows().contains_key(w)).or_else(|| target_window(&app)) else {
         return rpc_error(&id, -32000, "OpenTrader is starting (no window ready yet): try again in a few seconds");
     };
     let n = state.seq.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel();
     state.pending.locked().insert(n, tx);
-    if let Err(e) = (AgentRequest { window, id: n, body }).emit(&app) {
+    if let Err(e) = (AgentRequest { window, id: n, body, assistant }).emit(&app) {
         state.pending.locked().remove(&n);
         return rpc_error(&id, -32000, &format!("OpenTrader window unreachable: {e}"));
     }
-    match tokio::time::timeout(REPLY_TIMEOUT, rx).await {
+    match tokio::time::timeout(if assistant { ASSISTANT_REPLY_TIMEOUT } else { REPLY_TIMEOUT }, rx).await {
         // A notification (or a response from the client): nothing to answer.
         Ok(Ok(reply)) if reply.is_empty() => StatusCode::ACCEPTED.into_response(),
         Ok(Ok(reply)) => ([(header::CONTENT_TYPE, "application/json")], reply).into_response(),
@@ -277,12 +358,7 @@ pub fn agent_server_set_enabled(app: AppHandle, enabled: bool) -> Result<AgentSe
         c.clone()
     };
     write_config(&app, &config)?;
-    if enabled {
-        start(&app);
-    } else {
-        stop(&app);
-        *state.error.locked() = None;
-    }
+    settle(&app);
     Ok(status(&app))
 }
 
@@ -300,9 +376,7 @@ pub fn agent_server_set_port(app: AppHandle, port: u16) -> Result<AgentServerSta
         c.clone()
     };
     write_config(&app, &config)?;
-    if config.enabled {
-        start(&app);
-    }
+    settle(&app);
     Ok(status(&app))
 }
 

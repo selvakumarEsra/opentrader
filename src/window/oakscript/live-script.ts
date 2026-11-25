@@ -6,13 +6,19 @@
 import { createScriptRun, type ChartContext, type ScriptRun } from "oakscriptjs/script";
 import type { KeptRuns, LiveReply, LiveRequest } from "../../backtester/live-runs";
 import { scriptBars, withChartTimes } from "../../backtester/oakscript";
+import { chartTimesCopy } from "../../backtester/chart-times-copy";
 import type { Bar } from "../../backtester/types";
 import { seedSymbol } from "../../data/symbol-name";
 import type { OakBar, OakSourceData, OakSymbolData } from "./engine-types";
 import type { ProfileCollector } from "./profiler/collect";
 
+/** A live run of a calculate() module that exports one (a copy of a built-in: lightweight-charts-indicators
+ *  `createRun`): `update` gives calculate()'s result, calculated from bar `from`. */
+export type ModuleRun = { update(bars: unknown[], chart?: unknown): object & { from: number }; readonly fullRunReason: string | null };
+
 export type UserModule = Record<string, unknown> & {
   calculate?: (bars: unknown[], inputs?: Record<string, unknown>, chart?: unknown) => unknown;
+  createRun?: (inputs?: Record<string, unknown>, chart?: unknown) => ModuleRun;
   __run?: () => void;
 };
 
@@ -24,8 +30,10 @@ export type Compiled = ({ kind: "convention"; mod: UserModule } | { kind: "scrip
 export type LiveScript = {
   entry: Compiled;
   inputs: string;
-  /** null: a calculate() module, calculated on all the bars. */
+  /** null: a calculate() module, calculated on all the bars (or by its own run, `moduleRun`). */
   run: ScriptRun | null;
+  /** The run of a calculate() module that exports createRun (made on its first update). */
+  moduleRun: ModuleRun | null;
   /** The source values of the last update (study on study): a change before the forming bar is a new run. */
   sources: OakSourceData | undefined;
   /** Bars of other symbols of the last update, read through accessors that stay the same (a new accessor is another
@@ -69,6 +77,7 @@ function newLiveScript(entry: Compiled, inputs: Record<string, unknown>, inputsK
     entry,
     inputs: inputsKey,
     run: entry.kind === "script" ? createScriptRun(entry.run, inputs) : null,
+    moduleRun: null,
     sources: undefined,
     symbols: undefined,
     barsOf: (s, tf) => live.symbols?.bars[`${s}|${tf}`],
@@ -107,19 +116,31 @@ export function updateLiveScript(kept: KeptRuns<LiveScript>, entry: Compiled, re
     live.seen = seen;
   }
   let result: unknown;
+  // A module's run calculated the bars from `from` only (it may change those points in place).
+  let bound: { from: number; bars: number } | undefined;
+  const mod = entry.kind === "convention" ? entry.mod : null;
   try {
     if (live.run) {
       const run = live.run.update(seen as never[], chart);
       // The kinds of drawings this run created: the drawing rows of the Style settings.
       result = run.drawingKinds.length ? { ...run.result, drawingKinds: run.drawingKinds } : run.result;
+    } else if (typeof mod?.createRun === "function") {
+      live.moduleRun ??= mod.createRun(inputs, chart);
+      const { from, ...out } = live.moduleRun.update(seen, chart);
+      result = out;
+      if (from > 0) bound = { from, bars: got.bars.length };
     } else {
-      result = (entry as Extract<Compiled, { kind: "convention" }>).mod.calculate!(seen, inputs, chart);
+      result = mod!.calculate!(seen, inputs, chart);
     }
-    // Back on the chart's times, as a copy (the run keeps its points with the script's times for the next update).
-    if (req.restamp && result && typeof result === "object") result = withChartTimes(result, seen, got.bars, live.chartTimes);
+    // Back on the chart's times, as a copy (the run keeps its points with the script's times for the next update). A
+    // module's run may change a point in place: its points are copied again.
+    if (req.restamp && result && typeof result === "object") {
+      result = live.moduleRun ? chartTimesCopy(result, seen, got.bars) : withChartTimes(result, seen, got.bars, live.chartTimes);
+    }
   } catch (err) {
     kept.drop(req.live.key);
     throw err;
   }
-  return kept.keep(req.live, prev, got.bars, live, result, live.run ? live.run.fullRunReason : CONVENTION_REASON);
+  const reason = live.run ? live.run.fullRunReason : live.moduleRun ? live.moduleRun.fullRunReason : CONVENTION_REASON;
+  return kept.keep(req.live, prev, got.bars, live, result, reason, bound);
 }

@@ -4,9 +4,9 @@
 use super::{clamp_to_floor, day_of, midnight};
 use crate::data::calendar::SessionCalendar;
 use crate::data::gateway;
-use crate::data::provider::capabilities::BarFamily;
+use crate::data::interval::BarUnit;
 use crate::data::provider::{DataProvider, SymbolChange};
-use crate::data::symbol::SymbolRef;
+use crate::data::symbol::Symbol;
 use crate::data::types::Candle;
 use chrono::{Duration, NaiveDate};
 
@@ -135,16 +135,16 @@ pub(super) fn stretch_start(bars: &[Candle], end_sec: f64) -> f64 {
 /// at the first move that is not proven; the oldest symbol kept starts where
 /// its bars do (the date of its entry is not a listing date). The symbols
 /// used in between are checked one by one (see [`proven_between`]).
-pub(super) async fn listing_of<P: DataProvider + ?Sized>(provider: &P, sym: &SymbolRef) -> Listing {
+pub(super) async fn listing_of<P: DataProvider + ?Sized>(provider: &P, sym: &Symbol) -> Listing {
     let (listed, changes) = tokio::join!(provider.listing_date(sym), provider.symbol_changes(sym));
     let mut partial = false;
     let listed = or_partial(listed, None, &mut partial);
     let changes = or_partial(changes, Vec::new(), &mut partial);
-    let mut listing = Listing::new(&sym.ticker, listed, &changes);
+    let mut listing = Listing::new(sym.ticker(), listed, &changes);
     listing.partial = partial;
     let (mut proven, mut oldest_start) = (0, f64::MIN);
     for segment in &listing.earlier {
-        let earlier = SymbolRef { exchange: sym.exchange.clone(), ticker: segment.ticker.clone() };
+        let earlier = sym.with_ticker(&segment.ticker);
         let bars = match provider.daily_archive(&earlier, false).await {
             Ok(bars) => bars,
             Err(e) => {
@@ -184,7 +184,7 @@ pub(super) fn times_inside(bars: &[Candle], start_sec: f64, end_sec: f64) -> Opt
 /// A lookup that could not reach the server marks `partial`.
 async fn proven_between<P: DataProvider + ?Sized>(
     provider: &P,
-    sym: &SymbolRef,
+    sym: &Symbol,
     candidates: Vec<Segment>,
     partial: &mut bool,
 ) -> Vec<Segment> {
@@ -217,7 +217,7 @@ async fn proven_between<P: DataProvider + ?Sized>(
                 let Some(today) = window_end.flatten() else {
                     continue;
                 };
-                if let Some((a, b)) = clamp_to_floor(BarFamily::Day, start, today).await {
+                if let Some((a, b)) = clamp_to_floor(BarUnit::Day, start, today).await {
                     next = or_partial(provider.daily_aggs(sym, a, b, false).await.map(Some), None, partial)
                         .and_then(|bars| bars.first().map(|b| b.time));
                 }
@@ -230,12 +230,12 @@ async fn proven_between<P: DataProvider + ?Sized>(
         let Some(end) = day_of(segment.end_sec).filter(|end| *end > start) else {
             continue;
         };
-        let other = SymbolRef { exchange: sym.exchange.clone(), ticker: segment.ticker.clone() };
+        let other = sym.with_ticker(&segment.ticker);
         let archived = or_partial(provider.daily_archive(&other, false).await, Vec::new(), partial);
         let mut span = times_inside(&archived, segment.start_sec, segment.end_sec);
         if span.is_none() {
             // No archive for that symbol: its recent bars.
-            if let Some((a, b)) = clamp_to_floor(BarFamily::Day, start, end - Duration::days(1)).await {
+            if let Some((a, b)) = clamp_to_floor(BarUnit::Day, start, end - Duration::days(1)).await {
                 let recent = or_partial(provider.daily_aggs(&other, a, b, false).await, Vec::new(), partial);
                 span = times_inside(&recent, segment.start_sec, segment.end_sec);
             }

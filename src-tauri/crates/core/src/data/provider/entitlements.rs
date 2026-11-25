@@ -17,7 +17,8 @@
  * A generation counter drops the result of a probe that a newer one (key
  * change) superseded.
  */
-use super::capabilities::{BarFamily, Entitlements, ProviderCapabilities, StreamCaps};
+use super::capabilities::{Entitlements, ProviderCapabilities, StreamCaps};
+use crate::data::interval::BarUnit;
 use super::Provider;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -227,7 +228,7 @@ async fn run(app: HostRef, provider: Provider, gen: u64) {
 /// Oldest available bar date for `family`, or `None` when unknown (no key,
 /// probe failed, or the first probe took longer than `FLOOR_WAIT`). Waits only
 /// while the first probe for the current key is running.
-pub async fn history_floor(family: BarFamily) -> Option<NaiveDate> {
+pub async fn history_floor(family: BarUnit) -> Option<NaiveDate> {
     let mut rx = cell().subscribe();
     let settled = tokio::time::timeout(FLOOR_WAIT, rx.wait_for(|s| s.settled))
         .await

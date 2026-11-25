@@ -93,3 +93,29 @@ describe("agent guide resources", () => {
     }
   });
 });
+
+describe("the AI assistant's confirmation (REQ-ASSIST-CLI-003.A3)", () => {
+  const ran: string[] = [];
+  const s: AgentServerDef = {
+    ...server,
+    tools: [
+      { name: "delete_alert", title: "", description: "", inputSchema: { type: "object" }, annotations: { destructiveHint: true }, run: async (a) => (ran.push(`delete ${a.id}`), "Deleted.") },
+      { name: "get_chart", title: "", description: "", inputSchema: { type: "object" }, annotations: { readOnlyHint: true }, run: async () => "chart" },
+    ],
+  };
+  const call = (name: string, confirm: () => Promise<boolean>) =>
+    handleMessage(s, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: { id: "a1" } } }), { confirm }).then((r) => JSON.parse(r).result);
+
+  it("a destructive tool runs only once the user allows it", async () => {
+    expect(await call("delete_alert", async () => false)).toEqual({ content: [{ type: "text", text: "The user did not allow it." }], isError: true });
+    expect(ran).toEqual([]);
+    expect((await call("delete_alert", async () => true)).content[0].text).toBe("Deleted.");
+    expect(ran).toEqual(["delete a1"]);
+  });
+
+  it("other tools are not asked about", async () => {
+    let asked = false;
+    await call("get_chart", async () => ((asked = true), false));
+    expect(asked).toBe(false);
+  });
+});

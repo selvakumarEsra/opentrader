@@ -9,10 +9,10 @@
  * read its per-session disk cache.
  */
 use crate::data::gateway;
-use crate::data::provider::capabilities::BarFamily;
+use crate::data::interval::BarUnit;
 use crate::data::provider::{entitlements, Provider};
 use crate::data::market_rest::DayMemo;
-use crate::data::symbol::SymbolRef;
+use crate::data::symbol::Symbol;
 use crate::data::calendar::SessionCalendar;
 use crate::data::types::Candle;
 use crate::error::{Error, Result};
@@ -53,7 +53,7 @@ pub async fn clear_cache() -> Result<()> {
 }
 
 /// The symbol's trading calendar (its session: weekdays, holidays, zone).
-async fn calendar_of(provider: &Provider, sym: &SymbolRef) -> Result<SessionCalendar> {
+async fn calendar_of(provider: &Provider, sym: &Symbol) -> Result<SessionCalendar> {
     let session = provider.symbol_session(sym).await?;
     Ok(SessionCalendar::new(&session))
 }
@@ -63,7 +63,7 @@ async fn calendar_of(provider: &Provider, sym: &SymbolRef) -> Result<SessionCale
 /// nothing is fetched. Asking for days before the floor returns no bars, and
 /// the REST cache would then store them as empty no-trade days.
 async fn clamp_to_floor(
-    family: BarFamily,
+    family: BarUnit,
     from: NaiveDate,
     to: NaiveDate,
 ) -> Option<(NaiveDate, NaiveDate)> {
@@ -74,12 +74,12 @@ async fn clamp_to_floor(
 
 /// An economic series ("ECONOMICS:<ID>"): its observations as daily bars
 /// (open = high = low = close = the value, no volume).
-fn economic(sym: &SymbolRef) -> bool {
-    crate::data::market_rest::economics::is_economic(&sym.exchange)
+fn economic(sym: &Symbol) -> bool {
+    crate::data::market_rest::economics::is_economic(sym.exchange())
 }
 
-async fn economic_bars(sym: &SymbolRef) -> Result<Vec<Candle>> {
-    let s = crate::data::market_rest::economics::fetch_series(&sym.ticker).await?;
+async fn economic_bars(sym: &Symbol) -> Result<Vec<Candle>> {
+    let s = crate::data::market_rest::economics::fetch_series(sym.ticker()).await?;
     Ok(s.time
         .iter()
         .zip(&s.value)
@@ -102,7 +102,7 @@ fn day_of(sec: f64) -> Option<NaiveDate> {
 
 /// The split-adjusted daily series of `sym` over its last `days` sessions
 /// (see [`joined_daily`]), memoised for the day.
-async fn daily_series(provider: &Provider, cal: &SessionCalendar, sym: &SymbolRef, days: u32) -> Result<Arc<Vec<Candle>>> {
+async fn daily_series(provider: &Provider, cal: &SessionCalendar, sym: &Symbol, days: u32) -> Result<Arc<Vec<Candle>>> {
     Ok(daily_series_read(provider, cal, sym, days).await?.0)
 }
 
@@ -111,19 +111,19 @@ async fn daily_series(provider: &Provider, cal: &SessionCalendar, sym: &SymbolRe
 async fn daily_series_read(
     provider: &Provider,
     cal: &SessionCalendar,
-    sym: &SymbolRef,
+    sym: &Symbol,
     days: u32,
 ) -> Result<(Arc<Vec<Candle>>, bool)> {
     let to = cal.window_end();
 
     // Instant path: same (ticker, days) already assembled today.
-    if let Some(series) = DAILY_MEM.get(&(sym.full(), days), |as_of| *as_of == to) {
+    if let Some(series) = DAILY_MEM.get(&(sym.to_string(), days), |as_of| *as_of == to) {
         return Ok((series, false));
     }
 
     let dates = cal.last_trading_days(days.max(1) as usize);
     let wanted_from = *dates.first().unwrap_or(&to);
-    let Some((from, to)) = clamp_to_floor(BarFamily::Day, wanted_from, to).await else {
+    let Some((from, to)) = clamp_to_floor(BarUnit::Day, wanted_from, to).await else {
         return Err(no_data("daily", sym, days));
     };
 
@@ -133,7 +133,7 @@ async fn daily_series_read(
     }
     let bars = Arc::new(joined.bars);
     if joined.complete {
-        DAILY_MEM.insert((sym.full(), days), to, bars.clone());
+        DAILY_MEM.insert((sym.to_string(), days), to, bars.clone());
     }
     Ok((bars, joined.partial))
 }
@@ -155,7 +155,7 @@ fn page_without_symbol_history() -> Error {
     gateway::ApiError::transport("symbol history", "lookup failed").into()
 }
 
-fn no_data(family: &str, sym: &SymbolRef, days: u32) -> Error {
+fn no_data(family: &str, sym: &Symbol, days: u32) -> Error {
     Error::not_found(format!("no {family} data for {sym} in last {days} days"))
 }
 
@@ -172,7 +172,7 @@ pub async fn get_daily_history(
     days: u32,
     adjusted: bool,
 ) -> Result<History> {
-    let sym = SymbolRef::parse(&symbol);
+    let sym = Symbol::parse(&symbol);
     if economic(&sym) {
         return Ok(History { bars: economic_bars(&sym).await?, partial: false });
     }
@@ -194,7 +194,7 @@ pub async fn get_minute_history(
     interval_min: u32,
     adjusted: bool,
 ) -> Result<History> {
-    let sym = SymbolRef::parse(&symbol);
+    let sym = Symbol::parse(&symbol);
     if economic(&sym) {
         return Err(Error::invalid(DAILY_ONLY));
     }
@@ -202,7 +202,7 @@ pub async fn get_minute_history(
     let dates = cal.last_trading_days(days.max(1) as usize);
     let to = cal.window_end();
     let from = *dates.first().unwrap_or(&to);
-    let Some((from, to)) = clamp_to_floor(BarFamily::Minute, from, to).await else {
+    let Some((from, to)) = clamp_to_floor(BarUnit::Minute, from, to).await else {
         return Err(no_data("minute", &sym, days));
     };
 
@@ -225,7 +225,7 @@ pub async fn get_second_history(
     days: u32,
     adjusted: bool,
 ) -> Result<History> {
-    let sym = SymbolRef::parse(&symbol);
+    let sym = Symbol::parse(&symbol);
     if economic(&sym) {
         return Err(Error::invalid(DAILY_ONLY));
     }
@@ -234,7 +234,7 @@ pub async fn get_second_history(
     // Pad the lookback by a day so a `days = 1` request still spans the
     // most recent full session even before today's bars exist.
     let from = to - Duration::days((days.max(1) as i64) + 1);
-    let Some((from, to)) = clamp_to_floor(BarFamily::Second, from, to).await else {
+    let Some((from, to)) = clamp_to_floor(BarUnit::Second, from, to).await else {
         return Ok(History { bars: Vec::new(), partial: false });
     };
     let (bars, partial) = chained_aggs(provider, &cal, &sym, Span::Second(mult), from, to, true, true).await?;
@@ -254,7 +254,7 @@ pub async fn get_second_history_tail(
     since_sec: f64,
     adjusted: bool,
 ) -> Result<Vec<Candle>> {
-    let sym = SymbolRef::parse(&symbol);
+    let sym = Symbol::parse(&symbol);
     if economic(&sym) {
         return Ok(Vec::new());
     }
@@ -296,7 +296,7 @@ fn aggregates_before_window(cal: &SessionCalendar, to: NaiveDate, span_days: u32
 pub async fn get_aggregates_before(
     provider: &Provider,
     symbol: String,
-    timespan: String,
+    timespan: BarUnit,
     mult: u32,
     // Seconds since epoch. `f64` (not i64) because specta forbids exporting
     // 64-bit ints to TypeScript, and it matches `Candle.time`'s type anyway.
@@ -304,7 +304,13 @@ pub async fn get_aggregates_before(
     span_days: u32,
     adjusted: bool,
 ) -> Result<Vec<Candle>> {
-    let sym = SymbolRef::parse(&symbol);
+    // Daily bars page back through `get_daily_history_before`, against the same source as their first load.
+    let span = match timespan {
+        BarUnit::Second => Span::Second(mult),
+        BarUnit::Minute => Span::MinuteChunked(mult),
+        BarUnit::Day => return Err(Error::invalid("unsupported timespan for aggregates-before: day")),
+    };
+    let sym = Symbol::parse(&symbol);
     if economic(&sym) {
         return Ok(Vec::new());
     }
@@ -314,20 +320,11 @@ pub async fn get_aggregates_before(
         .date_of(before_sec as i64 - 1)
         .ok_or_else(|| invalid_before(before_sec))?;
     let (from, to) = aggregates_before_window(&cal, to, span_days);
-    let family = match timespan.as_str() {
-        "second" => BarFamily::Second,
-        _ => BarFamily::Minute,
-    };
     // Older than the key's history floor: exhausted, no request.
-    let Some((from, to)) = clamp_to_floor(family, from, to).await else {
+    let Some((from, to)) = clamp_to_floor(span.family(), from, to).await else {
         return Ok(Vec::new());
     };
 
-    let span = match timespan.as_str() {
-        "second" => Span::Second(mult),
-        "minute" => Span::MinuteChunked(mult),
-        other => return Err(Error::invalid(format!("unsupported timespan for aggregates-before: {other}"))),
-    };
     let (bars, partial) = chained_aggs(provider, &cal, &sym, span, from, to, true, false).await?;
     if partial {
         return Err(page_without_symbol_history());
@@ -351,7 +348,7 @@ pub async fn get_daily_history_before(
     span_days: u32,
     adjusted: bool,
 ) -> Result<Vec<Candle>> {
-    let sym = SymbolRef::parse(&symbol);
+    let sym = Symbol::parse(&symbol);
     // An economic series is loaded whole.
     if economic(&sym) {
         return Ok(Vec::new());
@@ -365,7 +362,7 @@ pub async fn get_daily_history_before(
         return Ok(Vec::new());
     };
     // Older than the key's history floor: exhausted, no request.
-    let Some((from, end)) = clamp_to_floor(BarFamily::Day, from, end).await else {
+    let Some((from, end)) = clamp_to_floor(BarUnit::Day, from, end).await else {
         return Ok(Vec::new());
     };
 

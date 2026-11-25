@@ -7,6 +7,7 @@ import { buildInfo } from "../data/app-update";
 import { currentWindowLabel } from "../window/shell/window-bridge";
 import { indicatorCatalogueResource } from "./catalogue";
 import { AGENT_INSTRUCTIONS, AGENT_PROMPTS, drawingToolsResource, libraryGuideResources } from "./guide";
+import { assistantConfirm } from "./assistant-confirm";
 import { handleMessage, type AgentServerDef } from "./mcp";
 import { createAgentTools, type AgentHost } from "./tools";
 
@@ -31,9 +32,10 @@ export function installAgentBridge(server: AgentServerDef): () => void {
   const label = currentWindowLabel();
   void events.agentRequest
     .listen(async (e) => {
-      const { window, id, body } = e.payload;
+      const { window, id, body, assistant } = e.payload;
       if (window !== label) return;
-      const reply = await handleMessage(server, body).catch((err) =>
+      // A question to the assistant's SDK model: its destructive tools wait for the user's Allow in the panel.
+      const reply = await handleMessage(server, body, assistant ? { confirm: assistantConfirm } : {}).catch((err) =>
         JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32603, message: String(err) } }),
       );
       await commands.agentReply(id, reply);

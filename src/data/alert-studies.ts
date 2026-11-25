@@ -12,7 +12,7 @@ import type { SessionId } from "./session/symbol-sessions";
 import { conditionRules } from "./alert-condition";
 import type { AlertRule, Operand } from "./alert-store";
 import { chartBars, chartLastPrice, indicatorPlotValue, type ChartBar } from "./chart-state-registry";
-import { getIndicatorEntry } from "../window/chart/indicators/registry";
+import { canCalculateHere, getIndicatorEntry } from "../window/chart/indicators/registry";
 import { scriptChartContext } from "../window/chart/indicators/script-chart";
 import { scriptBars } from "../backtester/oakscript";
 import { setSourceResolver, type Bar } from "oakscriptjs";
@@ -116,6 +116,8 @@ export function runStudy(
   };
   // Daily and longer bars at the session open, as on the chart (the values are read by bar index).
   const given = scriptBars(bars as Bar[], chart);
+  // A library study's code is not on this thread yet: it loads now, the next poll calculates (no value meanwhile).
+  if (!canCalculateHere(entry)) return { result: null, bars: given };
   // The inputs of a rule are a store proxy: a plain copy, which a user script's worker can receive.
   const plain = inputs && typeof inputs === "object" ? JSON.parse(JSON.stringify(inputs)) : inputs;
   // A study calculated on other sources (study on study): their values first, read by its source inputs.

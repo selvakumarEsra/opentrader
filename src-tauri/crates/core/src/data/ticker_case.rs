@@ -49,7 +49,7 @@ pub fn to_app(ticker: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::symbol::SymbolRef;
+    use crate::data::symbol::Symbol;
 
     #[test]
     fn share_class_marker_is_a_slash_in_the_app() {
@@ -71,9 +71,9 @@ mod tests {
 
     #[test]
     fn a_full_name_keeps_its_exchange() {
-        let sym = SymbolRef::parse("nyse:bac/pb");
-        assert_eq!((sym.exchange.as_str(), sym.ticker.as_str()), ("NYSE", "BAC/PB"));
-        assert_eq!(to_source(&sym.ticker), "BACpB");
+        let sym = Symbol::parse("nyse:bac/pb");
+        assert_eq!((sym.exchange(), sym.ticker()), ("NYSE", "BAC/PB"));
+        assert_eq!(to_source(sym.ticker()), "BACpB");
     }
 
     /// Every lower-case ticker of the real list has the form the rule covers

@@ -441,7 +441,8 @@ function PluginSettings(props: { plugin: PluginInfo; take: (what: string, p: Pro
             <span class="app-settings-field-label" data-no-translate>{f.label}</span>
             <input
               class="app-settings-input"
-              type="text"
+              type={f.type === "secret" ? "password" : "text"}
+              autocomplete={f.type === "secret" ? "off" : undefined}
               inputmode={f.type === "number" ? "decimal" : undefined}
               value={values()[f.key]}
               onInput={(e) => set(f.key, e.currentTarget.value)}

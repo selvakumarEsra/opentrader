@@ -1,0 +1,90 @@
+{
+  "id": "dhan",
+  "name": "Dhan",
+  "version": "0.1.0",
+  "publisher": "OpenTrader",
+  "description": "Indian stocks, indices, futures and options (NSE, BSE, NFO, BFO, MCX, CDS) with history and live prices from your Dhan account (DhanHQ API). History is kept in a bar store on this computer, or in ClickHouse.",
+  "api": 2,
+  "provides": [
+    "datafeed"
+  ],
+  "exchanges": [
+    "NSE",
+    "BSE",
+    "NFO",
+    "BFO",
+    "MCX",
+    "CDS",
+    "BCD"
+  ],
+  "runtime": {
+    "type": "process",
+    "entry": "opentrader-dhan",
+    "args": []
+  },
+  "settings": [
+    {
+      "key": "clientId",
+      "label": "Client ID (DHAN_CLIENT_ID)",
+      "type": "text",
+      "default": "",
+      "help": "Your Dhan client ID."
+    },
+    {
+      "key": "pin",
+      "label": "PIN (DHAN_PIN)",
+      "type": "secret",
+      "default": "",
+      "help": "Your 6-digit Dhan login PIN."
+    },
+    {
+      "key": "totpSecret",
+      "label": "TOTP secret (DHAN_TOTP_SECRET)",
+      "type": "secret",
+      "default": "",
+      "help": "The key shown when you turned on TOTP for Dhan (the text under the QR code). With the PIN, the plugin makes the day's access token on its own."
+    },
+    {
+      "key": "accessToken",
+      "label": "Access token (DHAN_ACCESS_TOKEN)",
+      "type": "secret",
+      "default": "",
+      "help": "Or an access token made at web.dhan.co (My Profile > Access DhanHQ APIs), used as given instead of the PIN and TOTP. It lasts 24 hours."
+    },
+    {
+      "key": "alwaysRecord",
+      "label": "Always record",
+      "type": "text",
+      "default": "",
+      "help": "Symbols whose 1-minute bars are kept in the bar store for as long as OpenTrader is open, with or without a chart: such as NSE:RELIANCE, NFO:NIFTY26NOVFUT."
+    },
+    {
+      "key": "clickhouseUrl",
+      "label": "ClickHouse URL",
+      "type": "text",
+      "default": "",
+      "help": "Leave empty to keep bars in a file on this computer. Or give a ClickHouse server, such as http://localhost:8123, to keep them there."
+    },
+    {
+      "key": "clickhouseDatabase",
+      "label": "ClickHouse database",
+      "type": "text",
+      "default": "trading_db",
+      "help": "Created if it does not exist."
+    },
+    {
+      "key": "clickhouseUser",
+      "label": "ClickHouse user",
+      "type": "text",
+      "default": "default"
+    },
+    {
+      "key": "clickhousePassword",
+      "label": "ClickHouse password",
+      "type": "secret",
+      "default": ""
+    }
+  ],
+  "setup": "Turn on TOTP for your Dhan account and the DhanHQ data APIs (market data needs Dhan's data plan). Fill in the client ID, PIN and TOTP secret, or paste an access token. Open a symbol such as NSE:RELIANCE, NSE:NIFTY or an option like NFO:NIFTY-24NOV2026-24000-CE. Enable either this plugin or Zerodha for Indian exchanges, not both. Settings, secrets included, are kept in OpenTrader's settings on this computer.",
+  "homepage": "https://github.com/selvakumarEsra/opentrader/tree/main/plugins/dhan"
+}

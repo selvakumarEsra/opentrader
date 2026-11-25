@@ -1,0 +1,96 @@
+{
+  "id": "zerodha",
+  "name": "Zerodha",
+  "version": "0.1.0",
+  "publisher": "OpenTrader",
+  "description": "Indian stocks, indices, futures and options (NSE, BSE, NFO, BFO, MCX, CDS) with history and live prices from your Zerodha Kite Connect app. History is kept in a bar store on this computer, or in ClickHouse.",
+  "api": 2,
+  "provides": [
+    "datafeed"
+  ],
+  "exchanges": [
+    "NSE",
+    "BSE",
+    "NFO",
+    "BFO",
+    "MCX",
+    "CDS",
+    "BCD",
+    "NCO"
+  ],
+  "runtime": {
+    "type": "process",
+    "entry": "opentrader-zerodha",
+    "args": []
+  },
+  "settings": [
+    {
+      "key": "apiKey",
+      "label": "API key (KITE_API_KEY)",
+      "type": "text",
+      "default": "",
+      "help": "Your Kite Connect app's API key (developers.kite.trade)."
+    },
+    {
+      "key": "apiSecret",
+      "label": "API secret (KITE_API_SECRET)",
+      "type": "secret",
+      "default": ""
+    },
+    {
+      "key": "userId",
+      "label": "User ID (KITE_USER_ID)",
+      "type": "text",
+      "default": "",
+      "help": "Your Zerodha client ID, such as AB1234."
+    },
+    {
+      "key": "password",
+      "label": "Password (KITE_PASSWORD)",
+      "type": "secret",
+      "default": ""
+    },
+    {
+      "key": "totpSecret",
+      "label": "TOTP secret (KITE_TOTP_SECRET)",
+      "type": "secret",
+      "default": "",
+      "help": "The key shown when you turned on TOTP in Kite (the text under the QR code). The plugin makes the 6-digit codes from it to log in each day."
+    },
+    {
+      "key": "alwaysRecord",
+      "label": "Always record",
+      "type": "text",
+      "default": "",
+      "help": "Symbols whose 1-minute bars are kept in the bar store for as long as OpenTrader is open, with or without a chart: such as NSE:RELIANCE, NFO:NIFTY26NOVFUT."
+    },
+    {
+      "key": "clickhouseUrl",
+      "label": "ClickHouse URL",
+      "type": "text",
+      "default": "",
+      "help": "Leave empty to keep bars in a file on this computer. Or give a ClickHouse server, such as http://localhost:8123, to keep them there."
+    },
+    {
+      "key": "clickhouseDatabase",
+      "label": "ClickHouse database",
+      "type": "text",
+      "default": "trading_db",
+      "help": "Created if it does not exist."
+    },
+    {
+      "key": "clickhouseUser",
+      "label": "ClickHouse user",
+      "type": "text",
+      "default": "default"
+    },
+    {
+      "key": "clickhousePassword",
+      "label": "ClickHouse password",
+      "type": "secret",
+      "default": ""
+    }
+  ],
+  "setup": "Create a Kite Connect app at developers.kite.trade (history needs its historical data add-on) and open its login URL once in a browser to authorise it. Then fill in the KITE_* fields: the plugin logs in on its own each day and keeps the day's token in its folder. Open a symbol such as NSE:RELIANCE, NSE:NIFTY_50 or an option like NFO:NIFTY26N2424000CE. Enable either this plugin or Dhan for Indian exchanges, not both. Settings, secrets included, are kept in OpenTrader's settings on this computer.",
+  "homepage": "https://github.com/selvakumarEsra/opentrader/tree/main/plugins/zerodha"
+}

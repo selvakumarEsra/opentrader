@@ -11,7 +11,7 @@ use crate::data::provider::{HistoryProvider, GatewayProvider, ReferenceProvider}
 
 /// The US equities calendar the current provider reports.
 fn us() -> SessionCalendar {
-    let session = tokio::runtime::Runtime::new().unwrap().block_on(GatewayProvider.symbol_session(&SymbolRef::parse("NASDAQ:AAPL"))).unwrap();
+    let session = tokio::runtime::Runtime::new().unwrap().block_on(GatewayProvider.symbol_session(&Symbol::parse("NASDAQ:AAPL"))).unwrap();
     SessionCalendar::new(&session)
 }
 
@@ -206,7 +206,7 @@ async fn dividend_adjust_live() {
     let provider: Provider = Arc::new(GatewayProvider);
     let out = std::env::var("OT_OUT").unwrap();
     for t in std::env::var("OT_TICKERS").unwrap_or_else(|_| "NASDAQ:NFLX,NASDAQ:NVDA,NASDAQ:AAPL,NYSE:KO".into()).split(',') {
-        let sym = SymbolRef::parse(t);
+        let sym = Symbol::parse(t);
         let cal = SessionCalendar::new(&provider.symbol_session(&sym).await.unwrap());
         let plain = daily_series(&provider, &cal, &sym, DIVIDEND_BASIS_DAYS).await.unwrap();
         let adjusted = with_dividends(&provider, &cal, &sym, (*plain).clone(), true).await.unwrap();
@@ -217,7 +217,7 @@ async fn dividend_adjust_live() {
         );
         let rows: Vec<String> =
             plain.iter().zip(&adjusted).map(|(p, a)| format!("{},{},{},{}", p.time, p.close, a.close, a.volume - p.volume)).collect();
-        std::fs::write(format!("{out}/ot-{}.csv", sym.ticker), rows.join("\n")).unwrap();
+        std::fs::write(format!("{out}/ot-{}.csv", sym.ticker()), rows.join("\n")).unwrap();
     }
 }
 
@@ -285,10 +285,10 @@ fn before_window_midweek() {
 #[ignore = "hits the gateway; run explicitly"]
 async fn daily_archive_join_live() {
     let provider = GatewayProvider;
-    let sym = SymbolRef::parse("NASDAQ:AAPL");
+    let sym = Symbol::parse("NASDAQ:AAPL");
     let cal = SessionCalendar::new(&provider.symbol_session(&sym).await.unwrap());
     let to = cal.window_end();
-    let from = clamp_to_floor(BarFamily::Day, *cal.last_trading_days(7560).first().unwrap(), to)
+    let from = clamp_to_floor(BarUnit::Day, *cal.last_trading_days(7560).first().unwrap(), to)
         .await
         .unwrap()
         .0;
@@ -344,7 +344,7 @@ async fn daily_archive_join_live() {
 
     let raw = provider.daily_archive(&sym, false).await.unwrap();
     assert_eq!((raw[0].close, raw[0].volume), (22.18, 3_957_751.0));
-    let none = provider.daily_archive(&SymbolRef::parse("ZZZZQQ"), true).await.unwrap();
+    let none = provider.daily_archive(&Symbol::parse("ZZZZQQ"), true).await.unwrap();
     assert!(none.is_empty());
 }
 
@@ -360,7 +360,7 @@ async fn archive_start_live() {
     let tickers: Vec<String> =
         std::env::var("OT_TICKERS").unwrap_or_else(|_| "TLF,WEX,GHC,META,GSL,AAPL".into()).split(',').map(str::to_string).collect();
     let to = crate::data::trading_calendar::ny_today();
-    let from = clamp_to_floor(BarFamily::Day, to - Duration::days(30 * 366), to).await.unwrap().0;
+    let from = clamp_to_floor(BarUnit::Day, to - Duration::days(30 * 366), to).await.unwrap().0;
     let day = |sec: f64| chrono::DateTime::from_timestamp(sec as i64, 0).unwrap().date_naive();
     let rows: Vec<String> = stream::iter(tickers)
         .map(|t| async move {
@@ -369,15 +369,15 @@ async fn archive_start_live() {
             if live.is_empty() || archive.is_empty() {
                 return format!("{t},,,,no live bars or no archive");
             }
-            let sym = SymbolRef::parse(&ticker_case::to_app(&t));
+            let sym = Symbol::parse(&ticker_case::to_app(&t));
             let listed = GatewayProvider.listing_date(&sym).await.ok().flatten();
             let Ok(changes) = GatewayProvider.symbol_changes(&sym).await else {
                 return format!("{t},,,,symbol history not read");
             };
             let listing = listing_of(&GatewayProvider, &sym).await;
-            let before = prepend_archive(live.clone(), archive.clone(), 0.0, &Listing::new(&sym.ticker, listed, &[]));
+            let before = prepend_archive(live.clone(), archive.clone(), 0.0, &Listing::new(sym.ticker(), listed, &[]));
             let after = prepend_archive(live.clone(), archive, 0.0, &listing);
-            let named = Listing::new(&sym.ticker, listed, &changes).taken_sec.is_some();
+            let named = Listing::new(sym.ticker(), listed, &changes).taken_sec.is_some();
             let dropped = if named && listing.taken_sec.is_none() { " (move not proven, ignored)" } else { "" };
             let history = changes.iter().map(|c| format!("{} {}", c.ticker, c.date)).collect::<Vec<_>>().join(" < ") + dropped;
             format!("{t},{},{},{},{history}", day(before[0].time), day(after[0].time), day(live[0].time))
@@ -412,17 +412,17 @@ async fn archive_start_live() {
 #[ignore = "hits the gateway; run explicitly"]
 async fn symbol_chain_live() {
     let provider: Provider = Arc::new(GatewayProvider);
-    let cal = SessionCalendar::new(&provider.symbol_session(&SymbolRef::parse("NASDAQ:AAPL")).await.unwrap());
+    let cal = SessionCalendar::new(&provider.symbol_session(&Symbol::parse("NASDAQ:AAPL")).await.unwrap());
     let to = cal.window_end();
     let wanted_from = *cal.last_trading_days(7560).first().unwrap();
-    let from = clamp_to_floor(BarFamily::Day, wanted_from, to).await.unwrap().0;
+    let from = clamp_to_floor(BarUnit::Day, wanted_from, to).await.unwrap().0;
     // No entitlement store in a test: the oldest minute bar is probed.
     let probe = provider.probe_history().await.unwrap();
     let minute_floor = NaiveDate::parse_from_str(&probe.floor.minute.unwrap(), "%Y-%m-%d").unwrap();
     let tickers = std::env::var("OT_TICKERS").unwrap_or_else(|_| "META,T,WEX,BALL,ELV,COR,KELYA,AAPL,TLF,GHC".into());
     let mut rows = vec!["ticker,earlier_symbols,bars,first_bar,first_close,last_before_change,close_before,first_after_change,open_after,largest_close_move_pct,largest_move_date,minute_bars_before,minute_bars_after,complete".to_string()];
     for t in tickers.split(',') {
-        let sym = SymbolRef::parse(t);
+        let sym = Symbol::parse(t);
         let listing = listing_of(provider.as_ref(), &sym).await;
         let JoinedDaily { bars, complete, .. } = joined_daily(&provider, &cal, &sym, wanted_from, from, to, true).await.unwrap();
         assert!(bars.windows(2).all(|w| w[0].time < w[1].time), "{t}: times not strictly ascending");
@@ -507,7 +507,7 @@ async fn daily_load_smoke() {
     for sym in ["AMD", "NVDA", "TSLA"] {
         let t0 = std::time::Instant::now();
         let bars = provider
-            .daily_aggs(&SymbolRef::parse(sym), from, to, true)
+            .daily_aggs(&Symbol::parse(sym), from, to, true)
             .await
             .unwrap_or_else(|e| panic!("{sym} daily load failed: {e}"));
         let cold_ms = t0.elapsed().as_millis();
@@ -515,7 +515,7 @@ async fn daily_load_smoke() {
         let last = bars.last().unwrap();
 
         let t1 = std::time::Instant::now();
-        let warm = provider.daily_aggs(&SymbolRef::parse(sym), from, to, true).await.unwrap();
+        let warm = provider.daily_aggs(&Symbol::parse(sym), from, to, true).await.unwrap();
         let warm_ms = t1.elapsed().as_millis();
 
         eprintln!(
@@ -547,13 +547,13 @@ fn second_windows_one_session_each() {
 #[ignore = "hits the gateway; run explicitly"]
 async fn second_window_live() {
     let provider: Provider = Arc::new(GatewayProvider);
-    let cal = SessionCalendar::new(&provider.symbol_session(&SymbolRef::parse("NASDAQ:AAPL")).await.unwrap());
+    let cal = SessionCalendar::new(&provider.symbol_session(&Symbol::parse("NASDAQ:AAPL")).await.unwrap());
     let n: usize = std::env::var("OT_SESSIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
     let today = crate::data::trading_calendar::ny_today();
     let sessions: Vec<NaiveDate> = cal.last_trading_days(n + 1).into_iter().filter(|&d| d < today).collect();
     let (from, to) = (sessions[0], *sessions.last().unwrap());
     for t in std::env::var("OT_TICKERS").unwrap_or_else(|_| "SPY".into()).split(',') {
-        let sym = SymbolRef::parse(t);
+        let sym = Symbol::parse(t);
         let start = std::time::Instant::now();
         let bars = span::span_aggs(&provider, &cal, &sym, Span::Second(10), from, to, true).await.unwrap();
         eprintln!("{t}: {} bars over {} sessions in {:?}", bars.len(), sessions.len(), start.elapsed());
@@ -569,4 +569,14 @@ async fn second_window_live() {
         }
         assert!(bars.windows(2).all(|w| w[0].time < w[1].time), "{t}: bars out of order or repeated");
     }
+}
+
+/// Daily bars page back through their own command: `Day` is refused before the
+/// calendar, the floor or any bar is asked for.
+#[test]
+fn bars_before_refuse_days_without_asking() {
+    let provider: crate::data::provider::Provider = std::sync::Arc::new(GatewayProvider);
+    let run = get_aggregates_before(&provider, "NASDAQ:AAPL".into(), BarUnit::Day, 1, 1.7e9, 1, true);
+    let got = tokio::runtime::Runtime::new().unwrap().block_on(run);
+    assert!(matches!(got, Err(Error::InvalidInput(_))), "{got:?}");
 }

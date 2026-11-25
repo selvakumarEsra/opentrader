@@ -7,7 +7,8 @@
  *
  * The library (several megabytes) is not part of the first download: the
  * lists come from its names (`virtual:indicator-manifest`, read from the
- * library at build time) and the library itself is imported on first use —
+ * library at build time) and its entries from their metadata, without the
+ * code (indicator-code.ts, REQ-PERF-001), loaded on first use —
  * started once the app is up (`loadIndicatorLibrary`), or by the first
  * `getIndicatorEntry` of one of its studies. Until it is there such an entry
  * is undefined; the reads track `indicatorLibraryLoaded`, so the chart's
@@ -15,6 +16,9 @@
  */
 import { createSignal } from 'solid-js';
 import type { IndicatorRegistryEntry } from 'lightweight-charts-indicators';
+import { libraryEntriesToLoad } from './indicator-code';
+
+export { canCalculateHere, indicatorCodeLoaded, loadIndicatorCode } from './indicator-code';
 import manifest from 'virtual:indicator-manifest';
 import { getUserIndicatorEntry, isUserIndicatorId } from './user-scripts';
 import { getStrategyEntry, isStrategyId } from './strategy-entries';
@@ -45,10 +49,10 @@ const [loaded, setLoaded] = createSignal(false);
 export const indicatorLibraryLoaded = loaded;
 let loading: Promise<void> | null = null;
 
-/** Import the indicator library (once); its entries join the registry. */
+/** Load the indicator library's entries (once); they join the registry. */
 export function loadIndicatorLibrary(): Promise<void> {
-  loading ??= import('lightweight-charts-indicators').then((m) => {
-    for (const e of m.indicatorRegistry) if (!LOCAL.has(e.id)) { byId.set(e.id, e); libraryEntries.add(e); }
+  loading ??= libraryEntriesToLoad().then((entries) => {
+    for (const e of entries) if (!LOCAL.has(e.id)) { byId.set(e.id, e); libraryEntries.add(e); }
     setLoaded(true);
   });
   return loading;

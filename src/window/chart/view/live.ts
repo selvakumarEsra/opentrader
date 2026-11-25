@@ -23,6 +23,7 @@ import { cachedSymbolSessions } from "../../../data/session";
 import { setDataForType, type OHLC } from "../chart-types";
 import { toOHLC } from "./helpers";
 import { type ChartCx } from "./context";
+import { paintWait } from "./live-paint-gap";
 
 /** Shortest time between two live paints: 30 per second. The reference app's live updates come 25 ms apart at the
  *  closest (277 ms median), measured on a busy symbol. */
@@ -125,7 +126,7 @@ export function createLive(cx: ChartCx): LiveApi {
    *  per live update with nothing drawn (#249). */
   function schedulePaint() {
     if (waitingShown || timer || calculating) return;
-    const wait = Math.max(0, paintedAt + LIVE_PAINT_MS - performance.now());
+    const wait = paintWait(paintedAt, performance.now(), props.active, LIVE_PAINT_MS);
     timer = setTimeout(() => {
       timer = null;
       if (!document.hidden) {

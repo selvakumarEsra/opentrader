@@ -1,6 +1,9 @@
 /* Messages between the window and the study workers (study-calc.ts). */
 import type { Bar } from "oakscriptjs";
 import { isPacked, noValue, packPoints, packedPrefix } from "./packed-points";
+import { DEPTH, ITEMS, RESUMED_MARGIN, SHORT, encodeTimed, goesByItems, isItems, isSplice, splicedList, type DeltaBound, type Items } from "./delta-encodings";
+
+export type { DeltaBound } from "./delta-encodings";
 
 /** Accessors of the chart context a study may call (StudyCalcContext). */
 export const ACCESSORS = ["bars", "symbolInfo", "lowerBars", "chartEvents", "fundamentals"] as const;
@@ -160,17 +163,27 @@ function samePoint(a: unknown, b: unknown): boolean {
 /**
  * `next` as the changes from `prev` (arrays as their tail after the shared prefix), down to `depth` levels. `bound`: a
  * resumed run recalculated the bars from `bound.from` (its arrays of one point per bar, `bound.bars` long, may hold
- * the same point objects changed in place): those arrays are sent from that bar at the latest.
+ * the same point objects changed in place): those arrays are sent from that bar at the latest. The other encodings
+ * (item by item, by time, splices): delta-encodings.ts.
  */
-export function encodeDelta(next: unknown, prev: unknown, depth = 0, bound?: { from: number; bars: number }): unknown {
+/** `next` after its first `k` points; whole when they are few (a short shared prefix is not worth it). */
+const tailOf = (next: unknown[], k: number): unknown => (k >= 32 ? ({ [TAIL]: k, items: next.slice(k) } satisfies Tail) : next);
+
+export function encodeDelta(next: unknown, prev: unknown, depth = 0, bound?: DeltaBound): unknown {
   if (Array.isArray(next) && Array.isArray(prev)) {
-    const n = Math.min(next.length, prev.length, bound && next.length === bound.bars ? bound.from : Infinity);
-    let k = packedPrefix(next, prev, n) ?? 0;
-    if (!isPacked(prev)) while (k < n && samePoint(next[k], prev[k])) k++;
-    // A short shared prefix is not worth it.
-    return k < 32 ? next : ({ [TAIL]: k, items: next.slice(k) } satisfies Tail);
+    if (goesByItems(next, depth)) return { [ITEMS]: next.map((item, i) => encodeDelta(item, prev[i], depth + 1, bound)) } satisfies Items;
+    const timed = encodeTimed(next, prev, bound, samePoint);
+    if (timed) return "shared" in timed ? tailOf(next, timed.shared) : timed;
+    const from = bound && next.length === bound.bars ? bound.from : null;
+    const n = Math.min(next.length, prev.length, from ?? Infinity);
+    // A resumed run's list of one point per bar: the points well before its first recalculated bar are the ones sent,
+    // read one by one (the columns of a packed list are made from the whole list).
+    const start = from !== null ? Math.max(0, n - RESUMED_MARGIN) : 0;
+    let k = from === null ? packedPrefix(next, prev, n, start) : null;
+    if (k === null) for (k = start; k < n && samePoint(next[k], prev[k]); k++);
+    return tailOf(next, k);
   }
-  if (depth < 3 && isPlain(next) && isPlain(prev)) {
+  if (depth < DEPTH && isPlain(next) && isPlain(prev)) {
     const out: Record<string, unknown> = {};
     for (const k in next) out[k] = encodeDelta(next[k], prev[k], depth + 1, bound);
     return out;
@@ -189,14 +202,46 @@ export function deltaSnapshot(result: unknown, bars: number, depth = 0): unknown
   if (Array.isArray(result)) {
     if (result.length === bars || isPacked(result)) return packPoints(result.slice());
     const packed = packPoints(result);
-    return packed !== result ? packed : result.map((p) => (isPlain(p) ? { ...p } : p));
+    if (packed !== result) return packed;
+    // The items of a short list are compared one by one (encodeDelta): copied down as far, as a run may change
+    // what they hold in place.
+    if (depth < DEPTH && result.length <= SHORT) return result.map((p) => (isPlain(p) ? deltaSnapshot(p, bars, depth + 1) : p));
+    return result.map((p) => (isPlain(p) ? { ...p } : p));
   }
-  if (depth < 3 && isPlain(result)) {
+  if (depth < DEPTH && isPlain(result)) {
     const out: Record<string, unknown> = {};
     for (const k in result) out[k] = deltaSnapshot(result[k], bars, depth + 1);
     return out;
   }
   return result;
+}
+
+/**
+ * The snapshot of the result `delta` (encodeDelta) describes from the one of `prev` (deltaSnapshot): `prev`'s lists
+ * with their changed points, copied (a resumed run changes its newest points in place). Copying every per-bar list
+ * of a result on every update was most of a long chart's update; `prev` is not read again.
+ */
+export function advanceSnapshot(prev: unknown, delta: unknown, bars: number, depth = 0): unknown {
+  if (isSplice(delta) && Array.isArray(prev)) return splicedList(delta, prev, true);
+  if (isPlain(delta) && TAIL in delta && Array.isArray(prev)) {
+    const t = delta as unknown as Tail;
+    prev.length = t[TAIL];
+    for (const item of t.items) prev.push(isPlain(item) ? { ...item } : item);
+    return prev;
+  }
+  if (isItems(delta) && Array.isArray(prev)) {
+    const items = delta[ITEMS];
+    for (let i = 0; i < items.length; i++) prev[i] = advanceSnapshot(prev[i], items[i], bars, depth + 1);
+    prev.length = items.length;
+    return prev;
+  }
+  if (isPlain(delta) && isPlain(prev) && !(TAIL in delta) && !isItems(delta) && !isSplice(delta)) {
+    const out: Record<string, unknown> = {};
+    for (const k in delta) out[k] = advanceSnapshot(prev[k], delta[k], bars, depth + 1);
+    return out;
+  }
+  // A value sent whole.
+  return deltaSnapshot(delta, bars, depth);
 }
 
 /**
@@ -252,6 +297,16 @@ export function shareStrings(v: unknown, depth = 4): void {
 /** The result `delta` (encodeDelta) describes from `prev`. Its arrays are those of `prev`, changed in place (a copy
  *  of every array of a heavy study cost tens of milliseconds per update): `prev` is not read again. */
 export function applyDelta(delta: unknown, prev: unknown, changed = new Set<unknown[]>()): unknown {
+  if (isSplice(delta) || isItems(delta)) {
+    const list = Array.isArray(prev) ? prev : [];
+    // An array the result holds twice (two plots of the same points) changes once.
+    if (changed.has(list)) return list;
+    changed.add(list);
+    const out = isSplice(delta) ? splicedList(delta, list, false) : delta[ITEMS].map((item, i) => applyDelta(item, list[i], changed));
+    list.length = 0;
+    for (const p of out) list.push(p);
+    return list;
+  }
   if (isPlain(delta) && TAIL in delta) {
     const t = delta as unknown as Tail;
     const list = prev as unknown[];

@@ -1,0 +1,30 @@
+[package]
+name = "opentrader-plugin-kit"
+version = "0.1.0"
+description = "What OpenTrader's data plugins share: the bar store, the app connection, history filling, search"
+edition = "2021"
+publish = false
+
+# Built only as a dependency of the plugins (each its own workspace).
+[workspace]
+
+[dependencies]
+tokio = { version = "1.52", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+chrono-tz = "0.10"
+dirs = "6"
+rusqlite = { version = "0.40", features = ["bundled"] }
+ureq = { version = "3", default-features = false }
+hmac = "0.12"
+sha1 = "0.10"
+# The WebSocket stream loop (`socket`), for the plugins whose broker streams over a WebSocket.
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+
+[features]
+socket = ["dep:tokio-tungstenite", "dep:futures-util"]
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["full", "test-util"] }

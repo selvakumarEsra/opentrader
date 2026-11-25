@@ -1,0 +1,185 @@
+name: Plugins zerodha and dhan
+
+# Builds the Indian-market data plugins (plugins/zerodha, plugins/dhan; both on plugins/kit) as one program per
+# system, each also zipped with its manifest (plugins/package.py), and releases them to OUR repository,
+# selvakumarEsra/opentrader, never to upstream: the release job runs only there and names it.
+#   - On a pushed tag plugin-zerodha-v<version> or plugin-dhan-v<version>: that plugin's GitHub Release. The version
+#     must match the plugin's opentrader-plugin.json and Cargo.toml.
+#   - Called by the app's Release workflow (release.yml) with its release tag v<app version>: both plugins' files, and
+#     <id>-SHA256SUMS, uploaded to that (draft) release.
+#   - Manual run (Actions tab -> "Run workflow"): both plugins' zips as workflow artifacts only.
+# With the secrets TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD each zip also gets its .sig and a
+# catalog entry (catalog-entry-<id>-<platform>.json).
+on:
+  push:
+    tags: ['plugin-zerodha-v*', 'plugin-dhan-v*']
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: 'The app release (v<version>) the plugin files are added to'
+        type: string
+        required: true
+
+env:
+  # The plugin's own tag on a push of it; empty when called or run by hand.
+  TAG: ${{ !inputs.release_tag && github.ref_type == 'tag' && github.ref_name || '' }}
+  RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+  RELEASE_REPO: selvakumarEsra/opentrader
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      plugins: ${{ steps.p.outputs.plugins }}
+    steps:
+      - id: p
+        run: |
+          case "$TAG" in
+            plugin-zerodha-v*) echo 'plugins=["zerodha"]' >> "$GITHUB_OUTPUT" ;;
+            plugin-dhan-v*) echo 'plugins=["dhan"]' >> "$GITHUB_OUTPUT" ;;
+            *) echo 'plugins=["zerodha","dhan"]' >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJSON(needs.plan.outputs.plugins) }}
+        platform: [windows, macos, linux]
+        include:
+          - platform: windows
+            os: windows-latest
+          - platform: macos
+            os: macos-latest
+          - platform: linux
+            os: ubuntu-22.04        # an older glibc: the program runs on more Linux systems
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: plugins/${{ matrix.plugin }}
+    env:
+      PLUGIN: ${{ matrix.plugin }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Check version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          manifest=$(node -p "require('./opentrader-plugin.json').version")
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::Cargo.toml says $version, opentrader-plugin.json says $manifest"; exit 1
+          fi
+          if [ -n "$TAG" ] && [ "$TAG" != "plugin-$PLUGIN-v$version" ]; then
+            echo "::error::Tag $TAG does not match the plugin version $version (expected plugin-$PLUGIN-v$version)"; exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Test
+        run: cargo test --locked && (cd ../kit && cargo test --locked)
+
+      - name: Build
+        run: |
+          bin="opentrader-$PLUGIN"
+          case "${{ matrix.platform }}" in
+            macos)
+              cargo build --release --locked --target aarch64-apple-darwin
+              cargo build --release --locked --target x86_64-apple-darwin
+              mkdir -p target/universal
+              lipo -create -output "target/universal/$bin" \
+                "target/aarch64-apple-darwin/release/$bin" "target/x86_64-apple-darwin/release/$bin"
+              echo "BINARY=target/universal/$bin" >> "$GITHUB_ENV" ;;
+            windows)
+              cargo build --release --locked
+              echo "BINARY=target/release/$bin.exe" >> "$GITHUB_ENV" ;;
+            *)
+              cargo build --release --locked
+              echo "BINARY=target/release/$bin" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Smoke test
+        run: '"$BINARY" --help'
+
+      - name: Package
+        run: |
+          zip=$(python ../package.py zip "$PLUGIN" "$BINARY" ${{ matrix.platform }} dist)
+          echo "ZIP=$zip" >> "$GITHUB_ENV"
+          echo "Package: $zip"
+
+      - name: Sign
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        run: |
+          npx --yes @tauri-apps/cli@2.12.3 signer sign "$ZIP"
+          test -f "$ZIP.sig"
+          python ../package.py entry "$PLUGIN" "$ZIP" ${{ matrix.platform }} > "dist/catalog-entry-$PLUGIN-${{ matrix.platform }}.json"
+
+      - name: Not signed
+        if: env.TAURI_SIGNING_PRIVATE_KEY == ''
+        run: |
+          echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set: $ZIP is not signed and has no catalog entry."
+
+      - name: Attest
+        if: env.RELEASE_TAG != '' && github.repository == 'selvakumarEsra/opentrader'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: plugins/${{ matrix.plugin }}/dist/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: india-${{ matrix.plugin }}-${{ matrix.platform }}
+          path: plugins/${{ matrix.plugin }}/dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [plan, build]
+    if: github.repository == 'selvakumarEsra/opentrader' && (inputs.release_tag != '' || github.ref_type == 'tag')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        plugin: ${{ fromJSON(needs.plan.outputs.plugins) }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          pattern: india-${{ matrix.plugin }}-*
+          merge-multiple: true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLUGIN: ${{ matrix.plugin }}
+        run: |
+          if [ -z "$TAG" ]; then
+            (cd dist && sha256sum * > "$PLUGIN-SHA256SUMS" && cat "$PLUGIN-SHA256SUMS")
+            gh release upload "$RELEASE_TAG" -R "$RELEASE_REPO" --clobber dist/*
+            exit 0
+          fi
+          version="${TAG#plugin-$PLUGIN-v}"
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          prerelease=$([[ "$version" == *-* ]] && echo --prerelease || true)
+          # Never "Latest": the app's updater reads releases/latest/download/latest.json of the app's release.
+          if ! gh release view "$TAG" -R "$RELEASE_REPO" > /dev/null 2>&1; then
+            gh release create "$TAG" -R "$RELEASE_REPO" --verify-tag --latest=false $prerelease --title "$PLUGIN plugin $version" --notes \
+              "The $PLUGIN plugin $version for Indian stocks, indices, futures and options. Install the zip of your system in OpenTrader under Settings > Plugins > Install from file. See plugins/$PLUGIN/README.md."
+          fi
+          gh release upload "$TAG" -R "$RELEASE_REPO" --clobber dist/*

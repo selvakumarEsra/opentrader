@@ -1,0 +1,31 @@
+{
+  "id": "moomoo",
+  "name": "moomoo",
+  "version": "0.2.4",
+  "publisher": "OpenTrader",
+  "description": "Symbols, bars and live prices of US, Hong Kong and China A-share stocks, and trading of your paper and live moomoo accounts, through your moomoo OpenD.",
+  "api": 2,
+  "provides": ["datafeed", "broker"],
+  "exchanges": ["US", "HK", "SH", "SZ"],
+  "runtime": { "type": "process", "entry": "opentrader-moomoo", "args": [] },
+  "settings": [
+    { "key": "host", "label": "Host", "type": "text", "default": "127.0.0.1",
+      "help": "The computer OpenD runs on. Keep 127.0.0.1 when it runs on this computer." },
+    { "key": "port", "label": "Port", "type": "number", "default": "11111",
+      "help": "The API port set in OpenD (11111 unless you changed it)." },
+    { "key": "rsaKeyFile", "label": "RSA private key file", "type": "text", "default": "",
+      "help": "Only when encryption is on in OpenD: the same PEM key file set there. The connection is then encrypted, and the plugin does not connect while the file cannot be read." },
+    { "key": "alwaysRecord", "label": "Always record", "type": "text", "default": "",
+      "help": "Symbols whose 1-minute bars are kept in the bar store for as long as OpenTrader is open, with or without a chart: such as US:AAPL, US:MSFT. Each uses one of your OpenD subscriptions." },
+    { "key": "clickhouseUrl", "label": "ClickHouse URL", "type": "text", "default": "",
+      "help": "Leave empty to keep bars in a file on this computer. Or give a ClickHouse server, such as http://localhost:8123, to keep them there." },
+    { "key": "clickhouseDatabase", "label": "ClickHouse database", "type": "text", "default": "trading_db",
+      "help": "Created if it does not exist." },
+    { "key": "clickhouseUser", "label": "ClickHouse user", "type": "text", "default": "default" },
+    { "key": "clickhousePassword", "label": "ClickHouse password", "type": "text", "default": "",
+      "help": "Kept in OpenTrader's settings as you type it." }
+  ],
+  "setup": "Start moomoo OpenD and log in with your moomoo account (the first time, complete the API questionnaire it asks for). For OpenD on another computer, turn on its encryption and give the plugin the same RSA key file. The plugin connects within a few seconds and retries while OpenD is closed. Then open a symbol such as US:AAPL or HK:00700. To trade, choose moomoo in Trade > Connect broker…: paper accounts trade at once; a live account trades once you have unlocked trading in OpenD with your trade password (the plugin never asks for it).",
+  "homepage": "https://github.com/deepentropy/opentrader/tree/main/plugins/moomoo",
+  "platforms": ["windows", "macos", "linux"]
+}

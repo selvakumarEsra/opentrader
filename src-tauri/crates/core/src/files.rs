@@ -20,9 +20,20 @@ pub fn save_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> std::io::Resu
     write_atomic(path, &bytes)
 }
 
+/// `save_json` of a file only the user may read (mode 0600 on Unix, from the
+/// moment it is created): tokens and passwords.
+pub fn save_json_private<T: Serialize + ?Sized>(path: &Path, value: &T) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    write(path, &bytes, true)
+}
+
 /// Write `bytes` to `path` through a temporary file renamed over it; the
 /// folder is created when missing.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write(path, bytes, false)
+}
+
+fn write(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -34,7 +45,16 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(format!(".{}-{n}.tmp", std::process::id()));
     let tmp = path.with_file_name(tmp_name);
-    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let written = open.open(&tmp).and_then(|mut f| {
         f.write_all(bytes)?;
         f.sync_all()
     });
@@ -50,6 +70,17 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_is_only_the_users() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ot-private-{}", std::process::id()));
+        let path = dir.join("secret.json");
+        save_json_private(&path, &Settings { port: 1 }).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
     struct Settings {

@@ -70,6 +70,8 @@ pub struct InstallStep {
 #[serde(rename_all = "lowercase")]
 pub enum SettingKind {
     Text,
+    /// Text shown masked (a password, an API secret).
+    Secret,
     Number,
     Bool,
     Select,
@@ -354,6 +356,13 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_setting_is_accepted() {
+        let mut v = sample();
+        v["settings"] = serde_json::json!([{ "key": "apiSecret", "label": "API secret", "type": "secret" }]);
+        assert_eq!(parse(v).unwrap().settings[0].kind, SettingKind::Secret);
+    }
+
+    #[test]
     fn refuses_bad_fields() {
         let with = |k: &str, v: serde_json::Value| {
             let mut s = sample();
@@ -425,5 +434,15 @@ mod tests {
         assert!(expand("{appData}").is_none());
         assert!(folder_matches(Path::new("C:/T/ABC/MQL5/Experts"), "mql5/experts"));
         assert!(!folder_matches(Path::new("C:/T/ABC/MQL5"), "MQL5/Experts"));
+    }
+
+    #[test]
+    fn the_repo_plugins_manifests_are_accepted() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../plugins");
+        for plugin in ["moomoo", "zerodha", "dhan"] {
+            let bytes = std::fs::read(root.join(plugin).join(FILE)).unwrap();
+            let m = Manifest::parse(&bytes).unwrap_or_else(|e| panic!("{plugin}: {e}"));
+            assert_eq!(m.id, plugin);
+        }
     }
 }

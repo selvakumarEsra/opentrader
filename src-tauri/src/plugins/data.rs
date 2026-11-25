@@ -17,8 +17,10 @@
  * Its scripts too (`data.scripts`, #402): OakScript studies and strategies with their source, listed in the Indicators
  * dialog under the plugin's name and run like the user's own.
  */
+use super::quote_batch::{self, QuoteBatch};
 use super::Plugins;
 use crate::data::calendar::SessionCalendar;
+use crate::data::interval::{BarUnit, Interval};
 use crate::data::session::{Subsession, SymbolSession};
 use crate::data::types::{Candle, ChartAggregate, Snapshot, SymbolSearchResult, TickerInfo, TradeTick};
 use opentrader_core::host::HostRef;
@@ -169,11 +171,11 @@ pub struct HistoryDepth {
 
 impl HistoryDepth {
     /// The depth of a unit's bars (weeks and months are built from days).
-    fn of(&self, unit: &str) -> Option<f64> {
+    fn of(&self, unit: BarUnit) -> Option<f64> {
         match unit {
-            "second" => self.second,
-            "minute" => self.minute,
-            _ => self.day,
+            BarUnit::Second => self.second,
+            BarUnit::Minute => self.minute,
+            BarUnit::Day => self.day,
         }
         .filter(|d| d.is_finite() && *d > 0.0)
     }
@@ -189,10 +191,10 @@ struct Subscriptions {
     watchlists: HashMap<String, Vec<String>>,
 }
 
-/// A symbol's series of one bar size: the symbol, the unit and the multiplier.
-type RecentKey = (String, String, u32);
+/// A symbol's series of one bar size.
+type RecentKey = (String, Interval);
 /// A scroll-back page: the series' key, the time it ends before and its trading days.
-type PageKey = (String, String, u32, i64, u32);
+type PageKey = (String, Interval, i64, u32);
 
 /// The last `days` trading days of a symbol's bars, as read at `at` (and completed since by newer bars).
 struct Recent {
@@ -230,6 +232,17 @@ pub struct PluginData {
     watchlists: Mutex<BTreeMap<String, Vec<PluginWatchlist>>>,
     /// Each data plugin's scripts, as it last sent them (kept while it reconnects).
     scripts: Mutex<BTreeMap<String, Vec<PluginScript>>>,
+    /// The quotes since the last flush (specs/performance.md REQ-PERF-003).
+    batch: Mutex<QuoteBatch>,
+}
+
+/// The windows whose charts show `symbol`.
+fn chart_windows_of(app: &AppHandle, symbol: &str) -> BTreeSet<String> {
+    quote_batch::chart_windows(&state(app).subs.locked().charts, symbol)
+}
+
+fn flush_quotes(app: &AppHandle) {
+    quote_batch::flush(app, &state(app).batch, |symbol| chart_windows_of(app, symbol));
 }
 
 /// A plugin symbol: the plugin, the full symbol and its ticker.
@@ -251,11 +264,11 @@ pub fn route(app: &AppHandle, symbol: &str) -> Option<Route> {
 }
 
 fn route_in(exchanges: &HashMap<String, String>, whole: &HashSet<String>, symbol: &str) -> Option<Route> {
-    let (exchange, ticker) = symbol.trim().split_once(':')?;
-    let exchange = exchange.to_ascii_uppercase();
-    let plugin = exchanges.get(&exchange).cloned()?;
-    let symbol = format!("{exchange}:{ticker}");
-    let ticker = if whole.contains(&plugin) { symbol.clone() } else { ticker.to_string() };
+    // The app's one normalisation of a symbol (a bare ticker has no exchange, so no plugin).
+    let parsed = opentrader_core::data::symbol::Symbol::parse(symbol);
+    let plugin = exchanges.get(parsed.exchange()).cloned()?;
+    let symbol = parsed.to_string();
+    let ticker = if whole.contains(&plugin) { symbol.clone() } else { parsed.ticker().to_string() };
     Some(Route { plugin, symbol, ticker })
 }
 
@@ -339,6 +352,7 @@ pub fn symbol_of_plugin(app: &AppHandle, plugin: &str, ticker: &str) -> Option<S
 
 pub fn init(app: &AppHandle) {
     let mut events = app.state::<Plugins>().hub.subscribe();
+    quote_batch::spawn_flusher(app, flush_quotes);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         loop {
@@ -379,7 +393,7 @@ fn forget(app: &AppHandle, plugin: &str) {
     let exchanges: Vec<String> = s.exchanges.locked().iter().filter(|(_, p)| *p == plugin).map(|(e, _)| format!("{e}:")).collect();
     s.infos.locked().retain(|sym, _| !exchanges.iter().any(|e| sym.starts_with(e)));
     s.unknown.locked().retain(|sym| !exchanges.iter().any(|e| sym.starts_with(e)));
-    s.recent.locked().retain(|(sym, _, _), _| !exchanges.iter().any(|e| sym.starts_with(e)));
+    s.recent.locked().retain(|(sym, _), _| !exchanges.iter().any(|e| sym.starts_with(e)));
     s.pages.locked().retain(|(sym, ..), _| !exchanges.iter().any(|e| sym.starts_with(e)));
     super::fields::forget(app, &exchanges);
 }
@@ -548,25 +562,18 @@ pub async fn ticker_info(app: &AppHandle, r: &Route) -> Result<TickerInfo, Strin
     })
 }
 
-/// A resolution the plugin serves, and the bucket it is rebuilt to (seconds, 0 = as served).
-fn pick(intervals: &[String], unit: &str, mult: u32) -> Option<(String, u64)> {
-    let served = |n: u32| {
-        let name = match unit {
-            "second" => format!("{n}S"),
-            "minute" => n.to_string(),
-            _ => "1D".to_string(),
-        };
-        intervals.iter().any(|i| i.eq_ignore_ascii_case(&name)).then_some(name)
+/// A resolution the plugin serves for `iv`, and the bucket it is rebuilt to (seconds, 0 = as served).
+fn pick(intervals: &[String], iv: Interval) -> Option<(Interval, u64)> {
+    let served = |d: u32| {
+        let want = Interval::new(iv.unit(), d);
+        intervals.iter().any(|i| i.parse() == Ok(want)).then_some(want)
     };
-    if unit == "day" {
-        return served(1).map(|n| (n, 0));
-    }
-    if let Some(n) = served(mult) {
+    if let Some(n) = served(iv.mult()) {
         return Some((n, 0));
     }
     // The largest served size that divides it, rebuilt on the clock grid.
-    let step = if unit == "second" { 1 } else { 60 };
-    (1..mult).rev().filter(|d| mult % d == 0).find_map(|d| served(d)).map(|n| (n, mult as u64 * step))
+    let mult = iv.mult();
+    (1..mult).rev().filter(|d| mult.is_multiple_of(*d)).find_map(served).map(|n| (n, iv.secs()))
 }
 
 fn parse_bars(v: &Value) -> Result<Vec<Candle>, String> {
@@ -603,20 +610,19 @@ fn rebuild(bars: Vec<Candle>, bucket: u64) -> Vec<Candle> {
     out
 }
 
-/// Bars of `unit` ("second", "minute", "day") × `mult` in [`from`, `to`] (UNIX seconds), at most `count` of them,
-/// the newest ones.
-pub async fn bars(app: &AppHandle, r: &Route, unit: &str, mult: u32, from: f64, to: f64, count: u64) -> Result<Vec<Candle>, String> {
+/// Bars of `iv` in [`from`, `to`] (UNIX seconds), at most `count` of them, the newest ones.
+pub async fn bars(app: &AppHandle, r: &Route, iv: Interval, from: f64, to: f64, count: u64) -> Result<Vec<Candle>, String> {
     let i = info(app, r).await?;
-    let Some((resolution, bucket)) = pick(&i.intervals, unit, mult.max(1)) else {
+    let Some((served, bucket)) = pick(&i.intervals, iv) else {
         return Ok(Vec::new());
     };
-    let ask_count = if bucket > 0 { count.saturating_mul(bucket / base_seconds(&resolution).max(1)) } else { count };
+    let ask_count = if bucket > 0 { count.saturating_mul(bucket / served.secs()) } else { count };
     // Older than the source's history: nothing to ask (a scroll-back past it ends there).
-    let Some((from, ask_count)) = reachable(i.history.of(unit), from, to, ask_count, base_seconds(&resolution), now()) else {
+    let Some((from, ask_count)) = reachable(i.history.of(iv.unit()), from, to, ask_count, served.secs(), now()) else {
         return Ok(Vec::new());
     };
     let params = json!({
-        "ticker": r.ticker, "resolution": resolution,
+        "ticker": r.ticker, "resolution": served.resolution(),
         "from": from.max(0.0).floor(), "to": to.floor(), "countBack": ask_count.clamp(1, MAX_BARS),
     });
     let v = ask(app, r, "data.bars", params, BARS_TIMEOUT).await?;
@@ -636,55 +642,35 @@ fn reachable(depth: Option<f64>, from: f64, to: f64, count: u64, bar_secs: u64, 
     Some((from, count.min(fit)))
 }
 
-fn base_seconds(resolution: &str) -> u64 {
-    let r = resolution.to_ascii_uppercase();
-    if let Some(s) = r.strip_suffix('S') {
-        s.parse().unwrap_or(1)
-    } else if r.ends_with('D') || r.ends_with('W') || r.ends_with('M') {
-        86_400
-    } else {
-        r.parse::<u64>().unwrap_or(1) * 60
-    }
-}
-
 fn now() -> f64 {
     chrono::Utc::now().timestamp() as f64
 }
 
-/// Bars of `unit` × `mult` in one trading day at most: its traded hours, and one more for a bar its open or close cuts
+/// Bars of `iv` in one trading day at most: its traded hours, and one more for a bar its open or close cuts
 /// (bars on a clock grid of their own).
-fn per_day(cal: &SessionCalendar, unit: &str, mult: u32) -> u64 {
-    if unit == "day" {
+fn per_day(cal: &SessionCalendar, iv: Interval) -> u64 {
+    if iv.unit() == BarUnit::Day {
         return 1;
     }
-    let bar = bar_seconds(unit, mult);
+    let bar = iv.secs();
     (cal.day_minutes() as u64 * 60).div_ceil(bar).saturating_add(1).min(86_400u64.div_ceil(bar))
 }
 
 /// From the start of trading day `first` to the end of `last`: its start (UNIX seconds) and the bars it holds at most.
-fn window(cal: &SessionCalendar, unit: &str, mult: u32, first: NaiveDate, last: NaiveDate) -> (f64, u64) {
+fn window(cal: &SessionCalendar, iv: Interval, first: NaiveDate, last: NaiveDate) -> (f64, u64) {
     let days = cal.trading_days_in_range(first, last).len().max(1) as u64;
-    (cal.day_start(first) as f64, per_day(cal, unit, mult) * days)
+    (cal.day_start(first) as f64, per_day(cal, iv) * days)
 }
 
-/// Seconds of one bar of `unit` × `mult`.
-fn bar_seconds(unit: &str, mult: u32) -> u64 {
-    match unit {
-        "second" => mult.max(1) as u64,
-        "minute" => mult.max(1) as u64 * 60,
-        _ => 86_400,
-    }
-}
-
-/// The last `days` trading days of `unit` bars. A series read a moment ago answers at once; an older one asks only
+/// The last `days` trading days of `iv` bars. A series read a moment ago answers at once; an older one asks only
 /// the bars from its last one on; one read over fewer days, or none, asks the whole window. The asks of a series that
 /// come while it is read wait for it.
-pub async fn recent(app: &AppHandle, r: &Route, unit: &str, mult: u32, days: u32) -> Result<Vec<Candle>, String> {
-    let key: RecentKey = (r.symbol.clone(), unit.to_string(), mult.max(1));
+pub async fn recent(app: &AppHandle, r: &Route, iv: Interval, days: u32) -> Result<Vec<Candle>, String> {
+    let key: RecentKey = (r.symbol.clone(), iv);
     let gate = state(app).reading.locked().entry(key.clone()).or_default().clone();
     let read = {
         let _turn = gate.lock().await;
-        read_recent(app, r, &key, unit, mult, days).await
+        read_recent(app, r, &key, iv, days).await
     };
     drop(gate);
     let mut reading = state(app).reading.locked();
@@ -694,23 +680,23 @@ pub async fn recent(app: &AppHandle, r: &Route, unit: &str, mult: u32, days: u32
     read
 }
 
-async fn read_recent(app: &AppHandle, r: &Route, key: &RecentKey, unit: &str, mult: u32, days: u32) -> Result<Vec<Candle>, String> {
+async fn read_recent(app: &AppHandle, r: &Route, key: &RecentKey, iv: Interval, days: u32) -> Result<Vec<Candle>, String> {
     let to = now();
     // As the app's own history: the last `days` trading days before today, and today's bars.
     let cal = calendar(app, r).await?;
     let today = cal.window_end();
     let first = cal.last_trading_days(days.max(1) as usize).first().copied().unwrap_or(today);
-    let (from, count) = window(&cal, unit, mult, first, today);
+    let (from, count) = window(&cal, iv, first, today);
     let kept = state(app).recent.locked().get(key).filter(|k| k.days >= days && !k.bars.is_empty()).map(|k| (k.at, k.days, k.bars.clone()));
     let series = match kept {
         Some((at, _, series)) if at.elapsed() < RECENT_FRESH => series,
         Some((_, kept_days, series)) => {
             let last = series[series.len() - 1].time;
-            let newer_count = ((to - last) / bar_seconds(unit, mult) as f64).ceil().max(0.0) as u64 + 1;
-            let newer = bars(app, r, unit, mult, last, to, newer_count).await?;
+            let newer_count = ((to - last) / iv.secs() as f64).ceil().max(0.0) as u64 + 1;
+            let newer = bars(app, r, iv, last, to, newer_count).await?;
             keep(app, key, kept_days, with_newer(&series, newer))
         }
-        None => keep(app, key, days, bars(app, r, unit, mult, from, to, count).await?),
+        None => keep(app, key, days, bars(app, r, iv, from, to, count).await?),
     };
     Ok(window_of(&series, from, count))
 }
@@ -743,10 +729,10 @@ fn window_of(bars: &[Candle], from: f64, count: u64) -> Vec<Candle> {
     bars[start..].to_vec()
 }
 
-/// Bars strictly before `before_sec`, over `span_days` trading days. Pages are past bars: one read a while ago answers
+/// Bars of `iv` strictly before `before_sec`, over `span_days` trading days. Pages are past bars: one read a while ago answers
 /// the same page again (a chart loaded again asks the page it asked before).
-pub async fn before(app: &AppHandle, r: &Route, unit: &str, mult: u32, before_sec: f64, span_days: u32) -> Result<Vec<Candle>, String> {
-    let key: PageKey = (r.symbol.clone(), unit.to_string(), mult.max(1), before_sec as i64, span_days);
+pub async fn before(app: &AppHandle, r: &Route, iv: Interval, before_sec: f64, span_days: u32) -> Result<Vec<Candle>, String> {
+    let key: PageKey = (r.symbol.clone(), iv, before_sec as i64, span_days);
     let kept = state(app).pages.locked().get(&key).filter(|(at, _)| at.elapsed() < PAGE_KEPT_FOR).map(|(_, bars)| bars.clone());
     if let Some(bars) = kept {
         return Ok(bars.to_vec());
@@ -757,10 +743,10 @@ pub async fn before(app: &AppHandle, r: &Route, unit: &str, mult: u32, before_se
         return Ok(Vec::new());
     };
     // The day of an intraday page's end is mostly after it (the chart's oldest bar opened it): one day more.
-    let n = span_days.max(1) as usize + usize::from(unit != "day");
+    let n = span_days.max(1) as usize + usize::from(iv.unit() != BarUnit::Day);
     let first = cal.trading_days_before(last, n).first().copied().unwrap_or(last);
-    let (from, count) = window(&cal, unit, mult, first, last);
-    let page = bars(app, r, unit, mult, from, to, count).await?;
+    let (from, count) = window(&cal, iv, first, last);
+    let page = bars(app, r, iv, from, to, count).await?;
     let mut pages = state(app).pages.locked();
     pages.retain(|_, (at, _)| at.elapsed() < PAGE_KEPT_FOR);
     if pages.len() >= PAGES_KEPT {
@@ -774,7 +760,7 @@ pub async fn before(app: &AppHandle, r: &Route, unit: &str, mult: u32, before_se
 
 /// The quote panel's numbers, from the last two daily bars.
 pub async fn snapshot(app: &AppHandle, r: &Route) -> Result<Snapshot, String> {
-    let daily = recent(app, r, "day", 1, 10).await?;
+    let daily = recent(app, r, Interval::day(), 10).await?;
     let last = daily.last().ok_or_else(|| format!("{}: no bars", r.symbol))?;
     let prev = daily.len().checked_sub(2).map(|i| daily[i].close).unwrap_or(last.open);
     let change = last.close - prev;
@@ -986,13 +972,12 @@ fn on_quote(app: &AppHandle, plugin: &str, params: Value) {
     let minute = q.minute.map(candle);
     let time = q.time.unwrap_or_else(now);
     state(app).quoted.locked().insert(symbol.clone(), time);
-    if let Some(m) = &minute {
+    let bar = minute.as_ref().map(|m| {
         let day = q.day.map(|d| Candle { time, ..candle(d) });
-        let _ = ChartAggregate { symbol: symbol.clone(), time: m.time, open: m.open, high: m.high, low: m.low, close: m.close, volume: m.volume, day }
-            .emit(app);
-    }
+        ChartAggregate { symbol: symbol.clone(), time: m.time, open: m.open, high: m.high, low: m.low, close: m.close, volume: m.volume, day }
+    });
     let prev = q.prev_close.filter(|p| *p != 0.0);
-    let _ = TradeTick {
+    let trade = TradeTick {
         symbol: symbol.clone(),
         price: price,
         change: prev.map(|p| price - p),
@@ -1006,9 +991,13 @@ fn on_quote(app: &AppHandle, plugin: &str, params: Value) {
         trade_low: minute.as_ref().map(|m| m.low),
         day_high: q.day.map(|d| d[2]),
         day_low: q.day.map(|d| d[3]),
+    };
+    // The views get the newest per flush (flush_quotes); a bar this quote closes goes now.
+    let closed = state(app).batch.locked().add(bar, trade);
+    if let Some(bar) = closed {
+        quote_batch::send_bar(app, &bar, chart_windows_of(app, &bar.symbol));
     }
-    .emit(app);
-    // The desktop alert engine reads the quotes the host gets.
+    // The desktop alert engine reads every quote the host gets.
     if let Some(host) = app.try_state::<HostRef>() {
         host.on_quote(&symbol, price, minute.as_ref());
     }
@@ -1486,17 +1475,17 @@ mod tests {
     #[test]
     fn picks_a_served_interval_or_a_divisor() {
         let served = iv(&["1", "5", "15", "60", "1D"]);
-        assert_eq!(pick(&served, "minute", 5), Some(("5".into(), 0)));
-        assert_eq!(pick(&served, "minute", 45), Some(("15".into(), 2700)));
-        assert_eq!(pick(&served, "minute", 7), Some(("1".into(), 420)));
-        assert_eq!(pick(&served, "day", 1), Some(("1D".into(), 0)));
-        assert_eq!(pick(&served, "second", 5), None);
-        assert_eq!(pick(&iv(&["1S"]), "second", 10), Some(("1S".into(), 10)));
+        assert_eq!(pick(&served, Interval::minutes(5)), Some((Interval::minutes(5), 0)));
+        assert_eq!(pick(&served, Interval::minutes(45)), Some((Interval::minutes(15), 2700)));
+        assert_eq!(pick(&served, Interval::minutes(7)), Some((Interval::minutes(1), 420)));
+        assert_eq!(pick(&served, Interval::day()), Some((Interval::day(), 0)));
+        assert_eq!(pick(&served, Interval::seconds(5)), None);
+        assert_eq!(pick(&iv(&["1S"]), Interval::seconds(10)), Some((Interval::seconds(1), 10)));
         // Hours only (#332): the chart asks the served size itself and builds 2 and 4 hours from it; nothing under it.
         let hours = iv(&["60", "1D"]);
-        assert_eq!(pick(&hours, "minute", 60), Some(("60".into(), 0)));
-        assert_eq!(pick(&hours, "minute", 240), Some(("60".into(), 14_400)));
-        assert_eq!(pick(&hours, "minute", 30), None);
+        assert_eq!(pick(&hours, Interval::minutes(60)), Some((Interval::minutes(60), 0)));
+        assert_eq!(pick(&hours, Interval::minutes(240)), Some((Interval::minutes(60), 14_400)));
+        assert_eq!(pick(&hours, Interval::minutes(30)), None);
     }
 
     #[test]
@@ -1558,7 +1547,7 @@ mod tests {
         // No depth: the window as asked, the count kept when it fits.
         assert_eq!(reachable(None, now - 10.0 * day, now, 2880, 300, now), Some((now - 10.0 * day, 2880)));
         let depth = HistoryDepth { second: None, minute: Some(30.0), day: Some(0.0) };
-        assert_eq!((depth.of("minute"), depth.of("day"), depth.of("second")), (Some(30.0), None, None));
+        assert_eq!((depth.of(BarUnit::Minute), depth.of(BarUnit::Day), depth.of(BarUnit::Second)), (Some(30.0), None, None));
     }
 
     fn cal(tz: &str, session: &str, extended: Option<&str>, holidays: &str) -> SessionCalendar {
@@ -1574,18 +1563,18 @@ mod tests {
         let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
         // NSE (#363): 375 minutes a day, a holiday on Friday 20/11/2026: Monday 16 to Monday 23 is 5 trading days.
         let nse = cal("Asia/Kolkata", "0915-1530", None, "20261120");
-        assert_eq!(per_day(&nse, "minute", 1), 376);
-        assert_eq!(per_day(&nse, "minute", 5), 76);
-        assert_eq!(per_day(&nse, "second", 15), 1501);
-        assert_eq!(per_day(&nse, "day", 1), 1);
-        let (from, count) = window(&nse, "minute", 1, d(2026, 11, 16), d(2026, 11, 23));
+        assert_eq!(per_day(&nse, Interval::minutes(1)), 376);
+        assert_eq!(per_day(&nse, Interval::minutes(5)), 76);
+        assert_eq!(per_day(&nse, Interval::seconds(15)), 1501);
+        assert_eq!(per_day(&nse, Interval::day()), 1);
+        let (from, count) = window(&nse, Interval::minutes(1), d(2026, 11, 16), d(2026, 11, 23));
         assert_eq!((from as i64, count), (d(2026, 11, 16).and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp() - 19_800, 376 * 5));
         // Extended hours count; around the clock keeps whole days.
-        assert_eq!(per_day(&cal("America/New_York", "0930-1600", Some("0400-2000"), ""), "minute", 1), 961);
+        assert_eq!(per_day(&cal("America/New_York", "0930-1600", Some("0400-2000"), ""), Interval::minutes(1)), 961);
         let crypto = cal("UTC", "24x7", None, "");
-        assert_eq!(per_day(&crypto, "minute", 1), 1440);
-        assert_eq!(per_day(&crypto, "minute", 7), 206);
-        assert_eq!(window(&crypto, "day", 1, d(2026, 11, 1), d(2026, 11, 30)).1, 30);
+        assert_eq!(per_day(&crypto, Interval::minutes(1)), 1440);
+        assert_eq!(per_day(&crypto, Interval::minutes(7)), 206);
+        assert_eq!(window(&crypto, Interval::day(), d(2026, 11, 1), d(2026, 11, 30)).1, 30);
     }
 
     fn c(t: f64, close: f64) -> Candle {

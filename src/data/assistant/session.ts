@@ -4,17 +4,24 @@
  * (the same ones the MCP server gives coding agents, src/agent/), their results go back, until the model answers in
  * words. A tool that deletes something waits for the user's go-ahead.
  *
+ * A message can go instead to an SDK model (Claude Code, Codex, Gemini: ./models.ts, specs/assistant-cli-models.md),
+ * which runs its own loop on this computer and calls the same tools over the app's MCP endpoint; its steps show as they
+ * come, its destructive tools wait for the same go-ahead, and nothing of it goes to the usage statistics.
+ *
  * Chats are kept in kv (the 50 latest, pictures left out).
  */
+import { date } from "../../community-shared/dates";
 import { Channel } from "@tauri-apps/api/core";
 import { createSignal } from "solid-js";
 import { createStore, produce, reconcile } from "solid-js/store";
 import { commands } from "../../bindings";
 import type { AgentServerDef, AgentTool, ToolResult } from "../../agent/mcp";
-import { AgentError } from "../../agent/mcp";
+import { AgentError, NOT_ALLOWED } from "../../agent/mcp";
+import { setAssistantConfirm } from "../../agent/assistant-confirm";
 import * as kv from "../kv";
 import { attachmentLine } from "./attachments";
-import { modelVersion, promptFor } from "./prompts";
+import { modelVersion, promptFor, SDK_INSTRUCTIONS } from "./prompts";
+import { activeModel, BUILTIN, modelName } from "./models";
 import { newTraceId, trackFeedback, trackGeneration, trackToolSpan, trackTrace } from "./telemetry";
 import { applyEvent, finishedCalls, newTurn, shownText, StreamError, textToolCalls, type ToolCall, type Turn } from "./stream";
 
@@ -28,6 +35,8 @@ export type ToolStep = {
   result?: string;
   /** A picture the tool gave (a screenshot): shown, not kept, not sent. */
   image?: string;
+  /** An SDK model's id of this step, when the step was made first by its confirmation. */
+  alias?: string;
 };
 
 /** A file attached to a message: its text stays in attachments.ts, the chat keeps its id and name. */
@@ -41,6 +50,10 @@ export type ChatMessage =
       reasoning?: string;
       tools?: ToolStep[];
       error?: string;
+      /** The SDK model that answered (none: the built-in one). */
+      model?: string;
+      /** What an SDK model's run is doing before its answer comes (setting up…): not kept. */
+      status?: string;
       /** On the last message of an answer: its trace in the statistics, and the user's thumbs up or down. */
       trace?: string;
       rating?: "good" | "bad";
@@ -193,12 +206,15 @@ export function answerConfirm(stepId: string, ok: boolean): void {
 // ── The loop ─────────────────────────────────────────────────────────────
 let requestSeq = 0;
 let current: number | null = null;
+/** The SDK model's question under way. */
+let currentSdk: number | null = null;
 let stopped = false;
 
 /** Stops the answer under way: the request, and the tools waiting for a go-ahead. */
 export function stop(): void {
   stopped = true;
   if (current !== null) void commands.assistantCancel(current);
+  if (currentSdk !== null) void commands.assistantCliCancel(currentSdk);
   for (const [id, resolve] of waiting) {
     resolve(false);
     waiting.delete(id);
@@ -341,6 +357,8 @@ export async function send(text: string, files: AttachedFile[] = []): Promise<vo
     setState("activeId", chat.id);
   }
   edit((c) => c.messages.push(files.length ? { role: "user", text: t, files: files.map(({ id, name }) => ({ id, name })) } : { role: "user", text: t }));
+  const model = activeModel();
+  if (model !== BUILTIN) return sendSdk(model);
   setRunning(true);
   stopped = false;
   const trace: Trace = { trace: newTraceId(), chat: state.activeId! };
@@ -431,4 +449,162 @@ export function rateAnswer(trace: string, rating: "good" | "bad"): void {
   }));
   if (now) trackFeedback(trace, chat.id, now);
   save();
+}
+
+// ── SDK models ───────────────────────────────────────────────────────────
+/** The longest chat text an SDK model is given (the newest kept). */
+const MAX_TRANSCRIPT = 60_000;
+
+/** The active chart, as get_chart tells it (empty when the tools are not there). */
+async function chartContext(): Promise<string> {
+  const tool = server?.tools.find((t) => t.name === "get_chart");
+  if (!tool) return "";
+  try {
+    const text = resultOf(await tool.run({})).text;
+    return text.length > 6000 ? `${text.slice(0, 6000)}…` : text;
+  } catch {
+    return "";
+  }
+}
+
+/** The question for an SDK model: today's date, the chart on screen, the chat so far, and the new message. */
+export function sdkPrompt(c: Chat, chart: string, today: Date): string {
+  const past: string[] = [];
+  // The new message is the last user one (an empty answer may follow it, the one being written).
+  let at = c.messages.length - 1;
+  while (at >= 0 && c.messages[at].role !== "user") at--;
+  for (const m of c.messages.slice(0, Math.max(at, 0))) {
+    if (m.role === "user") {
+      past.push(`User: ${[m.text, ...(m.files ?? []).map(attachmentLine)].filter(Boolean).join("\n")}`);
+    } else if (m.text || m.tools?.length) {
+      const steps = (m.tools ?? []).map((t) => `[${t.name} ${t.status === "denied" ? "not allowed" : t.status}]`).join(" ");
+      past.push(`Assistant: ${[steps, m.text].filter(Boolean).join("\n")}`);
+    }
+  }
+  let transcript = past.join("\n\n");
+  if (transcript.length > MAX_TRANSCRIPT) transcript = `…${transcript.slice(-MAX_TRANSCRIPT)}`;
+  const last = at >= 0 ? c.messages[at] : undefined;
+  const question = last?.role === "user" ? [last.text, ...(last.files ?? []).map(attachmentLine)].filter(Boolean).join("\n") : "";
+  return [
+    `Today is ${date(today.getTime() / 1000)}.`,
+    chart ? `The chart on screen (get_chart):\n${chart}` : "",
+    transcript ? `The chat so far:\n${transcript}` : "",
+    `The user's message:\n${question}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+/** One event of the SDK model's run into the answer. */
+type SdkEvent =
+  | { t: "status"; text: string }
+  | { t: "text"; text: string }
+  | { t: "tool"; id: string; name: string; args: string }
+  | { t: "tool_done"; id: string; ok: boolean; result: string }
+  | { t: "error"; message: string }
+  | { t: "done" };
+
+export function applySdkEvent(m: Extract<ChatMessage, { role: "assistant" }>, e: SdkEvent): void {
+  switch (e.t) {
+    case "status":
+      m.status = e.text;
+      break;
+    case "text":
+      m.status = undefined;
+      m.text += e.text;
+      break;
+    case "tool": {
+      m.status = undefined;
+      // Its confirmation may have come first and made the step.
+      const early = m.tools?.find((x) => x.id.startsWith(EARLY) && x.name === e.name && !x.alias);
+      if (early) {
+        early.alias = e.id;
+        early.arguments = e.args;
+      } else (m.tools ??= []).push({ id: e.id, name: e.name, arguments: e.args, status: "running" });
+      break;
+    }
+    case "tool_done": {
+      const s = m.tools?.find((x) => x.id === e.id || x.alias === e.id);
+      if (!s) break;
+      if (s.status === "denied") s.result = NOT_ALLOWED;
+      else {
+        s.status = e.ok ? "done" : "error";
+        s.result = e.result;
+      }
+      break;
+    }
+    case "error":
+      m.status = undefined;
+      m.error = e.message;
+      break;
+    case "done":
+      m.status = undefined;
+      break;
+  }
+}
+
+/** The id prefix of a step made by a confirmation that came before the model's own report of the call. */
+const EARLY = "confirm";
+
+// A destructive tool the SDK model calls: its step (the newest of that name still running) waits for Allow.
+setAssistantConfirm(async (name, args) => {
+  if (currentSdk === null || stopped) return false;
+  const ms = activeChat()?.messages ?? [];
+  const m = ms[ms.length - 1];
+  if (m?.role !== "assistant") return false;
+  let step = [...(m.tools ?? [])].reverse().find((t) => t.name === name && t.status === "running");
+  if (!step) {
+    const id = `${EARLY}${++requestSeq}`;
+    editLast((x) => (x.tools ??= []).push({ id, name, arguments: JSON.stringify(args), status: "running" }));
+    step = { id, name, arguments: "", status: "running" };
+  }
+  const id = step.id;
+  const setStatus = (status: ToolStep["status"]) =>
+    editLast((x) => {
+      const s = x.tools?.find((t) => t.id === id);
+      if (s) s.status = status;
+    });
+  setStatus("confirm");
+  const ok = await new Promise<boolean>((resolve) => waiting.set(id, resolve));
+  setStatus(ok ? "running" : "denied");
+  return ok;
+});
+
+/** The message's answer from SDK model `model`: no statistics, no thumbs. */
+async function sendSdk(model: string): Promise<void> {
+  setRunning(true);
+  stopped = false;
+  const request = ++requestSeq;
+  currentSdk = request;
+  edit((c) => c.messages.push({ role: "assistant", text: "", model }));
+  try {
+    const chart = await chartContext();
+    const prompt = sdkPrompt(activeChat()!, chart, new Date());
+
+    const channel = new Channel<string>();
+    channel.onmessage = (data) => {
+      let e: SdkEvent;
+      try {
+        e = JSON.parse(data) as SdkEvent;
+      } catch {
+        return;
+      }
+      editLast((m) => applySdkEvent(m, e));
+    };
+    const r = await commands.assistantCliChat(request, model, JSON.stringify({ system: SDK_INSTRUCTIONS, prompt, web: true }), channel);
+    if (r.status === "error") editLast((m) => (m.error = r.error));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    editLast((m) => (m.error = msg));
+  } finally {
+    currentSdk = null;
+    setRunning(false);
+    editLast((m) => {
+      m.status = undefined;
+      m.tools?.forEach((s) => (s.status === "pending" || s.status === "confirm" || s.status === "running") && ((s.status = "denied"), (s.result ??= "Stopped.")));
+      if (stopped) m.error ??= "Stopped.";
+      else if (!m.text.trim() && !m.error) m.error = `No answer from ${modelName(model)}.`;
+    });
+    save();
+  }
 }

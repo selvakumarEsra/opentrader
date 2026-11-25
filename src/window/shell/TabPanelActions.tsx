@@ -16,6 +16,7 @@ import { track } from "../../data/analytics";
 import { isTauri, openNewWindow } from "./window-bridge";
 import { PAID_ENABLED, initPaid, realtimeActive, realtimeElsewhere } from "../../data/paid/plan";
 import { showPlanDialog } from "../paid/PlanDialog";
+import { dataBadge, servedByPlugin } from "./data-source-badge";
 
 /** The web version (`vite --mode web`): its title bar links to the desktop app. */
 const WEB_BUILD = import.meta.env.MODE === "web";
@@ -31,6 +32,8 @@ type Props = {
   themeSetting: ThemeSetting;
   onThemeChange: (s: ThemeSetting) => void;
   onOpenLink: (link: OpenedLink) => void;
+  /** The focused chart's symbol: a data plugin's shows as the badge's source (specs/data-source-badge.md). */
+  chartSymbol?: () => string | null | undefined;
 };
 
 export function TabPanelActions(props: Props) {
@@ -44,12 +47,8 @@ export function TabPanelActions(props: Props) {
   }, { defer: true }));
   const paid = PAID_ENABLED && isTauri();
   onMount(initPaid);
-  const badgeTip = () =>
-    realtimeActive()
-      ? "Market data is real-time."
-      : realtimeElsewhere()
-        ? "Real-time data is in use on another device. Click to use it here."
-        : "Market data is delayed by 15 minutes. Click for real-time data.";
+  const badge = () =>
+    dataBadge({ plugin: servedByPlugin(props.chartSymbol?.()), paid, realtimeActive: realtimeActive(), realtimeElsewhere: realtimeElsewhere() });
 
   return (
     <div class="tab-panel-actions">
@@ -58,20 +57,20 @@ export function TabPanelActions(props: Props) {
       <Show
         when={paid}
         fallback={
-          <Tooltip text="Market data is delayed by 15 minutes." side="bottom">
-            <span class="data-delay-badge" data-qa-id="data-delay-badge">Delayed 15 min</span>
+          <Tooltip text={badge().tip} side="bottom">
+            <span class="data-delay-badge" data-qa-id="data-delay-badge">{badge().label}</span>
           </Tooltip>
         }
       >
-        <Tooltip text={badgeTip()} side="bottom">
+        <Tooltip text={badge().tip} side="bottom">
           <button
             type="button"
             class="data-delay-badge is-button"
-            classList={{ "is-realtime": realtimeActive() }}
+            classList={{ "is-realtime": badge().realtime }}
             data-qa-id="data-delay-badge"
             onClick={() => showPlanDialog()}
           >
-            {realtimeActive() ? "Real-time" : realtimeElsewhere() ? "Real-time elsewhere" : "Delayed 15 min"}
+            {badge().label}
           </button>
         </Tooltip>
       </Show>

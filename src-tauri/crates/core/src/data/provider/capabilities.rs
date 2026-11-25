@@ -14,6 +14,7 @@
  * export 64-bit integers, and strings keep the cache file readable.
  */
 use serde::{Deserialize, Serialize};
+use crate::data::interval::BarUnit;
 use crate::host::event;
 
 /// Everything the frontend needs to know about the active provider. Also the
@@ -126,20 +127,12 @@ pub struct HistoryProbe {
     pub floor: HistoryFloor,
 }
 
-/// Bar family, for `history_floor` lookups.
-#[derive(Debug, Clone, Copy)]
-pub enum BarFamily {
-    Second,
-    Minute,
-    Day,
-}
-
 impl HistoryFloor {
-    pub fn get(&self, family: BarFamily) -> Option<chrono::NaiveDate> {
+    pub fn get(&self, family: BarUnit) -> Option<chrono::NaiveDate> {
         let s = match family {
-            BarFamily::Second => &self.second,
-            BarFamily::Minute => &self.minute,
-            BarFamily::Day => &self.day,
+            BarUnit::Second => &self.second,
+            BarUnit::Minute => &self.minute,
+            BarUnit::Day => &self.day,
         };
         s.as_deref()
             .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
@@ -157,12 +150,12 @@ mod tests {
             minute: Some("2016-09-29".into()),
             day: Some("bad".into()),
         };
-        assert_eq!(f.get(BarFamily::Second), None);
+        assert_eq!(f.get(BarUnit::Second), None);
         assert_eq!(
-            f.get(BarFamily::Minute),
+            f.get(BarUnit::Minute),
             chrono::NaiveDate::from_ymd_opt(2016, 9, 29)
         );
-        assert_eq!(f.get(BarFamily::Day), None);
+        assert_eq!(f.get(BarUnit::Day), None);
     }
 
     /// The statuses serialize as "streaming" / "delayed_streaming" /

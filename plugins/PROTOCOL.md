@@ -49,7 +49,7 @@ A plugin package is a zip. It holds `opentrader-plugin.json` at its root, plus t
 | `exchanges` | A data plugin that serves several exchanges from one source, for example the market segments of one broker account: `["NSE","BSE","NFO","MCX"]`. Same rules as `exchange`, no repeats. The app then names the plugin's symbols whole in every message (see below). Plugin API 2. |
 | `runtime` | How the plugin runs (see below). |
 | `install` | Files to copy into a folder the user picks (see below). |
-| `settings` | Fields the user fills in under Settings > Plugins. `type` is `text`, `number`, `bool` (`"true"` / `"false"`), `select` or `password`. Values travel as text. A `password` is typed masked and kept in the system's credential store, not with the other settings; Settings never shows it again, only that one is saved (Plugin API 3). `"when": {"connection": ["direct"]}` shows a field only while each named setting has one of the listed values (Plugin API 3); a hidden field keeps its value and is still sent. |
+| `settings` | Fields the user fills in under Settings > Plugins. `type` is `text`, `secret` (text shown masked, kept with the other settings), `number`, `bool` (`"true"` / `"false"`), `select` or `password`. Values travel as text. A `password` is typed masked and kept in the system's credential store, not with the other settings; Settings never shows it again, only that one is saved (Plugin API 3). `"when": {"connection": ["direct"]}` shows a field only while each named setting has one of the listed values (Plugin API 3); a hidden field keeps its value and is still sent. |
 | `platforms` | `windows`, `macos` and/or `linux`. Leave it empty for all platforms. |
 
 ### Runtime

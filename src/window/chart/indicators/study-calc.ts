@@ -12,9 +12,10 @@
 import { setSourceResolver, type Bar } from "oakscriptjs";
 import { MissingSymbolDataError } from "oakscriptjs/script";
 import type { LoadedIndicator } from "lightweight-charts-indicators/loader";
-import { ACCESSORS, callKey, deltaSnapshot, encodeDelta, isBarList, withoutEmptyPlots, type StudyCall, type StudyJob, type StudyReply } from "./study-worker-types";
+import { ACCESSORS, advanceSnapshot, callKey, deltaSnapshot, encodeDelta, isBarList, withoutEmptyPlots, type StudyCall, type StudyJob, type StudyReply } from "./study-worker-types";
 import { forPost } from "./packed-points";
-import { restoreTimes, scriptBars } from "../../../backtester/oakscript";
+import { scriptBars } from "../../../backtester/oakscript";
+import { chartTimesCopy } from "../../../backtester/chart-times-copy";
 
 /** A run of a library study (lightweight-charts-indicators `createRun`, on the ported studies): `update` gives the
  *  result of `calculate` on these bars, calculated from bar `from` (the newest bars on a live update). */
@@ -219,17 +220,20 @@ export async function calculateStudy(job: StudyJob): Promise<StudyReply> {
     } else {
       result = (entry.calculate as (b: Bar[], i: Record<string, unknown>, c: unknown) => unknown)(st.seen, job.inputs, ctx);
     }
-    if (st.seen !== st.bars && result && typeof result === "object") restoreTimes(result, st.seen, st.bars);
+    // What is sent goes on the chart's times; the run and the snapshot keep the script's.
+    const restamped = st.seen !== st.bars;
+    const sendable = (v: unknown): unknown => forPost(restamped && v && typeof v === "object" ? chartTimesCopy(v, st.seen, st.bars) : v);
     // Before the snapshot, so the next reply's changes are counted from what this one sent.
     result = withoutEmptyPlots(result);
     const prev = st.sent;
-    const snapshot = deltaSnapshot(result, st.bars.length);
-    st.sent = { id: job.id, result: snapshot };
-    const ms = performance.now() - t0;
     if (prev && prev.id === job.base) {
-      return { id: job.id, base: prev.id, result: forPost(encodeDelta(result, prev.result, 0, from > 0 ? { from, bars: st.bars.length } : undefined)), missing, ms };
+      const delta = encodeDelta(result, prev.result, 0, from > 0 ? { from, bars: st.bars.length } : undefined);
+      // The snapshot sent before, with the changes this reply sends.
+      st.sent = { id: job.id, result: advanceSnapshot(prev.result, delta, st.bars.length) };
+      return { id: job.id, base: prev.id, result: sendable(delta), missing, ms: performance.now() - t0 };
     }
-    return { id: job.id, result: forPost(result), missing, ms };
+    st.sent = { id: job.id, result: deltaSnapshot(result, st.bars.length) };
+    return { id: job.id, result: sendable(result), missing, ms: performance.now() - t0 };
   } catch (err) {
     // A run that stopped halfway is not resumed: the next job makes a new one.
     st.run = null;

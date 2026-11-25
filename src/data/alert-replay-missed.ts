@@ -19,7 +19,7 @@ import { DEFAULT_SESSION, engineRules, resolutionMs } from "./alert-bars";
 import { alertCallSeries, conditionSeries, plotSeries } from "./alert-studies";
 import { deliverFire } from "./alert-delivery";
 import { deliverStrategyFill, fillBarTime, strategyReplayReport } from "./alert-strategies";
-import { loadIndicatorLibrary } from "../window/chart/indicators/registry";
+import { isLibraryIndicatorId, loadIndicatorCode, loadIndicatorLibrary } from "../window/chart/indicators/registry";
 import * as kv from "./kv";
 import { isDailyInterval } from "./interval";
 
@@ -249,12 +249,21 @@ export async function replayMissedFires(previous: Record<string, number | null |
   return found;
 }
 
+/** A value of `v` (any depth) names a study of the indicator library. */
+function namesLibraryStudy(v: unknown, depth = 0): boolean {
+  if (typeof v === "string") return isLibraryIndicatorId(v);
+  if (depth > 6 || v === null || typeof v !== "object") return false;
+  return Object.values(v).some((x) => namesLibraryStudy(x, depth + 1));
+}
+
 /** Once per run of the app (a visit, on the web build): the fires missed while it was not running (with the indicator
- *  library loaded: alerts on its studies are replayed too). */
+ *  library's code loaded when a rule reads one of its studies: alerts on them are replayed too). The library's code
+ *  stays out of the window otherwise (specs/performance.md REQ-PERF-001). */
 export function replayMissedOnce(): void {
   // Read at once: the web build's record is overwritten during this run.
   const previousRun = previousRunQuotes();
   void loadIndicatorLibrary()
+    .then(() => (engineRules().some((r) => !evaluatedByBackend(r) && namesLibraryStudy(r)) ? loadIndicatorCode() : undefined))
     .then(() => previousRun)
     .then((recorded) => {
       // No record on the web build yet: from each rule's start, as the app does without a previous run.
