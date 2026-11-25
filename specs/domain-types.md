@@ -34,6 +34,12 @@ implementations:
   - src-tauri/crates/core/src/data/symbol.rs:Symbol
   - src-tauri/crates/core/src/commands.rs:live_symbol
 
+verifies:
+  - src-tauri/crates/core/src/data/symbol.rs:parses_full_and_bare
+  - src-tauri/crates/core/src/data/symbol.rs:reads_and_writes_its_full_name
+  - src-tauri/crates/core/src/data/symbol.rs:another_ticker_keeps_the_exchange
+  - src-tauri/crates/core/src/data/symbol.rs:tells_tickers_from_table_cells
+
 ## Acceptance
 <!-- id: REQ-DOMAIN-001.A1 -->
 - `Symbol::parse(" nse:reliance ")` has exchange `NSE`, ticker `RELIANCE` and displays `NSE:RELIANCE`; `Symbol::parse("aapl")` has exchange `""` and displays `AAPL`.
@@ -56,6 +62,13 @@ bars make one trading day. It reads and writes the plugin resolution grammar:
 implementations:
   - src-tauri/crates/core/src/data/interval.rs:Interval
   - src-tauri/crates/core/src/data/interval.rs:BarUnit
+
+verifies:
+  - src-tauri/crates/core/src/data/interval.rs:parses_the_plugin_grammar
+  - src-tauri/crates/core/src/data/interval.rs:refuses_what_is_not_a_served_size
+  - src-tauri/crates/core/src/data/interval.rs:writes_back_what_it_reads
+  - src-tauri/crates/core/src/data/interval.rs:knows_its_length_and_bars_per_day
+  - src-tauri/crates/core/src/data/interval.rs:units_keep_their_wire_words
 
 ## Acceptance
 <!-- id: REQ-DOMAIN-002.A1 -->
@@ -81,6 +94,10 @@ implementations:
   - src-tauri/crates/core/src/history/mod.rs:get_aggregates_before
   - src-tauri/crates/core/src/commands.rs:AggregatesBefore
 
+verifies:
+  - src-tauri/crates/core/src/commands.rs:a_timespan_that_is_not_a_unit_is_refused_when_read
+  - src-tauri/crates/core/src/history/tests.rs:bars_before_refuse_days_without_asking
+
 ## Acceptance
 <!-- id: REQ-DOMAIN-003.A1 -->
 - Arguments with `"timespan":"weird"` fail to deserialise. Before this change they were treated as minutes for the history-floor lookup.
@@ -100,6 +117,10 @@ implementations:
   - src-tauri/src/plugins/data.rs:bars
   - src-tauri/src/plugins/data.rs:recent
   - src-tauri/src/plugins/data.rs:before
+
+verifies:
+  - src-tauri/src/plugins/data.rs:picks_a_served_interval_or_a_divisor
+  - src-tauri/src/plugins/data.rs:rebuilds_bars_on_the_clock_grid
 
 ## Acceptance
 <!-- id: REQ-DOMAIN-004.A1 -->

@@ -37,6 +37,15 @@ implementations:
   - plugins/zerodha/src/auth.rs:login
   - plugins/dhan/src/auth.rs:generate
 
+verifies:
+  - plugins/kit/src/totp.rs:rfc_6238_vectors
+  - plugins/kit/src/totp.rs:secrets_are_read_loosely_and_bad_ones_refused
+  - plugins/zerodha/src/auth.rs:the_session_checksum_is_sha256_of_key_token_secret
+  - plugins/zerodha/src/auth.rs:missing_credentials_are_named
+  - plugins/dhan/src/auth.rs:missing_credentials_are_named
+  - plugins/kit/src/token.rs:a_private_file_is_the_users_only
+  - plugins/kit/src/token.rs:a_refused_login_answers_its_refusal_until_the_credentials_change
+
 ## Acceptance
 <!-- id: REQ-INDIA-001.A1 -->
 - The TOTP code of the RFC 6238 test secret at 59 s is `287082` (SHA-1, 6 digits, 30 s).
@@ -64,6 +73,14 @@ implementations:
   - plugins/zerodha/src/instruments.rs:parse
   - plugins/dhan/src/instruments.rs:parse
 
+verifies:
+  - plugins/zerodha/src/instruments.rs:rows_become_the_apps_symbols
+  - plugins/zerodha/src/instruments.rs:a_gzipped_dump_is_read
+  - plugins/dhan/src/instruments.rs:rows_become_the_apps_symbols
+  - plugins/dhan/src/instruments.rs:weekly_options_differ_by_their_expiry_date
+  - plugins/kit/src/catalog.rs:exact_symbol_first_then_cash_before_derivatives
+  - plugins/kit/src/catalog.rs:found_by_symbol_and_key_and_kept_on_disk
+
 ## Acceptance
 <!-- id: REQ-INDIA-002.A1 -->
 - A Kite dump row `NSE,RELIANCE,EQ` becomes `NSE:RELIANCE` (stock) and an `NFO-OPT` row `NIFTY25NOV24000CE` becomes `NFO:NIFTY25NOV24000CE` (futures) with its token, lot size and expiry.
@@ -89,6 +106,14 @@ implementations:
   - plugins/zerodha/src/history.rs
   - plugins/dhan/src/history.rs
 
+verifies:
+  - plugins/kit/src/history.rs:a_covered_window_needs_no_broker
+  - plugins/kit/src/history.rs:a_weekend_gap_is_not_asked
+  - plugins/kit/src/history.rs:a_long_window_is_asked_in_the_brokers_steps_newest_first
+  - plugins/kit/src/history.rs:the_forming_bar_stays_uncovered_and_a_refusal_answers_the_store
+  - plugins/zerodha/src/history.rs:candles_are_stamped_at_their_start
+  - plugins/dhan/src/history.rs:arrays_become_bars
+
 ## Acceptance
 <!-- id: REQ-INDIA-003.A1 -->
 - A covered window is answered without asking the broker; a weekend gap is not asked.
@@ -111,6 +136,14 @@ implementations:
   - plugins/kit/src/live.rs:Minutes
   - plugins/zerodha/src/ticker.rs:parse
   - plugins/dhan/src/feed.rs:parse
+
+verifies:
+  - plugins/kit/src/live.rs:the_minute_seen_from_its_start_is_written_not_the_one_joined
+  - plugins/kit/src/live.rs:a_new_days_first_minute_counts_from_none
+  - plugins/kit/src/live.rs:a_reconnect_drops_the_minute_in_progress
+  - plugins/zerodha/src/ticker.rs:a_packet_becomes_a_tick
+  - plugins/dhan/src/feed.rs:quote_and_prev_close_packets_read_back
+  - plugins/dhan/src/feed.rs:subscriptions_go_100_at_a_time
 
 ## Acceptance
 <!-- id: REQ-INDIA-004.A1 -->

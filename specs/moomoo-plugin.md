@@ -30,6 +30,11 @@ implementations:
   - plugins/moomoo/src/opend/frame.rs:encode
   - plugins/moomoo/src/opend/frame.rs:decode
 
+verifies:
+  - plugins/moomoo/src/opend/frame.rs:header_holds_the_fields_in_order
+  - plugins/moomoo/src/opend/frame.rs:decodes_what_it_encodes_and_waits_for_the_rest
+  - plugins/moomoo/src/opend/frame.rs:refuses_a_bad_header_or_checksum
+
 ## Acceptance
 <!-- id: REQ-MOOMOO-001.A1 -->
 - An encoded message is 44 header bytes plus the body. The header holds `F`, `T`, the proto id (u32 LE), format 1, version 0, the serial number (u32 LE), the body length (u32 LE) and the SHA-1 of the body.
@@ -50,6 +55,9 @@ port. The plugin retries every 5 s and logs the loss once.
 implementations:
   - plugins/moomoo/src/opend/client.rs:Client
 
+verifies:
+  - plugins/moomoo/src/opend/client.rs:an_answer_is_its_s2c_or_its_reason
+
 ## Acceptance
 <!-- id: REQ-MOOMOO-002.A1 -->
 - Against a fake OpenD, a request is answered with the `s2c` of the reply carrying the same serial number. A reply whose `retType` is not 0 becomes an error carrying `retMsg`.
@@ -65,6 +73,10 @@ zone, regular session and price scale. [needs review: exchange names]
 
 implementations:
   - plugins/moomoo/src/market.rs:Market
+
+verifies:
+  - plugins/moomoo/src/market.rs:maps_symbols_both_ways
+  - plugins/moomoo/src/market.rs:each_market_has_its_zone_and_session
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-003.A1 -->
@@ -88,6 +100,14 @@ implementations:
   - plugins/moomoo/src/bars.rs:to_bars
   - plugins/moomoo/src/bars.rs:end_stamped
   - plugins/kit/src/pace.rs:Pace
+
+verifies:
+  - plugins/moomoo/src/bars.rs:resolutions_map_to_kline_types
+  - plugins/moomoo/src/bars.rs:end_stamped_minutes_move_back_to_their_start
+  - plugins/moomoo/src/bars.rs:start_stamped_minutes_stay
+  - plugins/moomoo/src/bars.rs:a_daily_bar_starts_at_midnight_in_new_york
+  - plugins/moomoo/src/bars.rs:blanks_go_and_the_newest_count_stay
+  - plugins/kit/src/pace.rs:the_61st_waits_until_the_first_is_30_s_old
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-004.A1 -->
@@ -122,6 +142,13 @@ implementations:
   - plugins/moomoo/src/stream.rs:Quotes.minute_quote
   - plugins/moomoo/src/stream.rs:PushCount
 
+verifies:
+  - plugins/moomoo/src/stream.rs:new_symbols_at_once_dropped_ones_after_a_minute
+  - plugins/moomoo/src/stream.rs:a_reconnect_subscribes_the_wanted_set_again
+  - plugins/moomoo/src/stream.rs:basic_pushes_become_quotes_of_wanted_symbols_only
+  - plugins/moomoo/src/stream.rs:a_minute_push_after_a_basic_one_moves_the_price
+  - plugins/moomoo/src/stream.rs:pushes_are_counted_per_symbol_for_the_log
+
 ## Acceptance
 <!-- id: REQ-MOOMOO-005.A1 -->
 - Going from set {A} to {A, B} subscribes B only. Going to {} unsubscribes nothing before A's minute is up, and A once it is.
@@ -143,6 +170,11 @@ first, then code prefix, then name match.
 
 implementations:
   - plugins/moomoo/src/search.rs:rank
+
+verifies:
+  - plugins/moomoo/src/search.rs:exact_code_then_prefix_then_name
+  - plugins/moomoo/src/search.rs:at_most_fifty_rows
+  - plugins/moomoo/src/search.rs:reads_listed_securities_of_served_markets_and_types
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-006.A1 -->
@@ -184,6 +216,18 @@ implementations:
   - plugins/moomoo/src/history.rs:History
   - plugins/moomoo/src/history.rs:History.bars
 
+verifies:
+  - plugins/moomoo/src/history.rs:a_covered_window_is_answered_without_opend
+  - plugins/moomoo/src/history.rs:the_weekend_after_a_fetch_needs_no_opend
+  - plugins/moomoo/src/history.rs:a_longer_window_asks_from_one_bar_before_the_covered_end
+  - plugins/moomoo/src/history.rs:changed_adjusted_prices_drop_the_stored_series
+  - plugins/moomoo/src/history.rs:opend_refusing_answers_the_stored_bars
+  - plugins/moomoo/src/history.rs:streamed_minutes_answer_minute_and_five_minute_charts
+  - plugins/kit/src/store/sqlite.rs:a_flushed_series_is_read_back_by_a_new_store
+  - plugins/kit/src/store/sqlite.rs:a_dropped_series_is_deleted
+  - plugins/kit/src/store/clickhouse.rs:refuses_what_is_not_an_address_or_a_name
+  - plugins/moomoo/src/hours.rs:nights_and_weekends_hold_no_trading
+
 ## Acceptance
 <!-- id: REQ-MOOMOO-007.A1 -->
 - A second `data.bars` for a window already covered makes no OpenD request.
@@ -214,6 +258,9 @@ implementations:
   - plugins/moomoo/src/bars.rs:end_stamped
   - plugins/moomoo/src/hours.rs:has_trading
 
+verifies:
+  - plugins/moomoo/src/bars.rs:extended_us_bars_are_judged_on_the_extended_day
+
 ## Acceptance
 <!-- id: REQ-MOOMOO-008.A1 -->
 - A US 5-minute request carries `extendedTime: true`; a US daily request and any HK request do not.
@@ -233,6 +280,10 @@ always that of the plain body. Without the setting, nothing is encrypted.
 implementations:
   - plugins/moomoo/src/opend/crypt.rs:Rsa
   - plugins/moomoo/src/opend/crypt.rs:Aes
+
+verifies:
+  - plugins/moomoo/src/opend/crypt.rs:rsa_round_trips_bodies_longer_than_a_chunk
+  - plugins/moomoo/src/opend/crypt.rs:aes_round_trips_in_both_forms
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-009.A1 -->
@@ -263,6 +314,14 @@ implementations:
   - plugins/moomoo/src/trade/mod.rs:Broker
   - plugins/moomoo/src/trade/map.rs:order_request
   - plugins/moomoo/src/trade/map.rs:state_of
+
+verifies:
+  - plugins/moomoo/src/trade/map.rs:a_paper_account_with_two_markets_is_two_demo_accounts
+  - plugins/moomoo/src/trade/map.rs:a_gtc_stop_limit_becomes_opends_order
+  - plugins/moomoo/src/trade/map.rs:a_wrong_market_or_a_bracket_is_refused
+  - plugins/moomoo/src/trade/map.rs:statuses_map_to_the_apps
+  - plugins/moomoo/src/trade/map.rs:closing_four_of_a_long_ten_sells_four_at_market
+  - plugins/moomoo/src/trade/map.rs:orders_and_fills_read_back_and_tell_their_toast
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-010.A1 -->
@@ -321,6 +380,11 @@ implementations:
   - plugins/moomoo/src/cli.rs:backfill
   - plugins/moomoo/src/history.rs:History.fill
 
+verifies:
+  - plugins/moomoo/src/cli.rs:a_backfill_goes_back_to_the_first_step_without_bars_and_a_second_asks_nothing
+  - plugins/moomoo/src/cli.rs:a_refused_symbol_fails_and_the_next_is_filled
+  - plugins/moomoo/src/history.rs:an_answer_cut_at_the_most_bars_covers_only_up_to_its_newest
+
 ## Acceptance
 <!-- id: REQ-MOOMOO-012.A1 -->
 - Against a source with 1-minute bars in the last 70 days only, a backfill without `--from` stores them all and asks no step older than the first empty one.
@@ -344,6 +408,10 @@ or chart fetches them.
 implementations:
   - plugins/moomoo/src/cli.rs:record
   - plugins/moomoo/src/stream.rs:MinuteCover
+
+verifies:
+  - plugins/moomoo/src/stream.rs:closed_minutes_cover_the_span_since_the_last_one_until_a_reconnect
+  - plugins/moomoo/src/cli.rs:the_command_line_reads_symbols_options_and_refuses_strangers
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-013.A1 -->
@@ -392,6 +460,9 @@ releases the ones dropped (unless the app still asks for them).
 implementations:
   - plugins/moomoo/src/lib.rs:Plugin.notification
   - plugins/moomoo/src/lib.rs:record_list
+
+verifies:
+  - plugins/moomoo/src/lib.rs:always_record_folds_case_and_duplicates_and_leaves_out_others
 
 ## Acceptance
 <!-- id: REQ-MOOMOO-015.A1 -->
