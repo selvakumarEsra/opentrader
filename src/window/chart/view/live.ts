@@ -23,13 +23,11 @@ import { cachedSymbolSessions } from "../../../data/session";
 import { setDataForType, type OHLC } from "../chart-types";
 import { toOHLC } from "./helpers";
 import { type ChartCx } from "./context";
+import { paintWait } from "./live-paint-gap";
 
 /** Shortest time between two live paints: 30 per second. The reference app's live updates come 25 ms apart at the
  *  closest (277 ms median), measured on a busy symbol. */
 const LIVE_PAINT_MS = 33;
-/** Shortest time between two live paints of a pane that is not the focused one (a multi-chart layout): 5 per second
- *  (specs/performance.md REQ-PERF-004). */
-const BACKGROUND_PAINT_MS = 200;
 
 /** The bar a live paint gives the series' incremental update, or null to set the whole series again. The paint
  *  waits for the studies' results (up to LIVE_WAIT_MS): the series may have been given other bars
@@ -121,15 +119,14 @@ export function createLive(cx: ChartCx): LiveApi {
       : { next, appended };
     schedulePaint();
   }
-  /** The next live paint: at least LIVE_PAINT_MS after the one before (BACKGROUND_PAINT_MS for a pane that is not
-   *  focused), and not while the page is hidden (a minimised
+  /** The next live paint: at least LIVE_PAINT_MS after the one before, and not while the page is hidden (a minimised
    *  window, a browser tab in the background): it paints once shown. The chart library draws every series of the
    *  pane again on each paint, which at 60 per second takes cores on charts with many plots (#264). Not on an
    *  animation frame of its own: the chart library draws on the next one, a frame of ours before it was a second frame
    *  per live update with nothing drawn (#249). */
   function schedulePaint() {
     if (waitingShown || timer || calculating) return;
-    const wait = Math.max(0, paintedAt + (props.active === false ? BACKGROUND_PAINT_MS : LIVE_PAINT_MS) - performance.now());
+    const wait = paintWait(paintedAt, performance.now(), props.active, LIVE_PAINT_MS);
     timer = setTimeout(() => {
       timer = null;
       if (!document.hidden) {

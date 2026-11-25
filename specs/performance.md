@@ -37,7 +37,7 @@ implementations:
   - src/window/chart/indicators/indicator-layer.ts:IndicatorLayer
 
 verifies:
-  - src/window/chart/indicators/__tests__/registry-meta.test.ts
+  - src/window/chart/indicators/__tests__/registry-meta.test.ts:holdsFunction
   - src/window/chart/indicators/__tests__/registry-lazy.test.ts
 
 ## Acceptance
@@ -84,8 +84,8 @@ implementations:
   - src/window/oakscript/engine.ts
 
 verifies:
-  - src/window/chart/indicators/__tests__/study-calc-live.test.ts
-  - src/window/oakscript/__tests__/live-script.test.ts
+  - src/window/chart/indicators/__tests__/study-calc-live.test.ts:fullOnChart
+  - src/window/oakscript/__tests__/live-script.test.ts:fullRun
 
 ## Acceptance
 <!-- id: REQ-PERF-002.A1 -->
@@ -137,6 +137,11 @@ chart library draws on the next one, and a frame of ours before it would be a se
 
 implementations:
   - src/window/chart/view/live.ts:createLive
+  - src/window/chart/view/live-paint-gap.ts:paintGap
+  - src/window/chart/view/live-paint-gap.ts:paintWait
+
+verifies:
+  - src/window/chart/view/__tests__/live-paint-gap.test.ts:LIVE
 
 ## Acceptance
 <!-- id: REQ-PERF-004.A1 -->
