@@ -484,6 +484,9 @@ implementations:
   - plugins/moomoo/src/search.rs:Catalog
   - plugins/moomoo/src/lib.rs:Plugin.pump
 
+verifies:
+  - plugins/moomoo/tests/app_protocol.rs:the_us_list_is_loaded_once_and_kept_on_disk
+
 ## Acceptance
 <!-- id: REQ-MOOMOO-016.A1 -->
 - With no list file, the first connection to OpenD loads the US list and writes it; a search then finds `AAPL` without asking OpenD again.

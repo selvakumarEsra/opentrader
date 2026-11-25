@@ -3,6 +3,11 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import meta from "virtual:indicator-meta";
 
+/** Whether `v` is a function or holds one, at any depth (up to 12 levels). */
+function holdsFunction(v: unknown, depth = 0): boolean {
+  return typeof v === "function" || (depth < 12 && v !== null && typeof v === "object" && Object.values(v).some((x) => holdsFunction(x, depth + 1)));
+}
+
 describe("indicator registry with workers: the library's metadata, its code on demand", () => {
   beforeAll(() => vi.stubGlobal("Worker", class {}));
   afterAll(() => vi.unstubAllGlobals());
@@ -10,8 +15,7 @@ describe("indicator registry with workers: the library's metadata, its code on d
   it("has every entry's metadata and no function in it (REQ-PERF-001.A1)", async () => {
     const { indicatorRegistry } = await import("lightweight-charts-indicators");
     expect(meta.entries.map((e) => e.id)).toEqual(indicatorRegistry.map((e) => e.id));
-    const fn = (v: unknown, d = 0): boolean => typeof v === "function" || (d < 12 && v !== null && typeof v === "object" && Object.values(v).some((x) => fn(x, d + 1)));
-    expect(meta.entries.some((e) => fn(e))).toBe(false);
+    expect(meta.entries.some((e) => holdsFunction(e))).toBe(false);
     const rsi = indicatorRegistry.find((e) => e.id === "rsi")!;
     const { calculate: _c, createRun: _r, ...data } = rsi as unknown as Record<string, unknown>;
     expect(meta.entries.find((e) => e.id === "rsi")).toEqual(JSON.parse(JSON.stringify(data)));

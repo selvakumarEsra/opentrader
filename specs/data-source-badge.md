@@ -25,7 +25,7 @@ implementations:
   - src/window/shell/TabPanelActions.tsx:TabPanelActions
 
 verifies:
-  - src/window/shell/__tests__/data-source-badge.test.ts
+  - src/window/shell/__tests__/data-source-badge.test.ts:base
 
 ## Acceptance
 <!-- id: REQ-DATA-BADGE-001.A1 -->

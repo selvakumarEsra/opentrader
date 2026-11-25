@@ -44,7 +44,7 @@ implementations:
   - src-tauri/src/assistant_cli.rs:assistant_cli_status
 
 verifies:
-  - src/data/assistant/__tests__/models.test.ts
+  - src/data/assistant/__tests__/models.test.ts:load
 
 ## Acceptance
 <!-- id: REQ-ASSIST-CLI-001.A1 -->
@@ -72,7 +72,7 @@ implementations:
   - src/data/assistant/session.ts:sdkPrompt
 
 verifies:
-  - src/data/assistant/__tests__/session-sdk.test.ts
+  - src/data/assistant/__tests__/session-sdk.test.ts:run
   - src-tauri/assistant-bridge/bridge.test.mjs
 
 ## Acceptance
@@ -105,8 +105,8 @@ implementations:
   - src/data/assistant/session.ts
 
 verifies:
-  - src/agent/__tests__/mcp.test.ts
-  - src/data/assistant/__tests__/session-sdk.test.ts
+  - src/agent/__tests__/mcp.test.ts:call
+  - src/data/assistant/__tests__/session-sdk.test.ts:run
   - src-tauri/assistant-bridge/bridge.test.mjs
 
 ## Acceptance
@@ -135,6 +135,9 @@ implementations:
   - src/data/assistant/prompts.ts:SDK_INSTRUCTIONS
   - src/window/assistant/AssistantPanel.tsx
 
+verifies:
+  - src/data/assistant/__tests__/session-sdk.test.ts:run
+
 ## Acceptance
 <!-- id: REQ-ASSIST-CLI-004.A1 -->
 - The instructions sent to the model contain the rules above (data first, last bar date, options working, entry / stop / risks).
@@ -152,7 +155,7 @@ implementations:
   - src/data/assistant/session.ts:sendSdk
 
 verifies:
-  - src/data/assistant/__tests__/session-sdk.test.ts
+  - src/data/assistant/__tests__/session-sdk.test.ts:run
 
 ## Acceptance
 <!-- id: REQ-ASSIST-CLI-005.A1 -->
