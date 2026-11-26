@@ -637,6 +637,8 @@
 .app-settings-plugin-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--color-content-secondary-neutral); opacity: 0.5; }
 .app-settings-plugin-dot.is-waiting { background: var(--color-ripe-red-400); opacity: 0.6; }
 .app-settings-plugin-dot.is-on { background: var(--color-minty-green-400); opacity: 1; }
+/* A plugin's buttons: as many as fit in the card on a line, the rest on the next. */
+.app-settings-local-head.app-settings-plugin-actions { flex-wrap: wrap; }
 .app-settings-plugin-setup { white-space: pre-wrap; font-size: 12px; line-height: 16px; color: var(--color-content-secondary-neutral); }
 .app-settings-plugin-step { display: flex; flex-direction: column; gap: 6px; }
 /* Chart data / Trading of a plugin that provides both, under Enabled. */
