@@ -1,6 +1,6 @@
 [package]
 name = "opentrader"
-version = "0.4.35"
+version = "0.4.36"
 description = "OpenTrader: desktop charting app"
 authors = ["OpenTrader contributors"]
 license = "MIT"
