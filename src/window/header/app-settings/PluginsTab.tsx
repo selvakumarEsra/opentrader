@@ -275,7 +275,7 @@ function PluginCard(props: { plugin: PluginInfo; busy: string | null; take: (wha
       <Show when={m().setup}>
         <div class="app-settings-plugin-setup" data-no-translate>{m().setup}</div>
       </Show>
-      <div class="app-settings-local-head">
+      <div class="app-settings-local-head app-settings-plugin-actions">
         <Show when={(m().settings ?? []).length > 0}>
           <button type="button" class="app-settings-btn" onClick={() => setOpen(open() === "settings" ? null : "settings")}>
             Settings
