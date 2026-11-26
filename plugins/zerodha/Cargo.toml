@@ -1,6 +1,6 @@
 [package]
 name = "opentrader-zerodha"
-version = "0.1.0"
+version = "0.1.1"
 description = "OpenTrader data plugin for Zerodha Kite Connect (Indian stocks, indices, futures and options)"
 edition = "2021"
 publish = false
