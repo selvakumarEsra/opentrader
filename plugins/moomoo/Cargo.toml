@@ -1,6 +1,6 @@
 [package]
 name = "opentrader-moomoo"
-version = "0.2.4"
+version = "0.2.5"
 description = "OpenTrader data plugin for moomoo OpenD (symbols, bars and live prices)"
 edition = "2021"
 publish = false

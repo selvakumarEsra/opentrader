@@ -1,7 +1,7 @@
 {
   "id": "zerodha",
   "name": "Zerodha",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "OpenTrader",
   "description": "Indian stocks, indices, futures and options (NSE, BSE, NFO, BFO, MCX, CDS) with history and live prices from your Zerodha Kite Connect app. History is kept in a bar store on this computer, or in ClickHouse.",
   "api": 2,

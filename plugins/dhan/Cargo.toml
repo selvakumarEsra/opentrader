@@ -1,6 +1,6 @@
 [package]
 name = "opentrader-dhan"
-version = "0.1.0"
+version = "0.1.1"
 description = "OpenTrader data plugin for Dhan (DhanHQ API: Indian stocks, indices, futures and options)"
 edition = "2021"
 publish = false
