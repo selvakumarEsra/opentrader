@@ -28,7 +28,8 @@ Contract: [`specs/moomoo-plugin.md`](../../specs/moomoo-plugin.md).
   chart: the app starts the plugin when it opens and stops it when it quits, so this is `record` inside the app.
 - **Bar store** (`plugins/kit/src/store/`, shared with the other plugins): per series (symbol, resolution, session) the bars and the time ranges they cover,
   written every 30 s. By default an SQLite file in the user's cache folder (`OPENTRADER_MOOMOO_CACHE` overrides
-  it). With a ClickHouse URL in Settings, a `moomoo_bars` ReplacingMergeTree table and `moomoo_covered`, created
+  it), in a compact layout (`specs/compact-bar-store.md`): each series named once, prices as whole price steps
+  when that keeps them exact. A file of the layout before it is converted in place the first time it is opened. With a ClickHouse URL in Settings, a `moomoo_bars` ReplacingMergeTree table and `moomoo_covered`, created
   when missing. When a stored bar's close no longer matches OpenD's (a split or dividend adjusts history), the
   series is dropped and asked again.
 - **Trading** (`src/trade/`): each OpenD account and market it may trade is one app account, `SIM-<id>-US` (paper)

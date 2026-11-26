@@ -33,8 +33,8 @@ Secrets are kept in OpenTrader's settings on this computer and shown masked.
   `1, 5, 15, 60, 1D`; the app builds the others.
 - **Live** (`src/feed.rs`): Dhan's market feed (binary, little-endian) in full mode, up to 100 instruments a
   message; ticks become live prices and stored 1-minute bars. A disconnect for an expired token (807) makes a new one.
-- **Store**: SQLite in the cache folder `opentrader-dhan` (`OPENTRADER_DHAN_CACHE`), or ClickHouse tables
-  `dhan_bars` / `dhan_covered`.
+- **Store**: SQLite in the cache folder `opentrader-dhan` (`OPENTRADER_DHAN_CACHE`), in the compact layout of
+  `specs/compact-bar-store.md`, or ClickHouse tables `dhan_bars` / `dhan_covered`.
 
 ## Fill the store unattended
 

@@ -27,6 +27,12 @@ a series' covered ranges are the same ranges. This holds for prices on the symbo
 
 implementations:
   - plugins/kit/src/store/sqlite.rs:Sqlite
+  - plugins/kit/src/store/sqlite.rs:steps
+  - plugins/kit/src/store/sqlite.rs:price_of
+
+verifies:
+  - plugins/kit/src/store/sqlite.rs:bars_come_back_exactly_as_written
+  - plugins/kit/src/store/sqlite.rs:prices_are_whole_steps_only_when_they_come_back_exactly
 
 ## Acceptance
 <!-- id: REQ-BAR-STORE-001.A1 -->
@@ -45,6 +51,10 @@ has been compacted (no free pages).
 
 implementations:
   - plugins/kit/src/store/sqlite.rs:Sqlite
+  - plugins/kit/src/store/sqlite.rs:steps
+
+verifies:
+  - plugins/kit/src/store/sqlite.rs:the_compact_file_takes_half_the_space_or_less
 
 ## Acceptance
 <!-- id: REQ-BAR-STORE-002.A1 -->
@@ -64,6 +74,14 @@ file's size on disk is that of the compact layout, not the old size.
 
 implementations:
   - plugins/kit/src/store/sqlite.rs:Sqlite
+  - plugins/kit/src/store/sqlite.rs:to_compact
+
+verifies:
+  - plugins/kit/src/store/sqlite.rs:an_old_file_is_converted_in_place
+  - plugins/kit/src/store/sqlite.rs:a_failed_conversion_leaves_the_old_file
+  - plugins/kit/src/store/sqlite.rs:two_openers_convert_once
+  - plugins/kit/src/store/sqlite.rs:the_compact_file_takes_half_the_space_or_less
+  - plugins/kit/src/store/sqlite.rs:a_million_bars_convert_in_under_30_seconds
 
 ## Acceptance
 <!-- id: REQ-BAR-STORE-003.A1 -->
@@ -90,6 +108,11 @@ tables.
 
 implementations:
   - plugins/kit/src/store/sqlite.rs:Sqlite
+  - plugins/kit/src/store/sqlite.rs:to_compact
+
+verifies:
+  - plugins/kit/src/store/sqlite.rs:a_newer_layout_is_left_alone
+  - plugins/kit/src/store/sqlite.rs:the_old_store_cannot_use_a_converted_file
 
 ## Acceptance
 <!-- id: REQ-BAR-STORE-004.A1 -->
