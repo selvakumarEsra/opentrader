@@ -176,6 +176,11 @@ impl Catalog {
         index.by_symbol.get(&symbol).map(|&i| index.list[i].clone())
     }
 
+    /// The instruments `keep` takes, in the list's order.
+    pub fn select(&self, keep: impl Fn(&Instrument) -> bool) -> Vec<Instrument> {
+        self.index().list.iter().filter(|i| keep(i)).cloned().collect()
+    }
+
     pub fn by_key(&self, key: &str) -> Option<Instrument> {
         let index = self.index();
         index.by_key.get(key).map(|&i| index.list[i].clone())

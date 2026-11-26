@@ -6,6 +6,7 @@
   "description": "Symbols, bars and live prices of US, Hong Kong and China A-share stocks, and trading of your paper and live moomoo accounts, through your moomoo OpenD.",
   "api": 2,
   "provides": ["datafeed", "broker"],
+  "screener": ["US"],
   "exchanges": ["US", "HK", "SH", "SZ"],
   "runtime": { "type": "process", "entry": "opentrader-moomoo", "args": [] },
   "settings": [

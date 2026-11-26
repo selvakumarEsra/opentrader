@@ -27,6 +27,7 @@ import { openScreenAlertDialog } from "../alerts/screen-alert-dialog";
 import { leaveScreen } from "./leave-screen";
 import { ScreenerSettingsDialog } from "./ScreenerSettingsDialog";
 import { screenerFields, screenerScan } from "../../data/screener-api";
+import { activeMarket } from "./plugin-markets";
 import { planScreen } from "../../data/screener-query";
 import { watchlistTickers } from "./FilterPills";
 import { MAX_ROWS, csvFileName, screenCsv } from "./screener-csv";
@@ -69,9 +70,10 @@ export function ScreenerTopbar(props: Props) {
   const downloadCsv = async () => {
     const s = screenerStore.screen();
     trackScreener("screener_exported", { screener: s.type ?? "stock", to: "csv" });
-    const known = new Set((await screenerFields()).filter((f) => f.available).map((f) => f.id));
-    const plan = planScreen(s, (f) => known.has(f), watchlistTickers(s.watchlistId));
-    const res = await screenerScan({ columns: plan.fields, filter: plan.filter, sort: plan.sort, range: [0, MAX_ROWS], tickers: plan.tickers });
+    const market = activeMarket(s);
+    const known = new Set((await screenerFields(market)).filter((f) => f.available).map((f) => f.id));
+    const plan = planScreen({ ...s, market: market ?? undefined }, (f) => known.has(f), watchlistTickers(s.watchlistId));
+    const res = await screenerScan({ columns: plan.fields, filter: plan.filter, sort: plan.sort, range: [0, MAX_ROWS], tickers: plan.tickers }, market);
     void saveFile(csvFileName(s.title), screenCsv(res.rows, plan.columns, plan.fields));
   };
   const run = (fn: () => void) => {

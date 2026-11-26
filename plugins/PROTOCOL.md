@@ -342,6 +342,35 @@ Answer `-32601` (method not found) if you have no events: the app asks no more u
 
 Some symbols' events changed (a new dividend announced, an event cancelled): `{"tickers":["RELIANCE"]}`, with the tickers as the app asks them. Without `tickers`, all of the plugin's symbols changed. The app drops what it kept and asks `data.events` again for the charts that show them.
 
+### `data.screen` (app → plugin, request)
+
+The rows of a Stock Screener market the plugin serves. Declare the markets in the manifest: `"screener": ["IN"]`. The
+Market pill then lists them while the plugin is enabled for chart data. While a screener panel shows one, the app asks
+`{"market":"IN"}` every 10 s and stops asking when no panel shows it. Answer at once from what you hold, and keep the
+rows current in the background while the app keeps asking, within your broker's rate limits (leave room for the
+charts' requests). Answer:
+
+```json
+{"market":"IN","currency":"INR","updated":1763027999000,"status":"Daily history: 812 of 2,040 stocks","error":null,
+ "fields":["SMA50","RSI"],
+ "rows":[{"ticker":"NSE:RELIANCE","name":"Reliance Industries","exchange":"NSE","type":"stock",
+          "time":1763027999000,"live":true,"price":1500.5,"change":15.2,"changePercent":1.02,
+          "open":1490,"high":1510,"low":1480,"volume":1000000,"prevClose":1485.3,
+          "values":{"SMA50":1450.5,"RSI":61.2}}]}
+```
+
+- `rows`: every instrument of the market. `ticker` is the app's symbol. `type` is `stock`, or `secondary` for another
+  listing of a company listed on an exchange before it (the "Primary listing" filter leaves those out). `time` (UNIX
+  ms) is when the row's values were taken, 0 without a quote; `live` says it has traded in today's session.
+- `values`: screener field ids and their values as the screener shows them, computed with the live price
+  (`SMA50`, `EMA20`, `RSI`, `Perf.1M`, `price_52_week_high`, `average_volume_10d_calc`, …). Market cap, P/E and P/B
+  come from their inputs: `shares` (issued shares), `f.eps_dil_ttm` (EPS, TTM) and `f.book_ps_fq` (book value per
+  share). A field no row gives is shown as not available for the market.
+- `updated` (UNIX ms): when the rows were built; null before the first build. `status`: what the plugin is doing, shown
+  in the screener's status line. `error`: why the last refresh failed; the rows of the refresh before stay.
+
+Answer `-32602` for a market you do not serve.
+
 ## Broker plugins (`broker`)
 
 The user connects the app to one broker plugin at a time from **Trade > Connect broker…**. Requests are only sent to the connected plugin, and only its notifications are heard.

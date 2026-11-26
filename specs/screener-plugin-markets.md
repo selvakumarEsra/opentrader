@@ -39,6 +39,12 @@ stays in the popover for every market (REQ-SCREEN-MKT-003).
 implementations:
   - src/window/screener/FilterPills.tsx:FilterPills
   - src/window/screener/plugin-markets.ts:pluginMarkets
+  - src/window/screener/plugin-markets.ts:activeMarket
+  - src/window/screener/plugin-markets.ts:missingMarketNotice
+
+verifies:
+  - src/window/screener/__tests__/plugin-markets.test.ts:lists USA, then India, then USA (moomoo)
+  - src/window/screener/__tests__/plugin-markets.test.ts:falls back to USA when the plugin is no longer enabled
 
 ## Acceptance
 <!-- id: REQ-SCREEN-MKT-001.A1 -->
@@ -63,8 +69,16 @@ The protocol change is written in `plugins/PROTOCOL.md`.
 
 implementations:
   - src-tauri/src/plugins/screener.rs:PluginMarkets
+  - src-tauri/src/plugins/screener.rs:table_of
+  - src-tauri/src/plugins/screener.rs:catalog_of
   - plugins/kit/src/feed.rs:Feed
+  - plugins/kit/src/screen.rs:State
   - plugins/PROTOCOL.md
+
+verifies:
+  - src-tauri/src/plugins/screener.rs:a_plugin_answer_scans_like_the_market
+  - src-tauri/src/plugins/screener.rs:a_field_not_given_is_unavailable
+  - plugins/kit/src/screen.rs:the_refresh_runs_while_the_app_asks
 
 ## Acceptance
 <!-- id: REQ-SCREEN-MKT-002.A1 -->
@@ -89,7 +103,16 @@ the rows list the instruments with empty quote fields, and the status says to lo
 
 implementations:
   - plugins/zerodha/src/lib.rs:Zerodha
-  - plugins/zerodha/src/screen.rs:rows
+  - plugins/zerodha/src/screen.rs:member
+  - plugins/zerodha/src/screen.rs:quotes
+  - plugins/kit/src/screen.rs:listing_kinds
+  - plugins/kit/src/screen.rs:row
+
+verifies:
+  - plugins/zerodha/src/screen.rs:the_market_is_the_cash_stocks_of_nse_and_bse
+  - plugins/zerodha/src/screen.rs:an_answer_gives_each_symbol_its_quote
+  - plugins/kit/src/screen.rs:a_second_listing_is_secondary
+  - src/window/screener/__tests__/plugin-markets.test.ts:scans a plugin market's stocks, and its second listings with Primary listing off
 
 ## Acceptance
 <!-- id: REQ-SCREEN-MKT-003.A1 -->
@@ -118,7 +141,13 @@ it has enough bars for that value. Each day after the close, the new daily bar i
 
 implementations:
   - plugins/kit/src/screen.rs:technicals
-  - plugins/zerodha/src/screen.rs:rows
+  - plugins/kit/src/screen.rs:session_bars
+  - plugins/kit/src/feed.rs:Feed
+
+verifies:
+  - plugins/kit/src/screen.rs:technicals_follow_the_closes
+  - plugins/kit/src/screen.rs:a_young_stock_has_the_values_its_bars_allow
+  - plugins/kit/src/screen.rs:the_live_session_is_the_newest_bar
 
 ## Acceptance
 <!-- id: REQ-SCREEN-MKT-004.A1 -->
@@ -142,7 +171,13 @@ connected.
 
 implementations:
   - plugins/moomoo/src/screen.rs:rows
-  - plugins/moomoo/src/lib.rs:Moomoo
+  - plugins/moomoo/src/screen.rs:snapshot
+  - plugins/moomoo/src/screen.rs:run
+  - plugins/moomoo/src/lib.rs:Plugin
+
+verifies:
+  - plugins/moomoo/src/screen.rs:a_snapshot_gives_quote_and_fundamentals
+  - plugins/moomoo/src/screen.rs:a_stock_without_a_snapshot_has_an_empty_row
 
 ## Acceptance
 <!-- id: REQ-SCREEN-MKT-005.A1 -->

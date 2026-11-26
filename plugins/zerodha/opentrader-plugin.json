@@ -8,6 +8,9 @@
   "provides": [
     "datafeed"
   ],
+  "screener": [
+    "IN"
+  ],
   "exchanges": [
     "NSE",
     "BSE",

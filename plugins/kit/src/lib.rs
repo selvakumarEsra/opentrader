@@ -12,6 +12,7 @@
  *   token    a broker's access token: kept in memory and on disk, made again when refused
  *   socket   a broker's WebSocket stream of ticks, connected again after a drop (feature `socket`)
  *   backfill the plugin program as an unattended command filling the store
+ *   screen   a screener market's rows: quotes and the values of daily bars (`data.screen`)
  *   totp     RFC 6238 codes for broker logins
  */
 pub mod backfill;
@@ -22,6 +23,7 @@ pub mod history;
 pub mod live;
 pub mod pace;
 pub mod rpc;
+pub mod screen;
 pub mod session;
 #[cfg(feature = "socket")]
 pub mod socket;

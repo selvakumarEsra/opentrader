@@ -890,6 +890,8 @@ export type Screen = {
   watchlistId: string | null;
   /** Market pill "Primary listing" (unset = on, the reference default). */
   primaryListing?: boolean;
+  /** A data plugin's screener market (`zerodha:IN`, window/screener/plugin-markets.ts); unset = the app's USA. */
+  market?: string;
   /** How the results show (unset = table). */
   viewMode?: ViewMode;
   /** The screener it belongs to (unset = the Stock Screener). */

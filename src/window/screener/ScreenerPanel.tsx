@@ -40,7 +40,10 @@ import { trackScreener } from "../../data/screener-telemetry";
 import { For, Show, createEffect, createMemo, createSignal, on, onCleanup, onMount } from "solid-js";
 import { Icon } from "../../components/Icon";
 import type { FieldInfo, ScreenerProgress } from "../../bindings";
-import { POLL_MS, onScreenerUpdate, screenerClose, screenerFields, screenerOpen, screenerProgress } from "../../data/screener-api";
+import { POLL_MS, onScreenerUpdate, pluginMarketStatus, screenerClose, screenerFields, screenerOpen, screenerProgress } from "../../data/screener-api";
+import { activeMarket, formatDateTime, missingMarketNotice } from "./plugin-markets";
+import type { PluginMarketStatus } from "../../bindings";
+
 import { wheelText } from "../../data/screener-progress";
 import {
   columnSets,
@@ -212,15 +215,25 @@ export function ScreenerPanel(props: Props) {
     ctl.refresh();
   };
   const tickers = createMemo(() => watchlistTickers(screen().watchlistId));
-  const plan = createMemo<Plan | null>(() => (fields() ? planScreen(screen(), has, tickers()) : null));
-  const ctl = createScanController(plan);
+  /** The plugin market the screen shows (null: the app's USA). */
+  const market = createMemo(() => activeMarket(screen()));
+  const plan = createMemo<Plan | null>(() => (fields() ? planScreen({ ...screen(), market: market() ?? undefined }, has, tickers()) : null));
+  const ctl = createScanController(plan, market);
+  /** A plugin market's status line: what its plugin is doing, or its last error and the rows' time. */
+  const [pluginStatus, setPluginStatus] = createSignal<PluginMarketStatus | null>(null);
+  const pluginLine = () => {
+    const st = pluginStatus();
+    if (!market() || !st) return null;
+    if (st.error) return `${st.error}${st.updatedMs !== null ? ` · rows of ${formatDateTime(st.updatedMs)}` : ""}`;
+    return st.status ?? null;
+  };
 
   // Re-plan → reset rows (only when the request really changes).
   createEffect(
     on(
       () => {
         const p = plan();
-        return p ? JSON.stringify([p.fields, p.filter, p.sort, p.tickers]) : "";
+        return p ? JSON.stringify([market(), p.fields, p.filter, p.sort, p.tickers]) : "";
       },
       (key) => {
         if (!key) return;
@@ -244,7 +257,7 @@ export function ScreenerPanel(props: Props) {
   createEffect(() => {
     if (!waiting()) return;
     let stop = false;
-    const read = () => void screenerProgress().then((p) => !stop && setProgress(p), () => {});
+    const read = () => void screenerProgress(market()).then((p) => !stop && setProgress(p), () => {});
     read();
     const timer = window.setInterval(read, 300);
     onCleanup(() => {
@@ -253,15 +266,18 @@ export function ScreenerPanel(props: Props) {
     });
   });
 
-  onMount(() => {
+  // The market's table: opened for this panel, again when the screen's market changes.
+  createEffect(on(market, (mk) => {
     let disposed = false;
     let unlisten: (() => void) | null = null;
+    setPluginStatus(null);
+    setBackendLoaded(false);
     void (async () => {
       try {
-        const list = await screenerFields();
+        const list = await screenerFields(mk);
         if (disposed) return;
         setFields(new Map(list.map((f) => [f.id, f])));
-        const st = await screenerOpen(owner);
+        const st = await screenerOpen(owner, mk);
         if (disposed) return;
         track("screener_opened");
         if (st.updatedMs !== null) setLastUpdate(Date.now());
@@ -270,13 +286,16 @@ export function ScreenerPanel(props: Props) {
         // waiting on the ticker list or the daily state): that one is shown at once, whatever the auto-refresh setting.
         let loaded = st.updatedMs !== null && st.complete;
         setBackendLoaded(loaded);
+        if (mk) void pluginMarketStatus(mk).then((p) => !disposed && setPluginStatus(p));
         unlisten = await onScreenerUpdate((u) => {
           setLastUpdate(Date.now());
-          // A new daily state brings its fields (the fundamentals): the field list is read again.
-          if (u.stateAsof !== stateAsof) {
+          // A new daily state brings its fields (the fundamentals): the field list is read again. A plugin market's
+          // fields follow its rows.
+          if (u.stateAsof !== stateAsof || (mk && !loaded)) {
             stateAsof = u.stateAsof;
-            void screenerFields().then((l) => !disposed && setFields(new Map(l.map((f) => [f.id, f]))));
+            void screenerFields(mk).then((l) => !disposed && setFields(new Map(l.map((f) => [f.id, f]))));
           }
+          if (mk) void pluginMarketStatus(mk).then((p) => !disposed && setPluginStatus(p));
           if (u.error) return;
           const first = !loaded && u.updatedMs !== null && u.complete;
           // Auto-refresh: every update (10 s), the first update a minute after the last refresh, or never.
@@ -287,19 +306,21 @@ export function ScreenerPanel(props: Props) {
             loaded = true;
             setBackendLoaded(true);
           }
-        });
+        }, mk);
         if (disposed) unlisten();
       } catch (e) {
         console.error("[screener] open failed", e);
       }
     })();
-    const tick = window.setInterval(() => setNow(Date.now()), 1000);
     onCleanup(() => {
       disposed = true;
-      window.clearInterval(tick);
       unlisten?.();
-      void screenerClose(owner).catch(() => {});
+      void screenerClose(owner, mk).catch(() => {});
     });
+  }));
+  onMount(() => {
+    const tick = window.setInterval(() => setNow(Date.now()), 1000);
+    onCleanup(() => window.clearInterval(tick));
   });
 
   // Seconds to the next refresh (the reference app "Time to refresh"); none with auto-refresh off.
@@ -615,6 +636,9 @@ export function ScreenerPanel(props: Props) {
             <Show when={!maximized()}>
             <Show when={!narrow()}>
               <FilterPills has={has} />
+            </Show>
+            <Show when={missingMarketNotice(screen()) ?? pluginLine()}>
+              {(text) => <div class="scr-market-status" role="status">{text()}</div>}
             </Show>
             <div class="scr-head-row" classList={{ "is-row": narrow() && roomy(), "is-stacked": narrow() && !roomy() }}>
             <Show when={narrow()}>

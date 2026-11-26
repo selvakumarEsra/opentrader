@@ -10,6 +10,7 @@ pub mod cli;
 pub mod history;
 pub mod hours;
 pub mod market;
+pub mod screen;
 pub mod opend;
 // Shared with the other data plugins (plugins/kit).
 pub use opentrader_plugin_kit::{pace, rpc, store};
@@ -62,6 +63,9 @@ struct Plugin {
     broker: trade::Broker,
     quotes: Mutex<Quotes>,
     out: Out,
+    /// The screener's "USA (moomoo)" rows (`data.screen`).
+    screen: opentrader_plugin_kit::screen::State,
+    screen_pace: pace::Pace,
 }
 
 /// One session with the app: Ok when the app closed the connection, Err with the reason when it refused the plugin
@@ -92,6 +96,8 @@ pub async fn run_session_with(addr: &str, plugin: &str, token: &str, opend: &str
         record_tickers: Mutex::new(BTreeSet::new()),
         quotes: Mutex::new(Quotes::default()),
         out: out.clone(),
+        screen: Default::default(),
+        screen_pace: screen::pace(),
     });
     tokio::spawn(me.clone().pump(events));
     tokio::spawn(me.clone().release());
@@ -361,8 +367,41 @@ impl Plugin {
     }
 }
 
+#[derive(Deserialize)]
+struct ScreenParams {
+    market: String,
+}
+
+impl Plugin {
+    /// `data.screen`: the US rows as last built; the first ask starts their refresh (screen.rs).
+    fn data_screen(self: Arc<Self>, p: Value) -> Result<Value, RpcError> {
+        let p: ScreenParams = params("data.screen", p)?;
+        if p.market != screen::US {
+            return Err(RpcError::new(BAD_PARAMS, format!("No screener market {}", p.market)));
+        }
+        let (mut answer, start) = self.screen.ask();
+        if start {
+            let me = self.clone();
+            tokio::spawn(async move {
+                let _ = me.catalog.keep_fresh(&me.client, opentrader_plugin_kit::now()).await;
+                let list = std::sync::Mutex::new(me.catalog.us_stocks().await);
+                screen::run(&me.screen, &me.client, || locked(&list).clone(), &me.screen_pace).await;
+            });
+        }
+        if answer.market.is_empty() {
+            answer.market = screen::US.into();
+            answer.currency = "USD".into();
+            answer.status = Some("Loading the market's quotes".into());
+        }
+        Ok(serde_json::to_value(answer).unwrap_or(Value::Null))
+    }
+}
+
 impl Handler for Plugin {
     async fn request(self: Arc<Self>, method: String, params: Value) -> Result<Value, RpcError> {
+        if method == "data.screen" {
+            return self.data_screen(params);
+        }
         Plugin::request(&self, &method, params).await
     }
 

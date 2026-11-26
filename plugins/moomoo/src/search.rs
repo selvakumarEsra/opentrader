@@ -168,6 +168,11 @@ impl Catalog {
             .collect()
     }
 
+    /// The US list's stocks (none before it is loaded).
+    pub async fn us_stocks(&self) -> Vec<Listed> {
+        self.lists.lock().await.get(&Market::Us).map(|l| l.iter().filter(|l| l.kind == "stock").cloned().collect()).unwrap_or_default()
+    }
+
     /// The name and type of `symbol`, when its market's list is loaded.
     pub async fn find(&self, symbol: &str) -> Option<Listed> {
         self.lists.lock().await.values().flatten().find(|l| l.symbol == symbol).cloned()

@@ -14,7 +14,7 @@ import type { Plan } from "../../data/screener-query";
 
 export const PAGE = 100;
 
-export function createScanController(plan: () => Plan | null) {
+export function createScanController(plan: () => Plan | null, market: () => string | null = () => null) {
   const [total, setTotal] = createSignal<number | null>(null);
   const [rev, setRev] = createSignal(0);
   const [error, setError] = createSignal<string | null>(null);
@@ -56,7 +56,7 @@ export function createScanController(plan: () => Plan | null) {
     setLoading(true);
     const t0 = performance.now();
     try {
-      const res = await screenerScan({ columns: p.fields, filter: p.filter, sort: p.sort, range: [from, to], tickers: p.tickers });
+      const res = await screenerScan({ columns: p.fields, filter: p.filter, sort: p.sort, range: [from, to], tickers: p.tickers }, market());
       if (myGen === gen) {
         batch(() => {
           for (let pg = need[0]; pg <= last; pg++) {

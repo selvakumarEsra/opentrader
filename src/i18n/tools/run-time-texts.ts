@@ -150,6 +150,7 @@ const GROUPS: Record<string, string[]> = {
     "Middle East",
     "Pacific",
   ],
+  "window/screener/plugin-markets.ts marketName, the Stock Screener's markets served by data plugins": ["India", "USA (moomoo)"],
 };
 
 export const RUN_TIME_TEXTS: FoundText[] = Object.entries(GROUPS).flatMap(([at, texts]) => texts.map((text) => ({ text, at: `run time: ${at}` })));

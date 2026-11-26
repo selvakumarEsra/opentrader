@@ -15,6 +15,7 @@ pub mod events;
 pub mod fields;
 mod package;
 mod quote_batch;
+pub mod screener;
 
 use opentrader_core::files;
 use opentrader_core::plugins::hub::{Allowed, Hub, HubEvent};
@@ -326,6 +327,7 @@ fn status(app: &AppHandle) -> PluginsStatus {
 }
 
 pub fn init(app: &AppHandle) {
+    screener::init(app);
     app.manage(Plugins {
         hub: Hub::new(),
         data: Default::default(),
@@ -441,6 +443,7 @@ fn apply(app: &AppHandle) {
         feeds.iter().filter(|m| m.whole_symbols()).map(|m| m.id.clone()).collect(),
         manifests.iter().filter(|m| m.provides.contains(&Capability::Datafeed)).flat_map(|m| m.data_exchanges()).collect(),
     );
+    screener::set_markets(app, feeds.iter().filter(|m| !m.screener.is_empty()).map(|m| (m.id.clone(), m.name.clone(), m.screener.clone())).collect());
     state.hub.set_allowed(
         enabled
             .iter()
