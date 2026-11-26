@@ -292,8 +292,14 @@ export const PRIMARY_UNIVERSE_CLAUSE: Clause = { left: "type", operation: "in_ra
 export const ETF_UNIVERSE_CLAUSE: Clause = { left: "type", operation: "in_range", right: ["etf", "etn", "etv", "structured"] };
 export const ETF_PRIMARY_UNIVERSE_CLAUSE: Clause = { left: "type", operation: "in_range", right: ["etf", "etn", "etv"] };
 
-/** The securities a screen scans. */
-export const universeClause = (s: Pick<Screen, "primaryListing" | "type">): Clause =>
+/** A plugin market's universe: its stocks, and with "Primary listing" off their other listings (a company's BSE row
+ *  beside its NSE one). */
+export const PLUGIN_UNIVERSE_CLAUSE: Clause = { left: "type", operation: "in_range", right: ["stock", "secondary"] };
+export const PLUGIN_PRIMARY_UNIVERSE_CLAUSE: Clause = { left: "type", operation: "in_range", right: ["stock"] };
+
+/** The securities a screen scans (`market`: the plugin market it shows, already resolved). */
+export const universeClause = (s: Pick<Screen, "primaryListing" | "type" | "market">): Clause =>
+  s.market ? (s.primaryListing === false ? PLUGIN_UNIVERSE_CLAUSE : PLUGIN_PRIMARY_UNIVERSE_CLAUSE) :
   screenType(s) === "etf"
     ? s.primaryListing === false ? ETF_UNIVERSE_CLAUSE : ETF_PRIMARY_UNIVERSE_CLAUSE
     : s.primaryListing === false ? UNIVERSE_CLAUSE : PRIMARY_UNIVERSE_CLAUSE;

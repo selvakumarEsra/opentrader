@@ -5,10 +5,12 @@
  *   instruments.rs  the instrument dump, for search and symbol info
  *   history.rs      historical candles, for the bar store
  *   ticker.rs       the WebSocket stream, for live prices and streamed 1-minute bars
+ *   screen.rs       the screener's India market: NSE and BSE stocks quoted by GET /quote
  */
 pub mod auth;
 pub mod history;
 pub mod instruments;
+pub mod screen;
 pub mod ticker;
 
 use auth::{Credentials, Urls};
@@ -17,6 +19,7 @@ use opentrader_plugin_kit::catalog::Instrument;
 use opentrader_plugin_kit::feed::{Event, Provider};
 use opentrader_plugin_kit::history::Source;
 use opentrader_plugin_kit::pace::Pace;
+use opentrader_plugin_kit::screen::Quote;
 use opentrader_plugin_kit::token::Tokens;
 use opentrader_plugin_kit::{now, Bar};
 use serde::{Deserialize, Serialize};
@@ -45,6 +48,8 @@ pub struct Zerodha {
     pub urls: Urls,
     pub tokens: Tokens<Credentials, Token>,
     pace: Pace,
+    /// Kite's quote limit: 1 request a second.
+    quote_pace: Pace,
     agent: ureq::Agent,
 }
 
@@ -61,6 +66,7 @@ impl Zerodha {
             tokens: Tokens::new("Kite"),
             // Kite's history limit: 3 requests a second.
             pace: Pace::new(3, Duration::from_secs(1)),
+            quote_pace: Pace::new(1, Duration::from_secs(1)),
             agent: ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(60))).build().into(),
         }
     }
@@ -176,5 +182,23 @@ impl Provider for Zerodha {
 
     async fn stream(self: Arc<Self>, wanted: watch::Receiver<Vec<Instrument>>, events: mpsc::UnboundedSender<Event>) {
         opentrader_plugin_kit::socket::run(self, wanted, events).await
+    }
+
+    const SCREEN_MARKETS: &'static [&'static str] = &[screen::INDIA];
+    const SCREEN_PRIMARY: &'static [&'static str] = screen::PRIMARY;
+    const QUOTE_BATCH: usize = screen::BATCH;
+
+    fn screen_member(market: &str, inst: &Instrument) -> bool {
+        screen::member(market, inst)
+    }
+
+    async fn quotes(&self, insts: &[Instrument]) -> Result<HashMap<String, Quote>, String> {
+        if insts.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.quote_pace.wait().await;
+        let body = self.get(&screen::quote_path(insts)).await?;
+        let v: Value = serde_json::from_slice(&body).map_err(|e| format!("Kite quote: {e}"))?;
+        screen::quotes(&v, now())
     }
 }

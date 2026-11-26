@@ -17,6 +17,7 @@ import { Icon } from "../../components/Icon";
 import { LoadingWheel } from "../../components/LoadingWheel";
 import type { WheelText } from "../../data/screener-progress";
 import { screenerScan } from "../../data/screener-api";
+import { activeMarket } from "./plugin-markets";
 import { COLUMN_BY_ID, fieldOf } from "../../data/screener-catalog";
 import { displayCell } from "../../data/screener-display";
 import {
@@ -133,7 +134,7 @@ export function ScreenerHeatmap(props: Props) {
     if (!sf || !cf || !props.has(sf) || !props.has(cf)) return null;
     const gf = groupField();
     const columns = [sf, cf, ...(gf && props.has(gf) ? [gf] : []), ...["description", "currency"].filter(props.has)];
-    return { columns, filter: props.plan.filter, sort: { sortBy: sf, sortOrder: "desc" as const }, range: [0, MAX_TILES] as [number, number], tickers: props.plan.tickers };
+    return { columns, filter: props.plan.filter, sort: { sortBy: sf, sortOrder: "desc" as const }, range: [0, MAX_TILES] as [number, number], tickers: props.plan.tickers, market: activeMarket(screenerStore.screen()) };
   });
 
   let seq = 0;
@@ -142,7 +143,8 @@ export function ScreenerHeatmap(props: Props) {
     if (!req) return;
     const my = ++seq;
     try {
-      const res = await screenerScan(req);
+      const { market, ...scanReq } = req;
+      const res = await screenerScan(scanReq, market);
       if (my !== seq) return;
       setRows(res.rows);
       props.onTotal(res.totalCount);

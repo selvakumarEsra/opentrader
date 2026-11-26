@@ -15,6 +15,8 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup } from "solid-js";
 import { Icon } from "../../components/Icon";
 import { screenerValues } from "../../data/screener-api";
+import { screenerStore } from "../../data/screener-store";
+import { activeMarket } from "./plugin-markets";
 import {
   COLUMN_BY_ID,
   FILTER_OPS,
@@ -370,8 +372,11 @@ function CheckboxList(props: { filter: CheckboxFilter; onChange: (f: Filter) => 
     return d?.filter?.type === "CheckboxGroup" && d.filter.options === "data" ? d.field : undefined;
   };
   const [dataValues] = createResource(
-    fromData,
-    (field) => screenerValues(field).catch(() => [] as string[]),
+    () => {
+      const f = fromData();
+      return f ? { field: f, market: activeMarket(screenerStore.screen()) } : undefined;
+    },
+    ({ field, market }) => screenerValues(field, market).catch(() => [] as string[]),
   );
   const options = (): [string, string][] => {
     const d = def()?.filter;

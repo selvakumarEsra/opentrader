@@ -2017,3 +2017,12 @@ html.theme-light .scr-table-scroll.is-scrolled-x .scr-th-symbol::before {
   visibility: hidden;
   pointer-events: none;
 }
+
+/* A plugin market's status line (window/screener/plugin-markets.ts): its plugin's progress or last error. */
+.scr-market-status {
+  padding: 2px 16px 6px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--scr-text-secondary, #787b86);
+  overflow-wrap: anywhere;
+}

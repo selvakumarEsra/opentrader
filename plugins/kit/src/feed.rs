@@ -6,12 +6,16 @@
  *   data.subscribe                 the stream of the wanted symbols and the "Always record" ones; each tick a
  *                                  data.quote, each whole minute written to the store (live.rs)
  *   plugin.configure               the broker's credentials, the store (ClickHouse or the embedded SQLite file)
+ *   data.screen                    a screener market's rows (screen.rs): the broker's quotes of the market's
+ *                                  instruments every 30 s, and values from the daily bars, filled in the background
  */
 use crate::calendar::Calendar;
 use crate::catalog::{Catalog, Instrument};
 use crate::history::{History, Source, Span};
 use crate::live::{store_minute, Minutes, Tick};
 use crate::rpc::{params, Out, RpcError, BAD_PARAMS, UNKNOWN_METHOD};
+use crate::screen::{self, Quote};
+use crate::store::Key;
 use crate::session::Handler;
 use crate::store::{Backend, Store, StoreSettings};
 use serde::Deserialize;
@@ -19,8 +23,15 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
+
+/// How often a screener market's quotes are asked for again.
+const SCREEN_REFRESH: Duration = Duration::from_secs(30);
+/// How far back a screener market's daily bars go: a year of sessions and the 200-day average.
+const SCREEN_DAYS: i64 = 400;
+/// How often a screener market's daily bars are checked for missing sessions once all are filled.
+const SCREEN_HISTORY_EVERY: Duration = Duration::from_secs(15 * 60);
 
 const FLUSH_EVERY: Duration = Duration::from_secs(30);
 /// How often the instrument list is checked for being a day old.
@@ -54,6 +65,23 @@ pub trait Provider: Source + Send + Sync + 'static {
     /// Streams the instruments of `wanted` (following its changes) for the plugin's life: `Event::Connected` after
     /// each connection, then their ticks. Reconnects on its own.
     fn stream(self: Arc<Self>, wanted: watch::Receiver<Vec<Instrument>>, events: mpsc::UnboundedSender<Event>) -> impl Future<Output = ()> + Send;
+
+    /// The screener markets the plugin serves (`data.screen`, plugins/PROTOCOL.md, data.screen), such as `["IN"]`. None by default.
+    const SCREEN_MARKETS: &'static [&'static str] = &[];
+    /// A market's exchanges in the order a company's listing on them counts as its primary one.
+    const SCREEN_PRIMARY: &'static [&'static str] = &[];
+    /// The most instruments one `quotes` call takes.
+    const QUOTE_BATCH: usize = 500;
+
+    /// Whether `inst` is one of the rows of screener market `market`.
+    fn screen_member(_market: &str, _inst: &Instrument) -> bool {
+        false
+    }
+
+    /// The broker's quotes of `insts` (at most `QUOTE_BATCH`), by symbol, within its rate limit.
+    fn quotes(&self, _insts: &[Instrument]) -> impl Future<Output = Result<HashMap<String, Quote>, String>> + Send {
+        async { Err("this plugin gives no quotes for a screener".to_string()) }
+    }
 }
 
 /// Lets `History` hold the provider shared with the plugin.
@@ -81,6 +109,8 @@ struct Feed<P: Provider> {
     wanted: watch::Sender<Vec<Instrument>>,
     minutes: Mutex<Minutes>,
     out: Out,
+    /// Per screener market: its rows and their refresh.
+    screens: HashMap<String, screen::State>,
 }
 
 fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -117,6 +147,11 @@ pub fn record_list_with(text: &str, symbol: impl Fn(&str) -> Option<String>) -> 
 #[derive(Deserialize)]
 struct SearchParams {
     query: String,
+}
+
+#[derive(Deserialize)]
+struct ScreenParams {
+    market: String,
 }
 
 #[derive(Deserialize)]
@@ -251,8 +286,133 @@ impl<P: Provider> Feed<P> {
     }
 }
 
+/// Screener markets (`data.screen`).
+impl<P: Provider> Feed<P> {
+    /// The market's rows as last built; the first ask (or one after the app stopped asking) starts their refresh.
+    fn screen(self: Arc<Self>, p: Value) -> Result<Value, RpcError> {
+        let p: ScreenParams = params("data.screen", p)?;
+        let state = self.screens.get(&p.market).ok_or_else(|| RpcError::new(BAD_PARAMS, format!("No screener market {}", p.market)))?;
+        let (mut answer, start) = state.ask();
+        if start {
+            tokio::spawn(self.clone().screen_loop(p.market.clone()));
+        }
+        if answer.market.is_empty() {
+            answer.market = p.market;
+            answer.currency = P::CURRENCY.into();
+            answer.status = Some("Loading the market's quotes".into());
+        }
+        Ok(serde_json::to_value(answer).unwrap_or(Value::Null))
+    }
+
+    fn screen_members(&self, market: &str) -> Vec<Instrument> {
+        self.catalog.select(|i| P::screen_member(market, i))
+    }
+
+    /// Keeps `market`'s rows current while the app asks for them: quotes every `SCREEN_REFRESH`, values from the
+    /// daily bars (filled by `screen_history` meanwhile).
+    async fn screen_loop(self: Arc<Self>, market: String) {
+        let Some(state) = self.screens.get(&market) else { return };
+        if self.catalog.is_empty() {
+            self.fresh_list().await;
+        }
+        let history = tokio::spawn(self.clone().screen_history(market.clone()));
+        let mut quotes: HashMap<String, Quote> = HashMap::new();
+        while state.wanted() {
+            let started = Instant::now();
+            let members = self.screen_members(&market);
+            let mut error = None;
+            for chunk in members.chunks(P::QUOTE_BATCH.max(1)) {
+                match self.provider.quotes(chunk).await {
+                    Ok(q) => quotes.extend(q),
+                    Err(e) => {
+                        error = Some(e);
+                        break;
+                    }
+                }
+            }
+            let rows = self.screen_rows(&members, &quotes).await;
+            state.update(|a| {
+                a.market = market.clone();
+                a.currency = P::CURRENCY.into();
+                a.rows = rows;
+                a.fields = screen::TECHNICAL_FIELDS.iter().map(|f| f.to_string()).collect();
+                a.updated = Some(chrono::Utc::now().timestamp_millis() as f64);
+                a.error = error;
+                if a.status.as_deref() == Some("Loading the market's quotes") {
+                    a.status = None;
+                }
+            });
+            if let Some(rest) = SCREEN_REFRESH.checked_sub(started.elapsed()) {
+                tokio::time::sleep(rest).await;
+            }
+        }
+        history.abort();
+    }
+
+    /// The rows of `members`: their quotes, and the values of their daily bars with today's session.
+    async fn screen_rows(&self, members: &[Instrument], quotes: &HashMap<String, Quote>) -> Vec<screen::Row> {
+        let kinds = screen::listing_kinds(members.iter().map(|i| i.symbol.as_str()), P::SCREEN_PRIMARY);
+        let t = now();
+        let mut rows = Vec::with_capacity(members.len());
+        for (inst, kind) in members.iter().zip(kinds) {
+            let cal = P::calendar(inst.exchange());
+            let today = cal.midnight(t);
+            let daily = self.store.read(&Key::new(&inst.symbol, "1D", false), |s| s.window(t - SCREEN_DAYS * 86_400, t)).await;
+            let q = quotes.get(&inst.symbol);
+            let values = screen::technicals(&screen::session_bars(daily, q, today), cal.tz);
+            rows.push(screen::row(&inst.symbol, &inst.name, kind, q, today, values));
+        }
+        rows
+    }
+
+    /// Fills the daily bars of `market`'s instruments, the primary exchange's first, within the broker's history
+    /// limit; then checks again every `SCREEN_HISTORY_EVERY` for the sessions since. The status counts the progress.
+    async fn screen_history(self: Arc<Self>, market: String) {
+        let Some(state) = self.screens.get(&market) else { return };
+        let rank = |e: &str| P::SCREEN_PRIMARY.iter().position(|x| *x == e).unwrap_or(P::SCREEN_PRIMARY.len());
+        loop {
+            let mut members = self.screen_members(&market);
+            members.sort_by_key(|i| rank(i.exchange()));
+            let total = members.len();
+            let mut done = 0;
+            for inst in &members {
+                if !state.wanted() {
+                    return;
+                }
+                let cal = P::calendar(inst.exchange());
+                let t = now();
+                let span = Span { from: t - SCREEN_DAYS * 86_400, to: t, count: 0 };
+                match self.history.fill(inst, &cal, "1D", span, t).await {
+                    Ok(None) => done += 1,
+                    Ok(Some(e)) | Err(e) => {
+                        state.update(|a| a.status = Some(format!("Daily history: {done} of {total} stocks ({e})")));
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        break;
+                    }
+                }
+                if done % 25 == 0 || done == total {
+                    state.update(|a| a.status = (done < total).then(|| format!("Daily history: {done} of {total} stocks")));
+                }
+            }
+            if done == total {
+                state.update(|a| a.status = None);
+                let until = Instant::now() + SCREEN_HISTORY_EVERY;
+                while Instant::now() < until {
+                    if !state.wanted() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            }
+        }
+    }
+}
+
 impl<P: Provider> Handler for Feed<P> {
     async fn request(self: Arc<Self>, method: String, params: Value) -> Result<Value, RpcError> {
+        if method == "data.screen" {
+            return self.screen(params);
+        }
         Feed::request(&self, &method, params).await
     }
 
@@ -279,6 +439,7 @@ pub async fn run<P: Provider>(addr: &str, plugin: &str, token: &str, provider: P
         wanted,
         minutes: Mutex::new(Minutes::default()),
         out: out.clone(),
+        screens: P::SCREEN_MARKETS.iter().map(|m| (m.to_string(), screen::State::default())).collect(),
     });
     let (events, events_rx) = mpsc::unbounded_channel();
     tokio::spawn(provider.stream(wanted_rx, events));

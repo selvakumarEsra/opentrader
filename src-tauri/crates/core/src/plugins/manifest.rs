@@ -139,6 +139,9 @@ pub struct Manifest {
     /// `windows`, `macos`, `linux`; empty: all.
     #[serde(default)]
     pub platforms: Vec<String>,
+    /// The Stock Screener markets a data plugin serves (`data.screen`, plugins/PROTOCOL.md, data.screen): `IN`, `US`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screener: Vec<String>,
 }
 
 /// The exchanges the app's own data uses: a plugin cannot take them.

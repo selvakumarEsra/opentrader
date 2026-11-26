@@ -12,6 +12,7 @@ pub const QOT_UPDATE_KL: u32 = 3007;
 pub const QOT_HISTORY_KL: u32 = 3103;
 pub const QOT_HISTORY_KL_QUOTA: u32 = 3104;
 pub const QOT_STATIC_INFO: u32 = 3202;
+pub const QOT_SECURITY_SNAPSHOT: u32 = 3203;
 
 pub const TRD_GET_ACC_LIST: u32 = 2001;
 pub const TRD_SUB_ACC_PUSH: u32 = 2008;

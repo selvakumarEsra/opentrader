@@ -25,6 +25,7 @@ import { screenerStore } from "../../data/screener-store";
 import { CategoryMenu } from "./CategoryMenu";
 import { FilterEditor } from "./FilterEditor";
 import { PopItem, Popover } from "./Popover";
+import { USA, activeView, pluginMarkets, viewOf, type MarketView } from "./plugin-markets";
 import { translatePlural } from "../../i18n/translator";
 
 type Props = {
@@ -182,6 +183,16 @@ export function FilterPills(props: Props) {
   let wlEl!: HTMLDivElement;
   let marketEl!: HTMLDivElement;
   const primary = () => screen().primaryListing !== false;
+  /** The markets the picker lists: the app's USA, then the plugin markets (REQ-SCREEN-MKT-001). */
+  const marketList = (): MarketView[] => [USA, ...pluginMarkets().map(viewOf)];
+  const marketShown = () => activeView(screen());
+  const pickMarket = (key: string | null) => {
+    screenerStore.update((s) => {
+      const { market: _, ...rest } = s;
+      return key ? { ...rest, market: key } : rest;
+    });
+    close();
+  };
   const controls = () => (
     <div class="scr-pills-controls">
       <button
@@ -216,17 +227,17 @@ export function FilterPills(props: Props) {
   return (
     <div class="scr-pills" classList={{ "is-dialog": !!props.dialog }}>
       <div class="scr-pills-list">
-      {/* Market: US (flag, name, primary listing marker); the popover holds "Primary listing". */}
+      {/* Market: its flag, short name and primary listing marker; the popover lists the markets and holds "Primary listing". */}
       <div ref={marketEl} class="scr-pill scr-pill--market" classList={{ "is-open": openId() === "market" }}>
         <button
           type="button"
           class="scr-pill-main"
-          aria-label={primary() ? "Market: USA, primary listing" : "Market: USA"}
+          aria-label={primary() ? `Market: ${marketShown().title}, primary listing` : `Market: ${marketShown().title}`}
           aria-expanded={openId() === "market"}
           onClick={() => toggle("market")}
         >
-          <span class="scr-pill-flag"><Icon name="scr-flag-us" size={18} /></span>
-          <span class="scr-pill-text">US</span>
+          <span class="scr-pill-flag"><Icon name={marketShown().flag} size={18} /></span>
+          <span class="scr-pill-text">{marketShown().short}</span>
           <Show when={primary()}>
             <span class="scr-pill-icon"><Icon name="scr-market-primary" size={18} /></span>
           </Show>
@@ -282,7 +293,16 @@ export function FilterPills(props: Props) {
       <Show when={openId() === "market"}>
         <Popover anchor={marketEl} onClose={close} width={240} class="scr-market-pop">
           <div class="scr-editor-header"><div class="scr-editor-title">Market</div></div>
-          <PopItem title="USA" selected right={<Icon name="scr-flag-us" size={18} />} />
+          <For each={marketList()}>
+            {(m) => (
+              <PopItem
+                title={m.title}
+                selected={m.key === marketShown().key}
+                right={<Icon name={m.flag} size={18} />}
+                onClick={() => pickMarket(m.key)}
+              />
+            )}
+          </For>
           <div class="scr-item-sep" />
           <div
             class="scr-item scr-market-primary"
