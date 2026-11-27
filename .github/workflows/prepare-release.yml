@@ -123,6 +123,8 @@ jobs:
     permissions:
       contents: write
       packages: write   # its `web` job (web-image.yml) declares it
+      id-token: write       # its plugin jobs declare it (build provenance attestations)
+      attestations: write
     uses: ./.github/workflows/release.yml
     with:
       tag: v${{ needs.prepare.outputs.version }}
